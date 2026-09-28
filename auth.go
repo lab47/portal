@@ -11,34 +11,37 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const challengeDomain = "adminhelper-command-v1\x00"
+const challengeDomain = "adminhelper-command-v2\x00"
 
-func commandProof(nonce []byte, argv []string) []byte {
-	encoded, _ := json.Marshal(argv)
+func commandProof(nonce []byte, user string, argv []string) []byte {
+	encoded, _ := json.Marshal(struct {
+		User string   `json:"user"`
+		Argv []string `json:"argv"`
+	}{user, argv})
 	proof := append([]byte(challengeDomain), nonce...)
 	return append(proof, encoded...)
 }
 
-func verifyCommand(ca ssh.PublicKey, principal string, nonce []byte, req commandRequest) error {
+func verifyCommand(ca ssh.PublicKey, principal string, nonce []byte, req commandRequest) (*ssh.Certificate, error) {
 	key, err := ssh.ParsePublicKey(req.Certificate)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cert, ok := key.(*ssh.Certificate)
 	if !ok || len(req.Argv) == 0 {
-		return errors.New("user certificate and command required")
+		return nil, errors.New("user certificate and command required")
 	}
 	if err := VerifyUserCertificate(ca, principal, cert); err != nil {
-		return err
+		return nil, err
 	}
 	var sig ssh.Signature
 	if err := ssh.Unmarshal(req.Signature, &sig); err != nil {
-		return err
+		return nil, err
 	}
-	if err := cert.Key.Verify(commandProof(nonce, req.Argv), &sig); err != nil {
-		return fmt.Errorf("invalid command signature: %w", err)
+	if err := cert.Key.Verify(commandProof(nonce, req.User, req.Argv), &sig); err != nil {
+		return nil, fmt.Errorf("invalid command signature: %w", err)
 	}
-	return nil
+	return cert, nil
 }
 
 // VerifyUserCertificate checks a user certificate against the trusted CA and principal.
@@ -79,10 +82,10 @@ func loadSigner(keyPath, certPath string) (ssh.Signer, *ssh.Certificate, error) 
 	return signer, cert, nil
 }
 
-func signCommand(signer ssh.Signer, cert *ssh.Certificate, nonce []byte, argv []string) (commandRequest, error) {
-	sig, err := signer.Sign(rand.Reader, commandProof(nonce, argv))
+func signCommand(signer ssh.Signer, cert *ssh.Certificate, nonce []byte, user string, argv []string) (commandRequest, error) {
+	sig, err := signer.Sign(rand.Reader, commandProof(nonce, user, argv))
 	if err != nil {
 		return commandRequest{}, err
 	}
-	return commandRequest{Certificate: cert.Marshal(), Signature: ssh.Marshal(sig), Argv: argv}, nil
+	return commandRequest{Certificate: cert.Marshal(), Signature: ssh.Marshal(sig), User: user, Argv: argv}, nil
 }

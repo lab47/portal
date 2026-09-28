@@ -5,8 +5,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"os/user"
 	"strings"
 	"testing"
 	"time"
@@ -31,10 +34,10 @@ func testSigner(t *testing.T) ssh.Signer {
 	return signer
 }
 
-func testCertificate(t *testing.T, signer, ca ssh.Signer, principal string, expiry time.Time) *ssh.Certificate {
+func testCertificate(t *testing.T, signer, ca ssh.Signer, identity, principal string, expiry time.Time) *ssh.Certificate {
 	t.Helper()
 	cert := &ssh.Certificate{
-		Key: signer.PublicKey(), CertType: ssh.UserCert,
+		Key: signer.PublicKey(), CertType: ssh.UserCert, KeyId: identity,
 		ValidPrincipals: []string{principal}, ValidAfter: uint64(time.Now().Add(-time.Minute).Unix()),
 		ValidBefore: uint64(expiry.Unix()),
 	}
@@ -84,9 +87,15 @@ func TestCoordinatorIrohCommand(t *testing.T) {
 	}
 	ca := testSigner(t)
 	signer := testSigner(t)
-	cert := testCertificate(t, signer, ca, "admin", time.Now().Add(time.Hour))
+	cert := testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(time.Hour))
+	allowed := policy{"operator": {fmt.Sprint(os.Geteuid()): true}}
+	if os.Geteuid() == 0 {
+		if nobody, err := user.Lookup("nobody"); err == nil {
+			allowed["operator"][nobody.Uid] = true
+		}
+	}
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, server, ca.PublicKey(), "admin") }()
+	go func() { done <- serve(ctx, server, ca.PublicKey(), "admin", allowed) }()
 	client, err := iroh.Bind(ctx, iroh.WithRelayMode(mode), iroh.WithBindAddr(netip.MustParseAddrPort("127.0.0.1:0")))
 	if err != nil {
 		t.Fatal(err)
@@ -95,30 +104,65 @@ func TestCoordinatorIrohCommand(t *testing.T) {
 	if err := client.Online(ctx); err != nil {
 		t.Fatal(err)
 	}
-	response, err := runRemote(ctx, client, found, signer, cert, []string{"/bin/echo", "from-iroh"})
+	response, err := runRemote(ctx, client, found, signer, cert, "", []string{"/bin/echo", "from-iroh"})
 	if err != nil || response.Output != "from-iroh\n" || response.ExitCode != 0 || response.Error != "" {
 		t.Fatalf("command: %+v, %v", response, err)
 	}
-	response, err = runRemote(ctx, client, found, signer, cert, []string{"/bin/sh", "-c", "printf failure; exit 7"})
+	response, err = runRemote(ctx, client, found, signer, cert, "", []string{"/bin/sh", "-c", "printf failure; exit 7"})
 	if err != nil || response.Output != "failure" || response.ExitCode != 7 {
 		t.Fatalf("exit status: %+v, %v", response, err)
+	}
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = runRemote(ctx, client, found, signer, cert, account.Username, []string{"/usr/bin/id", "-u"})
+	if err != nil || response.Error != "" || response.Output != fmt.Sprintf("%d\n", os.Geteuid()) {
+		t.Fatalf("run as current user: %+v, %v", response, err)
+	}
+	t.Setenv("ADMINHELPER_TOKEN", "server-only-secret")
+	response, err = runRemote(ctx, client, found, signer, cert, account.Username, []string{"/usr/bin/env"})
+	if err != nil || response.Error != "" || strings.Contains(response.Output, "server-only-secret") || !strings.Contains(response.Output, "USER="+account.Username+"\n") {
+		t.Fatalf("target user environment: %+v, %v", response, err)
+	}
+	response, err = runRemote(ctx, client, found, signer, cert, "no-such-adminhelper-user", []string{"/bin/echo", "should-not-run"})
+	if err != nil || response.Output != "" || !strings.Contains(response.Error, "unknown target user") {
+		t.Fatalf("unknown user command: %+v, %v", response, err)
+	}
+	if os.Geteuid() != 0 {
+		response, err = runRemote(ctx, client, found, signer, cert, "root", []string{"/bin/echo", "should-not-run"})
+		if err != nil || response.Output != "" || response.Error != "not authorized for target user" {
+			t.Fatalf("unauthorized root command: %+v, %v", response, err)
+		}
+	} else if nobody, err := user.Lookup("nobody"); err == nil {
+		response, err = runRemote(ctx, client, found, signer, cert, nobody.Username, []string{"/usr/bin/id", "-u"})
+		if err != nil || response.Error != "" || response.Output != nobody.Uid+"\n" {
+			t.Fatalf("root-to-user switch: %+v, %v", response, err)
+		}
 	}
 	for _, tc := range []struct {
 		name string
 		cert *ssh.Certificate
 		key  ssh.Signer
 	}{
-		{"wrong principal", testCertificate(t, signer, ca, "other", time.Now().Add(time.Hour)), signer},
-		{"expired", testCertificate(t, signer, ca, "admin", time.Now().Add(-time.Second)), signer},
-		{"wrong CA", testCertificate(t, signer, testSigner(t), "admin", time.Now().Add(time.Hour)), signer},
+		{"wrong principal", testCertificate(t, signer, ca, "operator", "other", time.Now().Add(time.Hour)), signer},
+		{"expired", testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(-time.Second)), signer},
+		{"wrong CA", testCertificate(t, signer, testSigner(t), "operator", "admin", time.Now().Add(time.Hour)), signer},
 		{"wrong private key", cert, testSigner(t)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			response, err := runRemote(ctx, client, found, tc.key, tc.cert, []string{"/bin/echo", "should-not-run"})
+			response, err := runRemote(ctx, client, found, tc.key, tc.cert, "", []string{"/bin/echo", "should-not-run"})
 			if err != nil || response.Error != "authentication failed" || response.Output != "" {
 				t.Fatalf("rejected command: %+v, %v", response, err)
 			}
 		})
+	}
+	for _, identity := range []string{"other-operator", ""} {
+		otherCert := testCertificate(t, signer, ca, identity, "admin", time.Now().Add(time.Hour))
+		response, err := runRemote(ctx, client, found, signer, otherCert, account.Username, []string{"/bin/echo", "should-not-run"})
+		if err != nil || response.Output != "" || response.Error == "" {
+			t.Fatalf("unauthorized identity %q: %+v, %v", identity, response, err)
+		}
 	}
 	// Inventory contains no IP, so the initial dial must use the relay. Iroh
 	// exchanges direct candidates on that connection and can upgrade it.
@@ -164,18 +208,23 @@ func TestCoordinatorIrohCommand(t *testing.T) {
 
 func TestCommandProofBindsArguments(t *testing.T) {
 	ca, signer := testSigner(t), testSigner(t)
-	cert := testCertificate(t, signer, ca, "admin", time.Now().Add(time.Hour))
+	cert := testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(time.Hour))
 	nonce := []byte(strings.Repeat("n", 32))
-	req, err := signCommand(signer, cert, nonce, []string{"echo", "safe"})
+	req, err := signCommand(signer, cert, nonce, "deploy", []string{"echo", "safe"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Argv = []string{"echo", "unsafe"}
-	if err := verifyCommand(ca.PublicKey(), "admin", nonce, req); err == nil {
+	if _, err := verifyCommand(ca.PublicKey(), "admin", nonce, req); err == nil {
 		t.Fatal("modified arguments passed authentication")
 	}
 	req.Argv = []string{"echo", "safe"}
-	if err := verifyCommand(ca.PublicKey(), "admin", []byte(strings.Repeat("x", 32)), req); err == nil {
+	req.User = "root"
+	if _, err := verifyCommand(ca.PublicKey(), "admin", nonce, req); err == nil {
+		t.Fatal("modified target user passed authentication")
+	}
+	req.User = "deploy"
+	if _, err := verifyCommand(ca.PublicKey(), "admin", []byte(strings.Repeat("x", 32)), req); err == nil {
 		t.Fatal("replayed signature passed authentication")
 	}
 }

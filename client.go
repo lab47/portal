@@ -15,6 +15,7 @@ import (
 type Client struct {
 	Name, CoordinatorURL string
 	KeyFile, CertFile    string
+	User                 string // Optional local account on the server; empty uses the server process's account.
 }
 
 // Run returns the remote output and status. A nonzero remote exit is in Result,
@@ -45,5 +46,5 @@ func (c Client) Run(ctx context.Context, argv []string) (Result, error) {
 	if err := ep.Online(requestCtx); err != nil {
 		return Result{}, err
 	}
-	return runRemote(requestCtx, ep, reg, signer, cert, argv)
+	return runRemote(requestCtx, ep, reg, signer, cert, c.User, argv)
 }

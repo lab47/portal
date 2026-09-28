@@ -10,7 +10,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"os/user"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
@@ -19,11 +23,12 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const alpn = "adminhelper/1"
+const alpn = "adminhelper/2"
 
 type commandRequest struct {
 	Certificate []byte   `json:"certificate"`
 	Signature   []byte   `json:"signature"`
+	User        string   `json:"user,omitempty"`
 	Argv        []string `json:"argv"`
 }
 
@@ -56,7 +61,7 @@ func register(ctx context.Context, url, token string, reg registration) error {
 	return nil
 }
 
-func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal string) error {
+func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal string, policy policy) error {
 	for {
 		conn, err := ep.Accept(ctx)
 		if err != nil {
@@ -69,7 +74,7 @@ func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal s
 			defer conn.CloseWithError(0, "")
 			stream, err := conn.AcceptStream(ctx)
 			if err == nil {
-				handleCommand(ctx, stream, ca, principal)
+				handleCommand(ctx, stream, ca, principal, policy)
 			} else {
 				log.Printf("accept stream: %v", err)
 			}
@@ -77,7 +82,7 @@ func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal s
 	}
 }
 
-func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string) {
+func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy) {
 	defer stream.Close()
 	stream.SetDeadline(time.Now().Add(65 * time.Second))
 	var opener [1]byte
@@ -96,18 +101,31 @@ func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		log.Printf("read command: %v", err)
 		return
 	}
-	if err := verifyCommand(ca, principal, nonce, req); err != nil {
+	cert, err := verifyCommand(ca, principal, nonce, req)
+	if err != nil {
 		log.Printf("rejected command: %v", err)
 		writeResponse(stream, Result{Error: "authentication failed"})
+		return
+	}
+	account, err := policy.authorize(cert.KeyId, req.User)
+	if err != nil {
+		log.Printf("rejected command from %q: %v", cert.KeyId, err)
+		writeResponse(stream, Result{Error: err.Error()})
 		return
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, req.Argv[0], req.Argv[1:]...)
+	if req.User != "" {
+		if err := setCommandUser(cmd, account); err != nil {
+			writeResponse(stream, Result{Error: err.Error()})
+			return
+		}
+	}
 	var output bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &output, remaining: 1 << 20}
 	cmd.Stderr = cmd.Stdout
-	err := cmd.Run()
+	err = cmd.Run()
 	response := Result{Output: output.String()}
 	if err != nil {
 		var exit *exec.ExitError
@@ -118,6 +136,38 @@ func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		}
 	}
 	writeResponse(stream, response)
+}
+
+func setCommandUser(cmd *exec.Cmd, account *user.User) error {
+	uid, err := strconv.ParseUint(account.Uid, 10, 32)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.ParseUint(account.Gid, 10, 32)
+	if err != nil {
+		return err
+	}
+	if uid != uint64(os.Geteuid()) || gid != uint64(os.Getegid()) {
+		if os.Geteuid() != 0 {
+			return errors.New("switching users requires the server to run as root")
+		}
+		groups, err := account.GroupIds()
+		if err != nil {
+			return err
+		}
+		credential := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+		for _, group := range groups {
+			id, err := strconv.ParseUint(group, 10, 32)
+			if err != nil {
+				return err
+			}
+			credential.Groups = append(credential.Groups, uint32(id))
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+	}
+	cmd.Dir = "/"
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + account.HomeDir, "USER=" + account.Username, "LOGNAME=" + account.Username}
+	return nil
 }
 
 func writeResponse(stream *iroh.Stream, response Result) {
@@ -163,7 +213,7 @@ func lookup(ctx context.Context, url, name string) (registration, error) {
 	return reg, err
 }
 
-func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate, argv []string) (Result, error) {
+func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate, user string, argv []string) (Result, error) {
 	id, err := key.ParseEndpointID(reg.EndpointID)
 	if err != nil {
 		return Result{}, err
@@ -193,7 +243,7 @@ func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer 
 	if len(nonce) != 32 {
 		return Result{}, errors.New("invalid server challenge")
 	}
-	req, err := signCommand(signer, cert, nonce, argv)
+	req, err := signCommand(signer, cert, nonce, user, argv)
 	if err != nil {
 		return Result{}, err
 	}

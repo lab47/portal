@@ -17,15 +17,19 @@ import (
 
 // Server runs commands for clients authenticated by the SSH user CA.
 type Server struct {
-	Name, CoordinatorURL, Token string
-	CAFile, Principal           string
-	RelayURL, Listen            string // Optional relay URL and UDP bind IP:port.
+	Name, CoordinatorURL, Token   string
+	CAFile, Principal, PolicyFile string
+	RelayURL, Listen              string // Optional relay URL and UDP bind IP:port.
 }
 
 // Serve checks in with the coordinator and accepts commands until ctx is canceled.
 func (s Server) Serve(ctx context.Context) error {
-	if s.Name == "" || s.CoordinatorURL == "" || s.Token == "" || s.CAFile == "" || s.Principal == "" {
-		return errors.New("server requires name, coordinator URL, token, CA file and principal")
+	if s.Name == "" || s.CoordinatorURL == "" || s.Token == "" || s.CAFile == "" || s.Principal == "" || s.PolicyFile == "" {
+		return errors.New("server requires name, coordinator URL, token, CA file, principal and policy file")
+	}
+	policy, err := loadPolicy(s.PolicyFile)
+	if err != nil {
+		return err
 	}
 	caData, err := os.ReadFile(s.CAFile)
 	if err != nil {
@@ -87,5 +91,5 @@ func (s Server) Serve(ctx context.Context) error {
 			}
 		}
 	}()
-	return serve(ctx, ep, ca, s.Principal)
+	return serve(ctx, ep, ca, s.Principal, policy)
 }

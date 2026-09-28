@@ -50,11 +50,12 @@ func run(args []string) error {
 	relayURL := serverFlags.String("relay", 0, "", "iroh relay URL (default: number0 production relays)")
 	listen := serverFlags.String("listen", 0, "", "optional UDP bind IP:port for direct paths (default: OS-assigned dual-stack port)")
 	caFile := serverFlags.String("ca", 0, "", "trusted SSH user CA public key file")
+	policyFile := serverFlags.String("policy", 0, "", "required JSON authorization policy file")
 	principal := serverFlags.String("principal", 0, "admin", "required certificate principal")
 	dispatcher.Dispatch("server", mflags.NewCommand(serverFlags, func(_ *mflags.FlagSet, _ []string) error {
 		return (adminhelper.Server{
 			Name: *name, CoordinatorURL: *coordinatorURL, Token: *token,
-			CAFile: *caFile, Principal: *principal, RelayURL: *relayURL, Listen: *listen,
+			CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen,
 		}).Serve(ctx)
 	}, mflags.WithUsage("Check in and serve authenticated commands")))
 
@@ -63,11 +64,12 @@ func run(args []string) error {
 	clientCoordinatorURL := clientFlags.String("coordinator", 0, "", "coordinator HTTP(S) URL")
 	keyFile := clientFlags.String("key", 0, "", "SSH private key file")
 	certFile := clientFlags.String("cert", 0, "", "SSH user certificate file")
+	user := clientFlags.String("user", 0, "", "local account to run the command as on the server")
 	var command []string
 	clientFlags.Rest(&command, "command and arguments")
 	dispatcher.Dispatch("client", mflags.NewCommand(clientFlags, func(_ *mflags.FlagSet, _ []string) error {
 		response, err := (adminhelper.Client{
-			Name: *clientName, CoordinatorURL: *clientCoordinatorURL, KeyFile: *keyFile, CertFile: *certFile,
+			Name: *clientName, CoordinatorURL: *clientCoordinatorURL, KeyFile: *keyFile, CertFile: *certFile, User: *user,
 		}).Run(ctx, command)
 		if err != nil {
 			return err
