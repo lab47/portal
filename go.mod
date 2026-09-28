@@ -1,4 +1,4 @@
-module github.com/miren/portal
+module github.com/lab47/portal
 
 go 1.26.0
 

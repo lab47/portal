@@ -1,4 +1,4 @@
-package adminhelper
+package portal
 
 import (
 	"context"
@@ -120,12 +120,12 @@ func TestCoordinatorIrohCommand(t *testing.T) {
 	if err != nil || response.Error != "" || response.Output != fmt.Sprintf("%d\n", os.Geteuid()) {
 		t.Fatalf("run as current user: %+v, %v", response, err)
 	}
-	t.Setenv("ADMINHELPER_TOKEN", "server-only-secret")
+	t.Setenv("PORTAL_TOKEN", "server-only-secret")
 	response, err = runRemote(ctx, client, found, signer, cert, account.Username, []string{"/usr/bin/env"})
 	if err != nil || response.Error != "" || strings.Contains(response.Output, "server-only-secret") || !strings.Contains(response.Output, "USER="+account.Username+"\n") {
 		t.Fatalf("target user environment: %+v, %v", response, err)
 	}
-	response, err = runRemote(ctx, client, found, signer, cert, "no-such-adminhelper-user", []string{"/bin/echo", "should-not-run"})
+	response, err = runRemote(ctx, client, found, signer, cert, "no-such-portal-user", []string{"/bin/echo", "should-not-run"})
 	if err != nil || response.Output != "" || !strings.Contains(response.Error, "unknown target user") {
 		t.Fatalf("unknown user command: %+v, %v", response, err)
 	}

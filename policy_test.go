@@ -1,4 +1,4 @@
-package adminhelper
+package portal
 
 import (
 	"fmt"
@@ -76,7 +76,7 @@ func TestPolicyValidation(t *testing.T) {
 		{"unknown field", `{"identities":{"operator":["root"]},"allowAll":true}`},
 		{"empty identity", `{"identities":{"": ["root"]}}`},
 		{"empty users", `{"identities":{"operator":[]}}`},
-		{"unknown account", `{"identities":{"operator":["no-such-adminhelper-user"]}}`},
+		{"unknown account", `{"identities":{"operator":["no-such-portal-user"]}}`},
 		{"trailing document", fmt.Sprintf(`{"identities":{"operator":[%q]}} {}`, current.Username)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1,4 +1,4 @@
-package adminhelper
+package portal
 
 import (
 	"encoding/json"

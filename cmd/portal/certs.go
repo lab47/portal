@@ -11,7 +11,7 @@ import (
 	"os"
 	"time"
 
-	adminhelper "github.com/miren/portal"
+	"github.com/lab47/portal"
 	"golang.org/x/crypto/ssh"
 	"miren.dev/mflags"
 )
@@ -167,7 +167,7 @@ func inspectCertificate(certPath, caPath, principal string) (*ssh.Certificate, e
 	if err != nil {
 		return nil, err
 	}
-	if err := adminhelper.VerifyUserCertificate(ca, principal, cert); err != nil {
+	if err := portal.VerifyUserCertificate(ca, principal, cert); err != nil {
 		return nil, err
 	}
 	return cert, nil

@@ -1,4 +1,4 @@
-package adminhelper_test
+package portal_test
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	adminhelper "github.com/miren/portal"
+	"github.com/lab47/portal"
 	"github.com/tmc/go-iroh/relayserver"
 	"golang.org/x/crypto/ssh"
 )
@@ -22,7 +22,7 @@ import (
 func TestPackageAPI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	coord := httptest.NewServer(adminhelper.NewCoordinator("test-token"))
+	coord := httptest.NewServer(portal.NewCoordinator("test-token"))
 	defer coord.Close()
 	relay := httptest.NewServer(relayserver.New())
 	defer relay.Close()
@@ -76,7 +76,7 @@ func TestPackageAPI(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- (adminhelper.Server{
+		done <- (portal.Server{
 			Name: "node-a", CoordinatorURL: coord.URL, Token: "test-token", CAFile: caFile,
 			Principal: "admin", PolicyFile: policyFile, RelayURL: relay.URL, Listen: "127.0.0.1:0",
 		}).Serve(ctx)
@@ -99,13 +99,13 @@ func TestPackageAPI(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	result, err := (adminhelper.Client{
+	result, err := (portal.Client{
 		Name: "node-a", CoordinatorURL: coord.URL, KeyFile: keyFile, CertFile: certFile,
 	}).Run(ctx, []string{"/bin/echo", "package-api"})
 	if err != nil || result.Output != "package-api\n" || result.ExitCode != 0 || result.Error != "" {
 		t.Fatalf("package client result: %+v, %v", result, err)
 	}
-	result, err = (adminhelper.Client{
+	result, err = (portal.Client{
 		Name: "node-a", CoordinatorURL: coord.URL, KeyFile: keyFile, CertFile: certFile, User: account.Username,
 	}).Run(ctx, []string{"/usr/bin/id", "-un"})
 	if err != nil || result.Output != account.Username+"\n" || result.Error != "" {
