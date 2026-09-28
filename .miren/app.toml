@@ -1,0 +1,14 @@
+name = "portal-coordinator"
+
+[[env]]
+key = "PORTAL_TOKEN"
+required = true
+sensitive = true
+description = "Shared token for server registration"
+
+[services.web]
+command = "/bin/app coordinator --listen 0.0.0.0:$PORT"
+
+[services.web.concurrency]
+mode = "fixed"
+num_instances = 1

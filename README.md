@@ -11,19 +11,19 @@ The importable `github.com/lab47/portal` package exposes `NewCoordinator(token)`
 In a temporary directory, generate a CA and client key, then sign a one-hour user certificate with the `admin` principal:
 
 ```sh
-./portal cert keygen -out ca
-./portal cert keygen -out operator
-./portal cert sign -ca-key ca -pub operator.pub -principal admin \
-  -id operator -valid-for 1h -out operator-cert.pub
-./portal cert inspect -cert operator-cert.pub -ca ca.pub -principal admin
+./portal cert keygen --out ca
+./portal cert keygen --out operator
+./portal cert sign --ca-key ca --pub operator.pub --principal admin \
+  --id operator --valid-for 1h --out operator-cert.pub
+./portal cert inspect --cert operator-cert.pub --ca ca.pub --principal admin
 ```
 
-The same `cert keygen` command creates either a CA or a user key; private keys are unencrypted and written with mode 0600. These commands never overwrite existing files. `cert inspect` checks the CA signature, principal, and validity period, but does not check the server's authorization policy or prove possession of the user private key. Certificates expire; there is no revocation list in this version, so issue short-lived certificates and protect the CA private key.
+The same `cert keygen` command creates either a CA or a user key; private keys are unencrypted and written with mode 0600. These commands never overwrite existing files. `cert inspect` checks the CA signature, principal, and validity period, but does not check the server's authorization policy or prove possession of the user private key. Certificates expire; there is no revocation list in this version, so protect the CA private key and restrict access through each server's policy.
 
 Start the coordinator in one terminal (use a long random token in practice):
 
 ```sh
-PORTAL_TOKEN=local-test-token ./portal coordinator -listen 127.0.0.1:8080
+PORTAL_TOKEN=local-test-token ./portal coordinator --listen 127.0.0.1:8080
 ```
 
 Create a policy on the server mapping each CA-signed certificate key ID (`cert sign -id`) to the local accounts it may use. For this walkthrough, allow `operator` to run as the current server user:
@@ -36,21 +36,56 @@ Start a server in another terminal; it validates its policy before registering o
 
 ```sh
 PORTAL_TOKEN=local-test-token ./portal server \
-  -name node-a -coordinator http://127.0.0.1:8080 -ca ca.pub -policy policy.json \
-  -label role=worker -label region=us-west
+  --name node-a --coordinator http://127.0.0.1:8080 --ca ca.pub --policy policy.json \
+  --label role=worker --label region=us-west
 ```
 
 Query the inventory and run a command from the client:
 
 ```sh
 curl http://127.0.0.1:8080/servers/node-a
-./portal client -name node-a -coordinator http://127.0.0.1:8080 \
-  -key operator -cert operator-cert.pub -user "$(id -un)" -- /usr/bin/id
+./portal client --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub --user "$(id -un)" -- /usr/bin/id
 ```
 
 Each repeated `-label KEY=VALUE` adds an inventory label; omit the flags for no labels. Values may contain commas and `=`. Labels are advertised on check-in and returned as `"labels":{"role":"worker","region":"us-west"}` by `GET /servers/node-a`. They are metadata only, not authorization rules or connection addresses. Inventory lookup is public to anyone who can reach the coordinator, so do not put secrets in labels.
 
 `-user` selects a local account on the server. Omit it to request the server process's effective account; that account must still be allowed by the policy. An unmapped certificate identity or account is denied, including `root`: to permit root, explicitly list `"root"` for that identity. Account names in the policy are resolved to UIDs at startup, so aliases cannot bypass authorization; unknown accounts and malformed policies prevent startup. Restart the server after changing its policy. Switching to another UID/GID requires the server process to run as root; an unprivileged switch is rejected. Explicit-user commands start in `/` with only `PATH`, `HOME`, `USER`, and `LOGNAME` in their environment; they do not inherit server-side secrets. The account name is included in the signed command request.
+
+## Passkey-backed CA
+
+Run the certificate authority **separately** from the inventory coordinator. Create a dedicated SSH CA key with `portal cert keygen --out ca`, and provision a random enrollment token of at least 32 characters as `PORTAL_CA_ENROLL_TOKEN`. Keep both off the coordinator. The CA needs a stable HTTPS origin (the WebAuthn relying-party origin); bind its HTTP listener only to a trusted TLS reverse proxy, not directly to the internet. Keep the `--state` file on persistent storage, back it up, and restrict access to the CA key and state. For example:
+
+```sh
+umask 077
+openssl rand -hex 32 > ca-enroll-token   # securely deliver to the initial user, then delete
+PORTAL_CA_ENROLL_TOKEN="$(cat ca-enroll-token)" portal ca serve \
+  --listen 127.0.0.1:8081 --origin https://ca.example.com \
+  --identity operator --principal admin --ca-key ca --state ca-state.json
+```
+
+After enrollment, remove `PORTAL_CA_ENROLL_TOKEN` from the CA environment and delete the token file; passkeys are persisted in the state file. This first version serves one configured identity per CA instance. An administrator must independently distribute `ca.pub` to clients and servers, and add `operator` to each server's local policy with only the accounts it may use. Passkey enrollment does **not** grant access by itself.
+
+On any machine, request a certificate without copying the old private key:
+
+```sh
+mkdir -p ~/.config/portal
+portal cert request --ca-url https://ca.example.com --ca ca.pub \
+  --key ~/.config/portal/operator --cert ~/.config/portal/operator-cert.pub
+```
+
+The command generates a local Ed25519 key if absent, shows its fingerprint, and prints an approval URL. Open that URL in a browser, compare the fingerprint, and approve with a passkey. On first enrollment, enter the one-time enrollment token. The client receives a **48-hour SSH user certificate** for the new public key, verifies it against its pinned CA public key, and writes it to `--cert`. It also stores a refresh token in `<key>.refresh` with mode 0600. The CA never receives the client's private key.
+
+Headless clients can renew without a browser using the **same private key** and their refresh token:
+
+```sh
+portal cert refresh --ca-url https://ca.example.com --ca ca.pub \
+  --key ~/.config/portal/operator --cert ~/.config/portal/operator-cert.pub
+```
+
+The CA requires a signature from that key, rotates the refresh token on each successful use, and returns a new 48-hour certificate. The token is bound to that key and expires **30 days after the most recent passkey approval**, not 30 days after each refresh. Schedule `cert refresh` before the certificate expires (for example, once daily); after 30 days, rerun `cert request` and approve in the browser to start another 30-day period. If the client loses the rotated token due to a crash or failed write, browser approval is required again. Keep the token file and private key together and restrict them to the client account; neither should be logged or committed.
+
+Approval requests expire after five minutes and are not durable across CA restarts. The CA keeps passkey credentials and hashed refresh tokens on disk, while challenges and pending certificates live in memory. This version does not include automatic scheduling, multiple users per CA instance, or revocation; a stolen private key and certificate can remain usable for up to 48 hours unless each server's policy is changed and reloaded or its trusted CA is rotated. Protect the enrollment token and avoid logging approval URLs. Do not mount the CA signing key into the public coordinator.
 
 ## MCP tool
 

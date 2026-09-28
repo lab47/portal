@@ -1,0 +1,24 @@
+name = "portal-ca"
+
+[[env]]
+key = "PORTAL_CA_KEY"
+required = true
+sensitive = true
+description = "Dedicated SSH CA private key (PEM), supplied through Miren secrets"
+
+[[env]]
+key = "PORTAL_CA_ENROLL_TOKEN"
+sensitive = true
+description = "Initial passkey enrollment token; remove after enrollment"
+
+[services.web]
+command = "umask 077; printf '%s' \"$PORTAL_CA_KEY\" > /tmp/portal-ca-key; exec /bin/app ca serve --listen 0.0.0.0:$PORT --origin https://ca.emp-summer.clusters.miren.run --identity operator --principal admin --ca-key /tmp/portal-ca-key --state /miren/data/local/ca-state.json"
+
+[services.web.concurrency]
+mode = "fixed"
+num_instances = 1
+
+[[services.web.disks]]
+name = "ca-state"
+provider = "local"
+mount_path = "/miren/data/local"

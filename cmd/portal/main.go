@@ -103,5 +103,6 @@ func run(args []string) error {
 	dispatcher.Dispatch("mcp-server", mflags.NewMCPServerCommand(mcpCommands))
 
 	registerCertCommands(dispatcher)
+	registerCACommands(dispatcher, ctx)
 	return dispatcher.Run(args)
 }
