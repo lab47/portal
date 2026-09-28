@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"maps"
 	"net/http/httptest"
 	"os"
 	"os/user"
@@ -73,12 +74,13 @@ func TestPackageAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyFile := write("operator", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}))
+	labels := map[string]string{"role": "database", "region": "eu,west=2"}
 
 	done := make(chan error, 1)
 	go func() {
 		done <- (portal.Server{
 			Name: "node-a", CoordinatorURL: coord.URL, Token: "test-token", CAFile: caFile,
-			Principal: "admin", PolicyFile: policyFile, RelayURL: relay.URL, Listen: "127.0.0.1:0",
+			Principal: "admin", PolicyFile: policyFile, RelayURL: relay.URL, Listen: "127.0.0.1:0", Labels: labels,
 		}).Serve(ctx)
 	}()
 	// Wait for the server's first check-in; Serve returns early if it fails.
@@ -87,10 +89,18 @@ func TestPackageAPI(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		res.Body.Close()
 		if res.StatusCode == 200 {
+			var inventory struct {
+				Labels map[string]string `json:"labels"`
+			}
+			err = json.NewDecoder(res.Body).Decode(&inventory)
+			res.Body.Close()
+			if err != nil || !maps.Equal(inventory.Labels, labels) {
+				t.Fatalf("inventory labels: %+v, %v", inventory.Labels, err)
+			}
 			break
 		}
+		res.Body.Close()
 		select {
 		case err := <-done:
 			t.Fatalf("server stopped before check-in: %v", err)

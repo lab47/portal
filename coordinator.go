@@ -12,10 +12,11 @@ import (
 )
 
 type registration struct {
-	Name       string    `json:"name"`
-	EndpointID string    `json:"endpoint_id"`
-	RelayURL   string    `json:"relay_url"`
-	Expires    time.Time `json:"expires"`
+	Name       string            `json:"name"`
+	EndpointID string            `json:"endpoint_id"`
+	RelayURL   string            `json:"relay_url"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Expires    time.Time         `json:"expires"`
 }
 
 type coordinator struct {
@@ -42,6 +43,12 @@ func (c *coordinator) register(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&reg); err != nil {
 		http.Error(w, "invalid registration", http.StatusBadRequest)
 		return
+	}
+	for key := range reg.Labels {
+		if key == "" {
+			http.Error(w, "invalid registration", http.StatusBadRequest)
+			return
+		}
 	}
 	relayURL, relayErr := netaddr.ParseRelayURL(reg.RelayURL)
 	_, idErr := key.ParseEndpointID(reg.EndpointID)

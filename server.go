@@ -19,7 +19,8 @@ import (
 type Server struct {
 	Name, CoordinatorURL, Token   string
 	CAFile, Principal, PolicyFile string
-	RelayURL, Listen              string // Optional relay URL and UDP bind IP:port.
+	RelayURL, Listen              string            // Optional relay URL and UDP bind IP:port.
+	Labels                        map[string]string // Optional inventory metadata advertised at each check-in.
 }
 
 // Serve checks in with the coordinator and accepts commands until ctx is canceled.
@@ -70,7 +71,7 @@ func (s Server) Serve(ctx context.Context) error {
 		if len(urls) == 0 {
 			return errors.New("no connected home relay")
 		}
-		reg := registration{Name: s.Name, EndpointID: ep.ID().String(), RelayURL: urls[0].String()}
+		reg := registration{Name: s.Name, EndpointID: ep.ID().String(), RelayURL: urls[0].String(), Labels: s.Labels}
 		return register(requestCtx, strings.TrimRight(s.CoordinatorURL, "/"), s.Token, reg)
 	}
 	if err := checkIn(); err != nil {

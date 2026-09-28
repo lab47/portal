@@ -26,3 +26,20 @@ func TestServerRequiresPolicy(t *testing.T) {
 		t.Fatalf("server ignored policy flag: %v", err)
 	}
 }
+
+func TestServerLabels(t *testing.T) {
+	args := []string{"server", "--name", "node-a", "--coordinator", "http://localhost:8080", "--token", "test", "--ca", "/missing-ca", "--policy", "/missing-policy"}
+	valid := append(append([]string{}, args...), "--label", "role=worker", "--label", "region=eu,west=2")
+	if err := run(valid); err == nil || !strings.Contains(err.Error(), "/missing-policy") {
+		t.Fatalf("labels with commas and equals were not accepted: %v", err)
+	}
+	for _, tc := range [][]string{
+		{"--label", "no-equals"},
+		{"--label", "=no-key"},
+		{"--label", "role=worker", "--label", "role=database"},
+	} {
+		if err := run(append(append([]string{}, args...), tc...)); err == nil || !strings.Contains(err.Error(), "label") {
+			t.Fatalf("invalid labels %v accepted: %v", tc, err)
+		}
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,10 +53,23 @@ func run(args []string) error {
 	caFile := serverFlags.String("ca", 0, "", "trusted SSH user CA public key file")
 	policyFile := serverFlags.String("policy", 0, "", "required JSON authorization policy file")
 	principal := serverFlags.String("principal", 0, "admin", "required certificate principal")
+	var labelFlags []string
+	serverFlags.StringArrayNoSplitVar(&labelFlags, "label", 0, nil, "inventory label KEY=VALUE (repeatable)")
 	dispatcher.Dispatch("server", mflags.NewCommand(serverFlags, func(_ *mflags.FlagSet, _ []string) error {
+		labels := make(map[string]string, len(labelFlags))
+		for _, pair := range labelFlags {
+			key, value, ok := strings.Cut(pair, "=")
+			if !ok || key == "" {
+				return fmt.Errorf("invalid label %q: expected KEY=VALUE", pair)
+			}
+			if _, exists := labels[key]; exists {
+				return fmt.Errorf("duplicate label %q", key)
+			}
+			labels[key] = value
+		}
 		return (portal.Server{
 			Name: *name, CoordinatorURL: *coordinatorURL, Token: *token,
-			CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen,
+			CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen, Labels: labels,
 		}).Serve(ctx)
 	}, mflags.WithUsage("Check in and serve authenticated commands")))
 

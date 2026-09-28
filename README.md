@@ -36,7 +36,8 @@ Start a server in another terminal; it validates its policy before registering o
 
 ```sh
 PORTAL_TOKEN=local-test-token ./portal server \
-  -name node-a -coordinator http://127.0.0.1:8080 -ca ca.pub -policy policy.json
+  -name node-a -coordinator http://127.0.0.1:8080 -ca ca.pub -policy policy.json \
+  -label role=worker -label region=us-west
 ```
 
 Query the inventory and run a command from the client:
@@ -46,6 +47,8 @@ curl http://127.0.0.1:8080/servers/node-a
 ./portal client -name node-a -coordinator http://127.0.0.1:8080 \
   -key operator -cert operator-cert.pub -user "$(id -un)" -- /usr/bin/id
 ```
+
+Each repeated `-label KEY=VALUE` adds an inventory label; omit the flags for no labels. Values may contain commas and `=`. Labels are advertised on check-in and returned as `"labels":{"role":"worker","region":"us-west"}` by `GET /servers/node-a`. They are metadata only, not authorization rules or connection addresses. Inventory lookup is public to anyone who can reach the coordinator, so do not put secrets in labels.
 
 `-user` selects a local account on the server. Omit it to request the server process's effective account; that account must still be allowed by the policy. An unmapped certificate identity or account is denied, including `root`: to permit root, explicitly list `"root"` for that identity. Account names in the policy are resolved to UIDs at startup, so aliases cannot bypass authorization; unknown accounts and malformed policies prevent startup. Restart the server after changing its policy. Switching to another UID/GID requires the server process to run as root; an unprivileged switch is rejected. Explicit-user commands start in `/` with only `PATH`, `HOME`, `USER`, and `LOGNAME` in their environment; they do not inherit server-side secrets. The account name is included in the signed command request.
 

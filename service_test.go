@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -67,16 +68,29 @@ func TestCoordinatorIrohCommand(t *testing.T) {
 	if err := server.Online(ctx); err != nil {
 		t.Fatal(err)
 	}
-	reg := registration{Name: "node-a", EndpointID: server.ID().String(), RelayURL: server.Addr().RelayURLs()[0].String()}
+	reg := registration{Name: "node-a", EndpointID: server.ID().String(), RelayURL: server.Addr().RelayURLs()[0].String(), Labels: map[string]string{"role": "api", "region": "east=2,prod"}}
 	if err := register(ctx, coordinator.URL, "bad-token", reg); err == nil {
 		t.Fatal("unauthorized check-in succeeded")
+	}
+	invalid := reg
+	invalid.Labels = map[string]string{"": "bad"}
+	if err := register(ctx, coordinator.URL, "registration-secret", invalid); err == nil {
+		t.Fatal("registration with empty label key succeeded")
 	}
 	if err := register(ctx, coordinator.URL, "registration-secret", reg); err != nil {
 		t.Fatal(err)
 	}
 	found, err := lookup(ctx, coordinator.URL, reg.Name)
-	if err != nil || found.EndpointID != reg.EndpointID || found.RelayURL != reg.RelayURL {
+	if err != nil || found.EndpointID != reg.EndpointID || found.RelayURL != reg.RelayURL || !maps.Equal(found.Labels, reg.Labels) {
 		t.Fatalf("lookup: %+v, %v", found, err)
+	}
+	reg.Labels = map[string]string{"role": "worker"}
+	if err := register(ctx, coordinator.URL, "registration-secret", reg); err != nil {
+		t.Fatal(err)
+	}
+	found, err = lookup(ctx, coordinator.URL, reg.Name)
+	if err != nil || !maps.Equal(found.Labels, reg.Labels) {
+		t.Fatalf("refreshed labels: %+v, %v", found.Labels, err)
 	}
 	data, err := json.Marshal(found)
 	if err != nil {
