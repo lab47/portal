@@ -14,11 +14,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func packetEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
+func packetFilterInstructions() asm.Instructions {
 	// The socket filter admits IP frames (including up to two VLAN tags) and
 	// caps copies to 2048 bytes. Endpoint and direction filters are evaluated
 	// on the server after parsing, before any event is sent to the client.
-	insns := asm.Instructions{
+	return asm.Instructions{
+		// Legacy packet loads implicitly read the skb context from R6.
+		asm.Mov.Reg(asm.R6, asm.R1),
 		asm.LoadAbs(12, asm.Half),
 		asm.JEq.Imm(asm.R0, 0x0800, "accept"),
 		asm.JEq.Imm(asm.R0, 0x86dd, "accept"),
@@ -37,7 +39,10 @@ func packetEvents(ctx context.Context, request MonitorRequest, emit func(Event) 
 		asm.Mov.Imm(asm.R0, 2048).WithSymbol("accept"),
 		asm.Return(),
 	}
-	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_packets", Type: ebpf.SocketFilter, License: "MIT", Instructions: insns})
+}
+
+func packetEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
+	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_packets", Type: ebpf.SocketFilter, License: "MIT", Instructions: packetFilterInstructions()})
 	if err != nil {
 		return fmt.Errorf("load eBPF packet filter: %w", err)
 	}
