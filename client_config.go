@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ClientConfig contains paths and endpoints, never private key contents.
@@ -64,6 +65,9 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 		return ClientConfig{}, errors.New("client config contains trailing data")
 	}
 	for _, field := range []*string{&config.Key, &config.CA, &config.Cert} {
+		if field == &config.CA && strings.Contains(*field, "://") {
+			continue
+		}
 		if *field != "" && !filepath.IsAbs(*field) {
 			*field = filepath.Join(filepath.Dir(path), *field)
 		}

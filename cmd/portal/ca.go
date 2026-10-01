@@ -46,7 +46,7 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	keyPath := request.String("key", 0, "", "local SSH private key (created if absent)")
 	certPath := request.String("cert", 0, "", "output SSH certificate (renewals replace this file)")
 	refreshPath := request.String("refresh-token", 0, "", "refresh token file (default: <key>.refresh)")
-	trustedCA := request.String("ca", 0, "", "trusted CA public key file")
+	trustedCA := request.String("ca", 0, "", "trusted CA public key file or HTTPS URL")
 	certPrincipal := request.String("principal", 0, "admin", "expected SSH principal")
 	dispatcher.Dispatch("cert request", mflags.NewCommand(request, func(_ *mflags.FlagSet, _ []string) error {
 		if err := certificateConfigDefaults(request, *requestConfig, map[string]*string{"key": keyPath, "cert": certPath, "ca": trustedCA, "ca-url": caURL, "principal": certPrincipal}); err != nil {
@@ -88,7 +88,7 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	refreshKey := refresh.String("key", 0, "", "local SSH private key")
 	refreshCert := refresh.String("cert", 0, "", "SSH certificate output")
 	refreshToken := refresh.String("refresh-token", 0, "", "refresh token file (default: <key>.refresh)")
-	refreshCA := refresh.String("ca", 0, "", "trusted CA public key file")
+	refreshCA := refresh.String("ca", 0, "", "trusted CA public key file or HTTPS URL")
 	refreshPrincipal := refresh.String("principal", 0, "admin", "expected SSH principal")
 	dispatcher.Dispatch("cert refresh", mflags.NewCommand(refresh, func(_ *mflags.FlagSet, _ []string) error {
 		if err := certificateConfigDefaults(refresh, *refreshConfig, map[string]*string{"key": refreshKey, "cert": refreshCert, "ca": refreshCA, "ca-url": refreshURL, "principal": refreshPrincipal}); err != nil {
@@ -135,11 +135,7 @@ func saveIssued(issued portal.IssuedCertificate, signer ssh.Signer, caPath, prin
 	if tokenPath == keyPath || tokenPath == certPath || certPath == keyPath || caPath == tokenPath || caPath == certPath {
 		return errors.New("key, CA, certificate and refresh token paths must differ")
 	}
-	caData, err := os.ReadFile(caPath)
-	if err != nil {
-		return err
-	}
-	caPub, _, _, _, err := ssh.ParseAuthorizedKey(caData)
+	caPub, err := portal.LoadCAPublicKey(context.Background(), caPath)
 	if err != nil {
 		return err
 	}

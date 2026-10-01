@@ -32,11 +32,15 @@ func loadPolicy(path string) (policy, error) {
 	if err := dec.Decode(new(any)); err != io.EOF {
 		return nil, errors.New("invalid policy: trailing data")
 	}
-	if len(config.Identities) == 0 {
+	return compilePolicy(config.Identities)
+}
+
+func compilePolicy(identities map[string][]string) (policy, error) {
+	if len(identities) == 0 {
 		return nil, errors.New("policy requires identities")
 	}
-	allowed := make(policy, len(config.Identities))
-	for identity, names := range config.Identities {
+	allowed := make(policy, len(identities))
+	for identity, names := range identities {
 		if identity == "" || len(names) == 0 {
 			return nil, errors.New("policy identities must have a nonempty key ID and at least one account")
 		}

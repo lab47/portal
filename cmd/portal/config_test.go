@@ -53,3 +53,15 @@ func TestConfigInitAndClientCommands(t *testing.T) {
 		t.Fatalf("refresh did not use config: %v", err)
 	}
 }
+
+func TestClientConfigPreservesCAURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.json")
+	caURL := "https://ca.example.com/ca.pub"
+	if err := run([]string{"config", "init", "--config", path, "--key", "operator", "--ca", caURL, "--coordinator", "https://inventory.example"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := portal.LoadClientConfig(path)
+	if err != nil || c.CA != caURL || !filepath.IsAbs(c.Key) {
+		t.Fatalf("CA URL was treated as a file path: %v", err)
+	}
+}

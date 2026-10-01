@@ -31,6 +31,55 @@ To inspect the script before running it, download it with `curl -fsSL https://ra
 
 The installer verifies the binary against the release's `SHA256SUMS` before replacing an existing installation atomically. Run it again to upgrade. The build workflow publishes all four platform binaries after tests and builds succeed on current `main`; “latest” means the latest published main build, not a semantic-versioned release. The first successful run of this workflow on `main` must publish a release before installation is available. Find actual tags on the [releases page](https://github.com/lab47/portal/releases).
 
+## Coordinator configuration
+
+Create the coordinator's local config and a copy/paste registration URL:
+
+```sh
+portal coordinator init --url https://inventory.example.com --config ./coordinator.json
+portal coordinator --config ./coordinator.json --listen 127.0.0.1:8080
+```
+
+Initialization generates a cryptographically random 256-bit token, saves it in the coordinator's local config with owner-only permissions (0600), and prints a URL like `https://inventory.example.com/register/TOKEN` on stdout. Existing files are never overwritten. Put the coordinator behind a trusted HTTPS reverse proxy outside local testing. Copy/paste this **secret URL** to managed servers; no JSON document needs to be transferred. Lookup-only clients need just `https://inventory.example.com`, not the registration URL. There is no separate token file or registration-token environment variable.
+
+Without `--config`, these commands use `portal/coordinator.json` in the OS user-config directory. Retrieve the registration URL later with `portal coordinator url --config ./coordinator.json`. The coordinator keeps its config locally; servers save the registration URL as one string in `server.json`. When rotating the token, update the coordinator's config and each server's URL, then restart the services.
+
+The server decodes `/register/TOKEN` locally and sends registration requests to the base URL with the existing Bearer authorization header. The secret path is **not** sent to the coordinator or reverse proxy, and no new HTTP routes are required. Base path prefixes are preserved (for example `https://inventory.example.com/portal/register/TOKEN`). Tokens are URL-escaped as one path component; queries, fragments, userinfo, and missing or malformed tokens are rejected. Do not open registration URLs in a browser or expose them in logs, shell history, or screenshots; these are enrollment credentials, not web pages.
+
+## Server configuration
+
+Bundle server settings into a single file, including the registration token, trusted CA **public key contents**, and account policy:
+
+```sh
+portal server init \
+  --name node-a --coordinator 'https://inventory.example.com/register/TOKEN' \
+  --ca https://ca.example.com/ca.pub --identity operator --user "$(id -un)"
+portal server
+```
+
+`server init` writes an owner-only (0600) `portal/server.json` in the OS user-config directory and refuses to overwrite an existing file. `--coordinator` takes the registration URL printed by the coordinator. `--ca` imports a public key from a local file or HTTPS URL, never a CA signing key. The resolved key is embedded, so subsequent server starts do not fetch the URL or depend on the CA service being online. `--identity` is the certificate key ID; repeat `--user` to authorize multiple local accounts. No accounts, including root, are granted implicitly. After initialization, the server needs only `server.json`, not the original CA public-key file or a separate policy file. Do not delete files still used by the coordinator, CA, or clients.
+
+The default path is `$XDG_CONFIG_HOME/portal/server.json` or `~/.config/portal/server.json` on Linux, `~/Library/Application Support/portal/server.json` on macOS, and `%AppData%\portal\server.json` on Windows. For a service running under another account, choose an explicit path with `server init --config /etc/portal/server.json ...` and `portal server --config /etc/portal/server.json`, giving the service account ownership. Unix startup rejects group/world-accessible configs because they contain a secret; restrict access using ACLs on Windows.
+
+Edit the JSON to add more identities, labels, or optional relay/listen settings:
+
+```json
+{
+  "name": "node-a",
+  "coordinator": "https://inventory.example.com/register/YOUR-REGISTRATION-TOKEN",
+  "ca": "ssh-ed25519 YOUR-CA-PUBLIC-KEY",
+  "identities": {"operator": ["deploy"]},
+  "principal": "admin",
+  "labels": {"role": "worker", "region": "us-west"}
+}
+```
+
+Replace the example token/key and use actual local account names. Optional `relay` specifies an iroh relay URL; `listen` specifies a UDP bind IP:port. Restart the server after edits. Configs must contain the token and valid CA/policy even when overrides are supplied; unknown fields, trailing JSON, invalid accounts, and files larger than 64 KiB are rejected.
+
+Existing flag-only startup still works when the default config is absent; a missing explicit `--config` is an error. Nonempty flags override saved settings. Both `server init --coordinator` and `server --coordinator` accept registration URLs. The legacy base URL plus `--token` flags remain supported for direct startup, but registration tokens are no longer read from the environment. Overriding the saved coordinator URL requires supplying that coordinator's token too, either in its URL or explicitly, rather than sending the saved token to another URL. Conflicting URL and explicit tokens are rejected. `--ca` and `--policy` replace the embedded key and policy with external files. Repeated `--label KEY=VALUE` flags merge with saved labels, overriding matching keys. The principal defaults to `admin`. Go callers can use `Server{ConfigFile: path}.Serve(ctx)` or supply `CAPublicKey` and `Identities` directly.
+
+**Treat `server.json` as a secret:** do not commit it or include it in logs. It stores the registration token in plaintext. The CA private key remains separately protected on the CA host.
+
 ## Client configuration
 
 Set up shared defaults once:
@@ -46,7 +95,7 @@ portal query --name node-a --query 'process where name = worker*'
 
 The default file is `portal/config.json` inside the OS user-config directory: `$XDG_CONFIG_HOME/portal/config.json` or `~/.config/portal/config.json` on Linux, `~/Library/Application Support/portal/config.json` on macOS, and `%AppData%\portal\config.json` on Windows. `config init --config PATH` selects another output file; `--config PATH` on any client, monitor, query, certificate request or refresh command selects it for use. Initialization refuses to overwrite an existing config, creates its directory, and writes the file with mode 0600 (OS ACLs govern access on Windows). It stores only paths and endpoints, not private keys or refresh tokens. Credential files need not exist yet; `cert request` creates the key using the existing approval workflow. `--ca-url` is optional when a certificate already exists.
 
-The JSON fields are `key`, `ca` (trusted SSH CA **public key file**, not a private key), `coordinator`, and optional `cert`, `ca_url`, and `principal`. Setup stores absolute credential paths; manually written relative paths resolve against the config file's directory. Omitted `cert` defaults to `<key>-cert.pub`, and omitted `principal` defaults to `admin`. Nonempty command-line credential/endpoint options override config defaults. A missing default config allows the original flag-only usage; an explicitly selected missing file or malformed config returns an error. With `ca` configured, clients locally check that their user certificate is valid for that CA and principal before connecting; this does not authenticate the server with an SSH host certificate. Use HTTPS for a trusted coordinator connection. Go clients use these defaults too and can set `Client.ConfigFile`, `CAFile`, and `Principal` explicitly. `cert request` and `cert refresh` also inherit the saved CA URL and credentials; refresh tokens retain their `<key>.refresh` default.
+The JSON fields are `key`, `ca` (trusted SSH CA **public key file or HTTPS URL**, not a private key), `coordinator`, and optional `cert`, `ca_url`, and `principal`. Setup stores absolute credential paths and preserves CA URLs; manually written relative file paths resolve against the config file's directory. Omitted `cert` defaults to `<key>-cert.pub`, and omitted `principal` defaults to `admin`. Nonempty command-line credential/endpoint options override config defaults. A missing default config allows the original flag-only usage; an explicitly selected missing file or malformed config returns an error. With `ca` configured, clients check that their user certificate is valid for that CA and principal before connecting; this does not authenticate the server with an SSH host certificate. Use HTTPS for a trusted coordinator connection. Go clients use these defaults too and can set `Client.ConfigFile`, `CAFile`, and `Principal` explicitly. `cert request` and `cert refresh` also inherit the saved CA URL and credentials; refresh tokens retain their `<key>.refresh` default.
 
 ## Event monitors
 
@@ -216,23 +265,27 @@ In a temporary directory, generate a CA and client key, then sign a one-hour use
 
 The same `cert keygen` command creates either a CA or a user key; private keys are unencrypted and written with mode 0600. These commands never overwrite existing files. `cert inspect` checks the CA signature, principal, and validity period, but does not check the server's authorization policy or prove possession of the user private key. Certificates expire; there is no revocation list in this version, so protect the CA private key and restrict access through each server's policy.
 
-Start the coordinator in one terminal (use a long random token in practice):
+Initialize the coordinator config (prints a secret registration URL), then start the coordinator in one terminal:
 
 ```sh
-PORTAL_TOKEN=local-test-token ./portal coordinator --listen 127.0.0.1:8080
+./portal coordinator init --url http://127.0.0.1:8080 --config ./coordinator.json
+./portal coordinator --config ./coordinator.json --listen 127.0.0.1:8080
 ```
 
-Create a policy on the server mapping each CA-signed certificate key ID (`cert sign -id`) to the local accounts it may use. For this walkthrough, allow `operator` to run as the current server user:
+Initialize the server config, allowing `operator` (the CA-signed certificate key ID from `cert sign --id`) to run as the current server user:
 
 ```sh
-printf '{"identities":{"operator":["%s"]}}\n' "$(id -un)" > policy.json
+./portal server init \
+  --name node-a --coordinator 'http://127.0.0.1:8080/register/TOKEN' \
+  --ca ca.pub --identity operator --user "$(id -un)"
 ```
 
-Start a server in another terminal; it validates its policy before registering or accepting commands:
+Replace `TOKEN` with the generated token, or paste the full URL printed by `coordinator init`.
+
+Start a server in another terminal; it loads the saved token, CA public key and policy before registering or accepting commands:
 
 ```sh
-PORTAL_TOKEN=local-test-token ./portal server \
-  --name node-a --coordinator http://127.0.0.1:8080 --ca ca.pub --policy policy.json \
+./portal server \
   --label role=worker --label region=us-west
 ```
 
@@ -260,7 +313,11 @@ PORTAL_CA_ENROLL_TOKEN="$(cat ca-enroll-token)" portal ca serve \
   --identity operator --principal admin --ca-key ca --state ca-state.json
 ```
 
-After enrollment, remove `PORTAL_CA_ENROLL_TOKEN` from the CA environment and delete the token file; passkeys are persisted in the state file. This first version serves one configured identity per CA instance. An administrator must independently distribute `ca.pub` to clients and servers, and add `operator` to each server's local policy with only the accounts it may use. Passkey enrollment does **not** grant access by itself.
+`ca serve` exposes the signing key's **public** counterpart at `GET /ca.pub`, in SSH authorized-key format, without authentication. For this example, use `--ca https://ca.example.com/ca.pub`. The endpoint never exposes the signing private key, passkey state, or enrollment token; `--ca-key` remains a local private-key file.
+
+All public `--ca` options accept a local path or an HTTPS URL, including server initialization/startup, client commands/config, and certificate request/refresh/inspection. Fetching uses normal TLS verification, a ten-second timeout, a 64 KiB limit, and exactly one plain SSH public key. Plain HTTP, redirects to HTTP, private keys, certificates, and malformed responses are rejected. A URL trusts that HTTPS origin to supply the CA key; use an independently distributed local file for an out-of-band pin. Server initialization pins the fetched key in its config; clients configured with a URL fetch its current key when verifying certificates, so changing that endpoint changes their trusted CA.
+
+After enrollment, remove `PORTAL_CA_ENROLL_TOKEN` from the CA environment and delete the token file; passkeys are persisted in the state file. This first version serves one configured identity per CA instance. An administrator must distribute the trusted CA public-key file or HTTPS endpoint to clients and servers, and add `operator` to each server's local policy with only the accounts it may use. Passkey enrollment does **not** grant access by itself.
 
 On any machine, request a certificate without copying the old private key:
 
@@ -270,7 +327,7 @@ portal cert request --ca-url https://ca.example.com --ca ca.pub \
   --key ~/.config/portal/operator --cert ~/.config/portal/operator-cert.pub
 ```
 
-The command generates a local Ed25519 key if absent, shows its fingerprint, and prints an approval URL. Open that URL in a browser, compare the fingerprint, and approve with a passkey. On first enrollment, enter the one-time enrollment token. The client receives a **48-hour SSH user certificate** for the new public key, verifies it against its pinned CA public key, and writes it to `--cert`. It also stores a refresh token in `<key>.refresh` with mode 0600. The CA never receives the client's private key.
+The command generates a local Ed25519 key if absent, shows its fingerprint, and prints an approval URL. Open that URL in a browser, compare the fingerprint, and approve with a passkey. On first enrollment, enter the one-time enrollment token. The client receives a **48-hour SSH user certificate** for the new public key, verifies it against its configured CA public key, and writes it to `--cert`. It also stores a refresh token in `<key>.refresh` with mode 0600. The CA never receives the client's private key.
 
 Headless clients can renew without a browser using the **same private key** and their refresh token:
 

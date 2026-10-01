@@ -3,7 +3,6 @@ package portal
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"time"
 
@@ -49,11 +48,7 @@ func withClient[T any](c Client, ctx context.Context, use func(*iroh.Endpoint, r
 		return zero, err
 	}
 	if c.CAFile != "" {
-		data, err := os.ReadFile(c.CAFile)
-		if err != nil {
-			return zero, err
-		}
-		ca, _, _, _, err := ssh.ParseAuthorizedKey(data)
+		ca, err := LoadCAPublicKey(ctx, c.CAFile)
 		if err != nil {
 			return zero, err
 		}

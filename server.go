@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log"
 	"net/netip"
-	"os"
 	"strings"
 	"time"
 
@@ -19,24 +18,37 @@ import (
 type Server struct {
 	Name, CoordinatorURL, Token   string
 	CAFile, Principal, PolicyFile string
-	RelayURL, Listen              string            // Optional relay URL and UDP bind IP:port.
-	Labels                        map[string]string // Optional inventory metadata advertised at each check-in.
+	ConfigFile, CAPublicKey       string              // Config path and optional inline CA public key.
+	Identities                    map[string][]string // Optional inline account policy.
+	RelayURL, Listen              string              // Optional relay URL and UDP bind IP:port.
+	Labels                        map[string]string   // Optional inventory metadata advertised at each check-in.
 }
 
 // Serve checks in with the coordinator and accepts commands until ctx is canceled.
 func (s Server) Serve(ctx context.Context) error {
-	if s.Name == "" || s.CoordinatorURL == "" || s.Token == "" || s.CAFile == "" || s.Principal == "" || s.PolicyFile == "" {
-		return errors.New("server requires name, coordinator URL, token, CA file, principal and policy file")
-	}
-	policy, err := loadPolicy(s.PolicyFile)
+	var err error
+	s, err = s.configured()
 	if err != nil {
 		return err
 	}
-	caData, err := os.ReadFile(s.CAFile)
+	if s.Name == "" || s.CoordinatorURL == "" || s.Token == "" || (s.CAFile == "" && s.CAPublicKey == "") || (s.PolicyFile == "" && s.Identities == nil) {
+		return errors.New("server requires name, coordinator URL, token, CA public key or CA file, and identities or policy file")
+	}
+	var policy policy
+	if s.PolicyFile != "" {
+		policy, err = loadPolicy(s.PolicyFile)
+	} else {
+		policy, err = compilePolicy(s.Identities)
+	}
 	if err != nil {
 		return err
 	}
-	ca, _, _, _, err := ssh.ParseAuthorizedKey(caData)
+	var ca ssh.PublicKey
+	if s.CAFile != "" {
+		ca, err = LoadCAPublicKey(ctx, s.CAFile)
+	} else {
+		ca, _, _, _, err = ssh.ParseAuthorizedKey([]byte(s.CAPublicKey))
+	}
 	if err != nil {
 		return err
 	}

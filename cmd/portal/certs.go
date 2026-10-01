@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -50,7 +51,7 @@ func registerCertCommands(dispatcher *mflags.Dispatcher) {
 
 	inspectFlags := mflags.NewFlagSet("cert inspect")
 	certFile := inspectFlags.String("cert", 0, "", "user certificate path")
-	caFile := inspectFlags.String("ca", 0, "", "trusted CA public key path")
+	caFile := inspectFlags.String("ca", 0, "", "trusted CA public key path or HTTPS URL")
 	inspectPrincipal := inspectFlags.String("principal", 0, "", "required server principal")
 	dispatcher.Dispatch("cert inspect", mflags.NewCommand(inspectFlags, func(_ *mflags.FlagSet, _ []string) error {
 		if *certFile == "" || *caFile == "" || *inspectPrincipal == "" {
@@ -159,11 +160,7 @@ func inspectCertificate(certPath, caPath, principal string) (*ssh.Certificate, e
 	if !ok {
 		return nil, errors.New("not an SSH certificate")
 	}
-	caData, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, err
-	}
-	ca, _, _, _, err := ssh.ParseAuthorizedKey(caData)
+	ca, err := portal.LoadCAPublicKey(context.Background(), caPath)
 	if err != nil {
 		return nil, err
 	}

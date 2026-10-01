@@ -31,15 +31,24 @@ func run(args []string) error {
 
 	coordinatorFlags := mflags.NewFlagSet("coordinator")
 	coordinatorListen := coordinatorFlags.String("listen", 0, "127.0.0.1:8080", "HTTP listen address")
-	coordinatorToken := coordinatorFlags.String("token", 0, os.Getenv("PORTAL_TOKEN"), "server registration token (or PORTAL_TOKEN)")
+	coordinatorConfig := coordinatorFlags.String("config", 0, "", "coordinator config file (default: user config directory/portal/coordinator.json)")
+	coordinatorToken := coordinatorFlags.String("token", 0, "", "legacy registration-token override (prefer config)")
 	dispatcher.Dispatch("coordinator", mflags.NewCommand(coordinatorFlags, func(_ *mflags.FlagSet, _ []string) error {
-		if *coordinatorToken == "" {
+		config, err := portal.LoadCoordinatorConfig(*coordinatorConfig)
+		if err != nil {
+			return err
+		}
+		registrationToken := config.Token
+		if *coordinatorToken != "" {
+			registrationToken = *coordinatorToken
+		}
+		if registrationToken == "" {
 			return errors.New("registration token required")
 		}
 		log.Printf("coordinator listening on %s", *coordinatorListen)
-		server := &http.Server{Addr: *coordinatorListen, Handler: portal.NewCoordinator(*coordinatorToken), ReadHeaderTimeout: 5 * time.Second}
+		server := &http.Server{Addr: *coordinatorListen, Handler: portal.NewCoordinator(registrationToken), ReadHeaderTimeout: 5 * time.Second}
 		go func() { <-ctx.Done(); server.Shutdown(context.Background()) }()
-		err := server.ListenAndServe()
+		err = server.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -49,12 +58,13 @@ func run(args []string) error {
 	serverFlags := mflags.NewFlagSet("server")
 	name := serverFlags.String("name", 0, "", "inventory name")
 	coordinatorURL := serverFlags.String("coordinator", 0, "", "coordinator HTTP(S) URL")
-	token := serverFlags.String("token", 0, os.Getenv("PORTAL_TOKEN"), "registration token (or PORTAL_TOKEN)")
+	token := serverFlags.String("token", 0, "", "legacy registration-token override (prefer config)")
 	relayURL := serverFlags.String("relay", 0, "", "iroh relay URL (default: number0 production relays)")
 	listen := serverFlags.String("listen", 0, "", "optional UDP bind IP:port for direct paths (default: OS-assigned dual-stack port)")
-	caFile := serverFlags.String("ca", 0, "", "trusted SSH user CA public key file")
-	policyFile := serverFlags.String("policy", 0, "", "required JSON authorization policy file")
-	principal := serverFlags.String("principal", 0, "admin", "required certificate principal")
+	serverConfig := serverFlags.String("config", 0, "", "server config file (default: user config directory/portal/server.json)")
+	caFile := serverFlags.String("ca", 0, "", "trusted SSH user CA public key file or HTTPS URL (overrides embedded key)")
+	policyFile := serverFlags.String("policy", 0, "", "JSON authorization policy file (overrides embedded policy)")
+	principal := serverFlags.String("principal", 0, "", "required certificate principal (default: admin)")
 	var labelFlags []string
 	serverFlags.StringArrayNoSplitVar(&labelFlags, "label", 0, nil, "inventory label KEY=VALUE (repeatable)")
 	dispatcher.Dispatch("server", mflags.NewCommand(serverFlags, func(_ *mflags.FlagSet, _ []string) error {
@@ -71,7 +81,7 @@ func run(args []string) error {
 		}
 		return (portal.Server{
 			Name: *name, CoordinatorURL: *coordinatorURL, Token: *token,
-			CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen, Labels: labels,
+			ConfigFile: *serverConfig, CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen, Labels: labels,
 		}).Serve(ctx)
 	}, mflags.WithUsage("Check in and serve authenticated commands")))
 
@@ -238,5 +248,7 @@ func run(args []string) error {
 	registerCertCommands(dispatcher)
 	registerCACommands(dispatcher, ctx)
 	registerConfigCommands(dispatcher)
+	registerServerInitCommand(dispatcher, ctx)
+	registerCoordinatorInitCommand(dispatcher)
 	return dispatcher.Run(args)
 }

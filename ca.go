@@ -185,6 +185,12 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, value any) bool {
 // Handler exposes device requests and one-time browser passkey ceremonies.
 func (c *CA) Handler(origin string) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ca.pub", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write(ssh.MarshalAuthorizedKey(c.signer.PublicKey()))
+	})
 	mux.HandleFunc("POST /requests", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			PublicKey string `json:"public_key"`
