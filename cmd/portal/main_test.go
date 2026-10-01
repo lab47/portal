@@ -17,6 +17,15 @@ func TestClientCommandSeparator(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesCommand(t *testing.T) {
+	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	for _, command := range [][]string{{"capabilities"}, {"query", "--query", "capabilities"}} {
+		if err := run(append(command, connection...)); err == nil || !strings.Contains(err.Error(), "/missing-key") {
+			t.Fatalf("capability command did not use client credentials: %v", err)
+		}
+	}
+}
+
 func TestServerRequiresPolicy(t *testing.T) {
 	args := []string{"server", "--name", "node-a", "--coordinator", "http://localhost:8080", "--token", "test", "--ca", "/missing-ca"}
 	if err := run(args); err == nil || !strings.Contains(err.Error(), "policy file") {

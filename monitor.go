@@ -125,17 +125,18 @@ type ProcessInfo struct {
 
 // Snapshot is a one-shot view, not a stream of lifecycle events.
 type Snapshot struct {
-	Source      string             `json:"source"`
-	Time        time.Time          `json:"time"`
-	Processes   []ProcessInfo      `json:"processes,omitempty"`
-	CPU         []CPUInfo          `json:"cpu,omitempty"`
-	Memory      *MemoryInfo        `json:"memory,omitempty"`
-	Network     []InterfaceInfo    `json:"network,omitempty"`
-	Kernel      *KernelInfo        `json:"kernel,omitempty"`
-	Sensors     []SensorInfo       `json:"sensors,omitempty"`
-	Containers  []ContainerInfo    `json:"containers,omitempty"`
-	GPUs        []GPUInfo          `json:"gpus,omitempty"`
-	Aggregation *AggregationResult `json:"aggregation,omitempty"`
+	Source       string             `json:"source"`
+	Time         time.Time          `json:"time"`
+	Processes    []ProcessInfo      `json:"processes,omitempty"`
+	CPU          []CPUInfo          `json:"cpu,omitempty"`
+	Memory       *MemoryInfo        `json:"memory,omitempty"`
+	Network      []InterfaceInfo    `json:"network,omitempty"`
+	Kernel       *KernelInfo        `json:"kernel,omitempty"`
+	Sensors      []SensorInfo       `json:"sensors,omitempty"`
+	Containers   []ContainerInfo    `json:"containers,omitempty"`
+	GPUs         []GPUInfo          `json:"gpus,omitempty"`
+	Aggregation  *AggregationResult `json:"aggregation,omitempty"`
+	Capabilities *Capabilities      `json:"capabilities,omitempty"`
 }
 
 // MarshalJSON keeps empty collections visible for the selected source while
@@ -258,7 +259,7 @@ func (r MonitorRequest) validate() error {
 	} else if r.Aggregation != nil {
 		return errors.New("aggregation requires aggregate mode")
 	}
-	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu" {
+	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu" && r.Source != "capabilities" {
 		return errors.New("unsupported snapshot source")
 	}
 	if r.Name != "" && !validEdgeGlob(r.Name) {
@@ -317,7 +318,7 @@ func (r MonitorRequest) validate() error {
 		if r.Disk != nil && r.Disk.Operation != "" && r.Disk.Operation != "read" && r.Disk.Operation != "write" && r.Disk.Operation != "discard" && r.Disk.Operation != "flush" {
 			return errors.New("disk operation must be read, write, discard or flush")
 		}
-	case "cpu", "memory", "network", "kernel", "sensors", "containers", "gpu":
+	case "cpu", "memory", "network", "kernel", "sensors", "containers", "gpu", "capabilities":
 		if r.Mode != "snapshot" || r.PID != 0 || len(r.Syscalls) != 0 || r.Packet != nil || r.Process != nil || r.Disk != nil || r.Tracepoint != nil ||
 			(r.Name != "" && r.Source != "network" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu") {
 			return errors.New("invalid snapshot source filters")
@@ -579,7 +580,14 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 	}
 	if req.Mode == "snapshot" {
 		stream.SetDeadline(time.Now().Add(30 * time.Second))
-		snapshot, err := querySnapshot(ctx, req.MonitorRequest)
+		var snapshot Snapshot
+		var err error
+		if req.Source == "capabilities" {
+			docs := describeCapabilities(policy, cert)
+			snapshot = Snapshot{Source: "capabilities", Time: time.Now().UTC(), Capabilities: &docs}
+		} else {
+			snapshot, err = querySnapshot(ctx, req.MonitorRequest)
+		}
 		if err != nil {
 			writeMonitorError(stream, err.Error())
 			return

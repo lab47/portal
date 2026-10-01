@@ -40,6 +40,14 @@ type registeredMonitorFrame struct {
 }
 
 func authorizeMonitorSource(p policy, cert *ssh.Certificate, source string) error {
+	if source == "capabilities" {
+		// Any mapped identity may discover requirements, including when it
+		// cannot query the server's own account. Never expose policy contents.
+		if len(p[cert.KeyId]) == 0 {
+			return errors.New("not authorized")
+		}
+		return nil
+	}
 	privileged := source == "packets" || source == "disk" || source == "containers" || source == "tracepoint"
 	if privileged && os.Geteuid() != 0 {
 		return fmt.Errorf("%s monitoring requires a root server", source)

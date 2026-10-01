@@ -97,6 +97,41 @@ The default file is `portal/config.json` inside the OS user-config directory: `$
 
 The JSON fields are `key`, `ca` (trusted SSH CA **public key file or HTTPS URL**, not a private key), `coordinator`, and optional `cert`, `ca_url`, and `principal`. Setup stores absolute credential paths and preserves CA URLs; manually written relative file paths resolve against the config file's directory. Omitted `cert` defaults to `<key>-cert.pub`, and omitted `principal` defaults to `admin`. Nonempty command-line credential/endpoint options override config defaults. A missing default config allows the original flag-only usage; an explicitly selected missing file or malformed config returns an error. With `ca` configured, clients check that their user certificate is valid for that CA and principal before connecting; this does not authenticate the server with an SSH host certificate. Use HTTPS for a trusted coordinator connection. Go clients use these defaults too and can set `Client.ConfigFile`, `CAFile`, and `Principal` explicitly. `cert request` and `cert refresh` also inherit the saved CA URL and credentials; refresh tokens retain their `<key>.refresh` default.
 
+## Capability discovery
+
+Ask the target server for its versioned, structured query reference using the
+same client config and certificate as other requests:
+
+```sh
+portal capabilities --name node-a
+portal capabilities --name node-a | jq '.sources[] | select(.name == "packets")'
+
+# The same reference is also available inside a snapshot response:
+portal query --name node-a --query 'capabilities'
+```
+
+The reference describes every data source, event/snapshot/aggregate modes,
+output JSON paths and types, units, DSL field aliases, filters and allowed
+values, grouping/numeric fields, all seven aggregate functions, examples,
+limits, and registered-monitor lifetime/storage semantics. `version` is the
+reference schema version; `os` and `arch` describe the **server**, not the client.
+In Go, use `Client.Capabilities(ctx)` or inspect `Snapshot.Capabilities` from
+`Client.Query(ctx, MonitorRequest{Source: "capabilities"})`.
+
+Each source reports `platform_supported`, `authorized` for the requesting
+identity, requirements, and an `unavailable_reason` when platform or
+authorization checks fail. These are not runtime health probes: eBPF loading,
+tracepoint formats, Docker access, GPU drivers, and other runtime dependencies
+can still fail when queried. Discovery never attaches a monitor or collects
+host data, and does not expose the server's policy or credentials.
+
+Discovery requires a trusted certificate and an identity mapped to at least
+one local account in the server policy. It does **not** require root or access
+to the server process's account just to learn the requirements; it grants no
+additional access to those sources. Capability requests are signed and cannot
+be used as event monitors or aggregates. Upgrade the managed server and client
+to use discovery; the coordinator and CA need no changes.
+
 ## Event monitors
 
 Clients can attach a long-lived, authenticated monitor to a server. The `syscalls` source uses an eBPF raw tracepoint on Linux to stream syscall-entry events (UTC receipt time, PID, TID, and numeric syscall ID) as JSON lines:

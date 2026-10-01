@@ -241,6 +241,17 @@ func run(args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(snapshot)
 	}, mflags.WithUsage("Return current server state or windowed event aggregates as JSON")))
+	capabilityFlags := mflags.NewFlagSet("capabilities")
+	capabilityOptions := clientConnectionFlags(capabilityFlags)
+	dispatcher.Dispatch("capabilities", mflags.NewCommand(capabilityFlags, func(_ *mflags.FlagSet, _ []string) error {
+		docs, err := capabilityOptions().Capabilities(ctx)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(docs)
+	}, mflags.WithUsage("Describe server sources, fields, filters, aggregates and caller authorization as JSON")))
 	mcpCommands := mflags.NewDispatcher("portal")
 	mcpCommands.Dispatch("client", clientCommand)
 	dispatcher.Dispatch("mcp-server", mflags.NewMCPServerCommand(mcpCommands))
