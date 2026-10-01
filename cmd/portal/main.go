@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -74,17 +76,14 @@ func run(args []string) error {
 	}, mflags.WithUsage("Check in and serve authenticated commands")))
 
 	clientFlags := mflags.NewFlagSet("client")
-	clientName := clientFlags.String("name", 0, "", "inventory name")
-	clientCoordinatorURL := clientFlags.String("coordinator", 0, "", "coordinator HTTP(S) URL")
-	keyFile := clientFlags.String("key", 0, "", "SSH private key file")
-	certFile := clientFlags.String("cert", 0, "", "SSH user certificate file")
+	clientOptions := clientConnectionFlags(clientFlags)
 	user := clientFlags.String("user", 0, "", "local account to run the command as on the server")
 	var command []string
 	clientFlags.Rest(&command, "command and arguments")
 	clientCommand := mflags.NewCommand(clientFlags, func(_ *mflags.FlagSet, _ []string) error {
-		response, err := (portal.Client{
-			Name: *clientName, CoordinatorURL: *clientCoordinatorURL, KeyFile: *keyFile, CertFile: *certFile, User: *user,
-		}).Run(ctx, command)
+		client := clientOptions()
+		client.User = *user
+		response, err := client.Run(ctx, command)
 		if err != nil {
 			return err
 		}
@@ -98,11 +97,146 @@ func run(args []string) error {
 		return nil
 	}, mflags.WithUsage("Look up a server and run a command (MCP arguments: prefix the command array with -- to preserve remote flags)"))
 	dispatcher.Dispatch("client", clientCommand)
+	monitorFlags := mflags.NewFlagSet("monitor")
+	monitorOptions := clientConnectionFlags(monitorFlags)
+	monitorQuery := monitorFlags.String("query", 0, "", "event query (for example: packets where protocol = tcp and dst.port = 80)")
+	monitorSource := monitorFlags.String("source", 0, "syscalls", "event source (syscalls, packets, process or disk; use --query for tracepoint)")
+	monitorPID := monitorFlags.Int("pid", 0, 0, "filter by process ID (0 matches all)")
+	var syscallFlags []string
+	monitorFlags.StringArrayNoSplitVar(&syscallFlags, "syscall", 0, nil, "filter by syscall number (repeatable)")
+	processName := monitorFlags.String("process-name", 0, "", "filter process events by exact name, prefix* or *suffix")
+	processAction := monitorFlags.String("process-action", 0, "", "filter process events by start or exit")
+	diskDevice := monitorFlags.String("device", 0, "", "disk kernel device ID (decimal or 0x hex)")
+	diskOperation := monitorFlags.String("operation", 0, "", "disk operation: read, write, discard or flush")
+	packetProtocol := monitorFlags.String("protocol", 0, "", "packet protocol: tcp or udp")
+	packetDirection := monitorFlags.String("direction", 0, "", "packet direction: incoming or outgoing")
+	packetSourceIP := monitorFlags.String("src-ip", 0, "", "packet source IP")
+	packetDestinationIP := monitorFlags.String("dst-ip", 0, "", "packet destination IP")
+	packetSourcePort := monitorFlags.Int("src-port", 0, 0, "packet source port")
+	packetDestinationPort := monitorFlags.Int("dst-port", 0, 0, "packet destination port")
+	dispatcher.Dispatch("monitor", mflags.NewCommand(monitorFlags, func(_ *mflags.FlagSet, _ []string) error {
+		if *monitorQuery != "" {
+			for _, name := range []string{"source", "pid", "syscall", "process-name", "process-action", "device", "operation", "protocol", "direction", "src-ip", "dst-ip", "src-port", "dst-port"} {
+				if monitorFlags.Lookup(name).HasValue {
+					return fmt.Errorf("--query cannot be combined with --%s", name)
+				}
+			}
+			request, err := portal.ParseMonitorQuery(*monitorQuery)
+			if err != nil {
+				return err
+			}
+			return monitorOptions().Monitor(ctx, request, func(event portal.Event) error {
+				return json.NewEncoder(os.Stdout).Encode(event)
+			})
+		}
+		if *monitorPID < 0 || uint64(*monitorPID) > uint64(^uint32(0)) {
+			return errors.New("PID out of range")
+		}
+		if *packetSourcePort < 0 || *packetSourcePort > 65535 || *packetDestinationPort < 0 || *packetDestinationPort > 65535 {
+			return errors.New("packet port out of range")
+		}
+		request := portal.MonitorRequest{Source: *monitorSource, PID: uint32(*monitorPID)}
+		for _, value := range syscallFlags {
+			id, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid syscall %q: %w", value, err)
+			}
+			request.Syscalls = append(request.Syscalls, id)
+		}
+		if *processName != "" || *processAction != "" {
+			request.Process = &portal.ProcessFilter{Name: *processName, Action: *processAction}
+		}
+		if *diskDevice != "" || *diskOperation != "" {
+			request.Disk = &portal.DiskFilter{Operation: *diskOperation}
+			if *diskDevice != "" {
+				device, err := strconv.ParseUint(*diskDevice, 0, 32)
+				if err != nil || device == 0 {
+					return fmt.Errorf("invalid device %q", *diskDevice)
+				}
+				request.Disk.Device = uint32(device)
+			}
+		}
+		if *monitorSource == "packets" || *packetProtocol != "" || *packetDirection != "" || *packetSourceIP != "" || *packetDestinationIP != "" || *packetSourcePort != 0 || *packetDestinationPort != 0 {
+			request.Packet = &portal.PacketFilter{
+				Protocol: *packetProtocol, Direction: *packetDirection,
+				SourceIP: *packetSourceIP, DestinationIP: *packetDestinationIP,
+				SourcePort: uint16(*packetSourcePort), DestinationPort: uint16(*packetDestinationPort),
+			}
+		}
+		return monitorOptions().Monitor(ctx, request, func(event portal.Event) error {
+			return json.NewEncoder(os.Stdout).Encode(event)
+		})
+	}, mflags.WithUsage("Stream authenticated server-side eBPF events as JSON lines")))
+	registerFlags := mflags.NewFlagSet("monitor-register")
+	registerOptions := clientConnectionFlags(registerFlags)
+	registerQuery := registerFlags.String("query", 0, "", "event query for the persistent monitor")
+	registerTTL := registerFlags.Duration("ttl", 0, portal.DefaultMonitorTTL, "idle lifetime, reset on reads (for example: 30m)")
+	dispatcher.Dispatch("monitor-register", mflags.NewCommand(registerFlags, func(_ *mflags.FlagSet, _ []string) error {
+		if *registerQuery == "" {
+			return errors.New("--query required")
+		}
+		request, err := portal.ParseMonitorQuery(*registerQuery)
+		if err != nil {
+			return err
+		}
+		id, err := registerOptions().CreateMonitor(ctx, request, *registerTTL)
+		if err != nil {
+			return err
+		}
+		fmt.Println(id)
+		return nil
+	}, mflags.WithUsage("Register a server-owned monitor and print its ID")))
+	readFlags := mflags.NewFlagSet("monitor-read")
+	readOptions := clientConnectionFlags(readFlags)
+	readID := readFlags.String("id", 0, "", "registered monitor ID")
+	readAfter := readFlags.String("after", 0, "0", "last processed sequence (0 starts from beginning)")
+	readTimestamp := readFlags.String("after-timestamp", 0, "", "last event TAI64N timestamp (best-effort resume)")
+	dispatcher.Dispatch("monitor-read", mflags.NewCommand(readFlags, func(_ *mflags.FlagSet, _ []string) error {
+		if readFlags.Lookup("after-timestamp").HasValue {
+			if readFlags.Lookup("after").HasValue {
+				return errors.New("--after and --after-timestamp are mutually exclusive")
+			}
+			return readOptions().ReadMonitorSince(ctx, *readID, *readTimestamp, func(record portal.MonitorRecord) error {
+				return json.NewEncoder(os.Stdout).Encode(record)
+			})
+		}
+		cursor, err := strconv.ParseUint(*readAfter, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid monitor cursor %q: %w", *readAfter, err)
+		}
+		return readOptions().ReadMonitor(ctx, *readID, cursor, func(record portal.MonitorRecord) error {
+			return json.NewEncoder(os.Stdout).Encode(record)
+		})
+	}, mflags.WithUsage("Replay records after a sequence, then follow the monitor as JSON lines")))
+	deleteFlags := mflags.NewFlagSet("monitor-delete")
+	deleteOptions := clientConnectionFlags(deleteFlags)
+	deleteID := deleteFlags.String("id", 0, "", "registered monitor ID")
+	dispatcher.Dispatch("monitor-delete", mflags.NewCommand(deleteFlags, func(_ *mflags.FlagSet, _ []string) error {
+		return deleteOptions().DeleteMonitor(ctx, *deleteID)
+	}, mflags.WithUsage("Stop a registered monitor and discard its history")))
+	queryFlags := mflags.NewFlagSet("query")
+	queryOptions := clientConnectionFlags(queryFlags)
+	queryText := queryFlags.String("query", 0, "", "snapshot or aggregation query (for example: syscalls count over 30s by pid)")
+	dispatcher.Dispatch("query", mflags.NewCommand(queryFlags, func(_ *mflags.FlagSet, _ []string) error {
+		if *queryText == "" {
+			return errors.New("--query required")
+		}
+		request, err := portal.ParseMonitorQuery(*queryText)
+		if err != nil {
+			return err
+		}
+		snapshot, err := queryOptions().Query(ctx, request)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(snapshot)
+	}, mflags.WithUsage("Return current server state or windowed event aggregates as JSON")))
 	mcpCommands := mflags.NewDispatcher("portal")
 	mcpCommands.Dispatch("client", clientCommand)
 	dispatcher.Dispatch("mcp-server", mflags.NewMCPServerCommand(mcpCommands))
 
 	registerCertCommands(dispatcher)
 	registerCACommands(dispatcher, ctx)
+	registerConfigCommands(dispatcher)
 	return dispatcher.Run(args)
 }

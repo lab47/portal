@@ -6,6 +6,177 @@ Requires Go 1.26 and outbound access to an iroh relay from both server and clien
 
 The importable `github.com/lab47/portal` package exposes `NewCoordinator(token)` as an HTTP handler, `Server.Serve(ctx)` for registration and command serving, and `Client.Run(ctx, argv)` for lookup and execution. `Client.Run` returns a `Result` containing output and remote exit status; the CLI in `cmd/portal` uses `miren.dev/mflags` for subcommands and flags. Use `--` before the remote command to pass flag-like arguments through unchanged.
 
+## Client configuration
+
+Set up shared defaults once:
+
+```sh
+portal config init --key "$HOME/.ssh/operator" --ca ./ca.pub \
+  --coordinator https://inventory.example.com \
+  --ca-url https://ca.example.com
+portal cert request              # optional: generate a missing key and request approval
+portal client --name node-a -- uname -a
+portal query --name node-a --query 'process where name = worker*'
+```
+
+The default file is `portal/config.json` inside the OS user-config directory: `$XDG_CONFIG_HOME/portal/config.json` or `~/.config/portal/config.json` on Linux, `~/Library/Application Support/portal/config.json` on macOS, and `%AppData%\portal\config.json` on Windows. `config init --config PATH` selects another output file; `--config PATH` on any client, monitor, query, certificate request or refresh command selects it for use. Initialization refuses to overwrite an existing config, creates its directory, and writes the file with mode 0600 (OS ACLs govern access on Windows). It stores only paths and endpoints, not private keys or refresh tokens. Credential files need not exist yet; `cert request` creates the key using the existing approval workflow. `--ca-url` is optional when a certificate already exists.
+
+The JSON fields are `key`, `ca` (trusted SSH CA **public key file**, not a private key), `coordinator`, and optional `cert`, `ca_url`, and `principal`. Setup stores absolute credential paths; manually written relative paths resolve against the config file's directory. Omitted `cert` defaults to `<key>-cert.pub`, and omitted `principal` defaults to `admin`. Nonempty command-line credential/endpoint options override config defaults. A missing default config allows the original flag-only usage; an explicitly selected missing file or malformed config returns an error. With `ca` configured, clients locally check that their user certificate is valid for that CA and principal before connecting; this does not authenticate the server with an SSH host certificate. Use HTTPS for a trusted coordinator connection. Go clients use these defaults too and can set `Client.ConfigFile`, `CAFile`, and `Principal` explicitly. `cert request` and `cert refresh` also inherit the saved CA URL and credentials; refresh tokens retain their `<key>.refresh` default.
+
+## Event monitors
+
+Clients can attach a long-lived, authenticated monitor to a server. The `syscalls` source uses an eBPF raw tracepoint on Linux to stream syscall-entry events (UTC receipt time, PID, TID, and numeric syscall ID) as JSON lines:
+
+```sh
+./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub --source syscalls \
+  --pid 1234 --syscall 0 --syscall 1
+```
+
+To keep collecting while the client is disconnected, register a server-owned monitor instead. The same event queries and authorization rules apply:
+
+```sh
+./portal monitor-register --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub \
+  --query 'process where name = worker*' # prints a monitor ID
+./portal monitor-read --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub --id MONITOR_ID --after 0
+# Disconnect with Ctrl-C; later, use --after with the last processed sequence.
+./portal monitor-delete --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub --id MONITOR_ID
+```
+
+`monitor-read` outputs JSON lines of `{ "sequence": N, "event": { ... } }`, first replaying retained events after `--after` and then following new events. Save the sequence **only after processing** each record; supplying it on the next read avoids both skips and duplicates. A new reader can start from `--after 0`. Multiple readers may use independent cursors.
+
+Every streamed event also has `tai64n`, an `@` followed by 24 lowercase hexadecimal digits (8 bytes of TAI seconds and 4 bytes of nanoseconds, big-endian). The existing UTC `time` remains available. TAI64N is assigned at server ingestion and is strictly increasing per monitor, advancing by one nanosecond on clock ties or backward wall-clock adjustments. Buffered replays preserve the original timestamp. UTC conversion uses the known leap-second table through 2017 (TAI−UTC = 37 seconds); the table must be updated for future leap seconds.
+
+To resume by the last processed event's timestamp, use `monitor-read ... --id MONITOR_ID --after-timestamp '@40000000586846a500000000'`, or `Client.ReadMonitorSince(ctx, id, lastEvent.TAI64N, callback)`. This timestamp is part of the signed request. The read starts with the first retained event **strictly newer** than the timestamp, including when the timestamp falls between events. If it predates retained history, the server starts at the oldest retained event as a best-effort continuation; overwritten events cannot be recovered. If it is at or beyond the latest event, the read waits for newer events while the source remains active. `--after` and `--after-timestamp` cannot be combined. Sequence cursors remain the choice for strict history-loss detection.
+
+Registered monitors have an idle TTL of **15 minutes** by default. Override it at creation with `monitor-register ... --ttl 30m`, or `Client.CreateMonitor(ctx, request, 30*time.Minute)` in Go. Omitting the duration (or using zero) selects `DefaultMonitorTTL`; negative durations are rejected. Every authorized read renews the lifetime, for both sequence and timestamp cursors. An active streaming read keeps the monitor alive even when no events arrive; the full TTL restarts when the last reader disconnects. Event production alone does not renew it. Expiry stops the source, discards the ring buffer, and frees the registration slot; subsequent reads return `monitor not found` and require a new registration. The TTL is included in the signed creation request.
+
+The server retains the last 1,024 matching events per registration in memory (up to 16 registered monitors, 8 KiB per event) until deleted, expired, or the server exits. Sources start asynchronously; startup or collection errors stop the producer and are returned by reads after any buffered events. If a sequence cursor falls behind the ring's oldest event, the read fails with an explicit `monitor history lost` error and the oldest available sequence. Go callers can inspect `*MonitorHistoryLostError` and explicitly resume with `after = OldestSequence - 1` if they choose to skip lost history. Finite storage cannot guarantee lossless reads under arbitrary disconnection or event rates, and sources retain their existing best-effort capture limitations. Registration and history do **not** survive a server restart.
+
+A renewed certificate for the same private key can resume a monitor if its current policy still authorizes the source; a different key cannot read or delete it. In Go, use `Client.CreateMonitor`, `Client.ReadMonitor(ctx, id, after, callback)` and `Client.DeleteMonitor`. The existing `Client.Monitor` and `portal monitor` commands remain connection-scoped.
+
+To show packets sent to TCP destination port 80, select the `packets` source and combine generic header filters:
+
+```sh
+./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub \
+  --query 'packets where protocol = tcp and direction = outgoing and dst.port = 80'
+```
+
+To watch a process name across starts and exits, use the cross-platform `process` source:
+
+```sh
+./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub \
+  --query 'process where name = "worker"'
+```
+
+Process names can also use one edge glob: `name = worker*` matches names beginning with `worker`, and `name = '*Helper'` matches names ending in `Helper`. An exact name still requires an exact match; interior `*` and a lone `*` are rejected. The same patterns work with `--process-name`.
+
+Each process event includes a PID and `process` with the exact process name and `start` or `exit` action. Filter by `pid`, `name` and/or `action` (for example, `process where name = "Google Chrome Helper" and action = start`). This source polls the server's process table once per second using native OS process-listing implementations, **not eBPF**. Processes already running when the monitor attaches form its initial baseline, not start events. Processes that start and exit between polls may be missed; timestamps indicate when a change was observed. PID reuse is distinguished by creation time. On Linux and macOS a non-root server reports only its own account's processes, while a root server can report all processes to identities authorized for root. On Windows it reports only processes belonging to the server account. Windows commands cannot switch to another user; eBPF sources require Linux. The process source builds on Linux, macOS and Windows.
+
+To query the current process table instead of waiting for lifecycle events, use the one-shot snapshot mode:
+
+```sh
+./portal query --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub \
+  --query 'process where name = worker*'
+```
+
+The command returns one JSON object with a `source`, `time`, and a `processes` array of `pid`, `name`, and `started` timestamps. `process` can be filtered by `pid` and/or `name`; no matches returns `"processes":[]`. The Go API is `Client.Query(ctx, MonitorRequest{Source: "process", PID: 1234})`, returning a `Snapshot`. It uses the same signed request and policy checks as `Client.Monitor`, with the snapshot mode included in the signature. The process listing is a best-effort observation during enumeration, not an atomic system-wide instant. `action` is only meaningful for start/exit events and is rejected in snapshots.
+
+Other one-shot sources use the same `portal query --query 'SOURCE [where name = PATTERN]'` command:
+
+| Source | Snapshot field | Data |
+| --- | --- | --- |
+| `cpu` | `cpu` | Per-core cumulative user/system/idle/I/O-wait/steal seconds; compare samples to calculate utilization |
+| `memory` | `memory` | RAM total, available, used, and swap totals in bytes |
+| `network` | `network` | Interface name, index, MTU, addresses, flags, and cumulative RX/TX byte and packet counters |
+| `kernel` | `kernel` | Boot time, uptime seconds, 1/5/15-minute load averages, and context-switch/running/blocked counters where available |
+| `sensors` | `sensors` | Available temperature readings in Celsius, including high/critical thresholds when reported |
+| `containers` | `containers` | Docker ID, name, image, and state, including stopped containers |
+| `gpu` | `gpus` | Nvidia GPU index, UUID, name, and available temperature, utilization, memory, and power readings |
+
+`network`, `sensors`, `containers`, and `gpu` support `where name = ...` with exact names or one leading/trailing `*` glob, for example `network where name = eth*`. Other sources do not take filters. An empty collection is returned as `[]`; metric fields unavailable from `nvidia-smi` are omitted. Docker requires Linux, a readable `/var/run/docker.sock`, a root server and **explicit `root` policy authorization**, because it exposes other workloads' metadata. GPU queries require `nvidia-smi` installed on the server and an Nvidia driver. Missing dependencies and unsupported platforms return errors, not fabricated empty results. Sensors depend on the host's exposed sensors and may legitimately be empty. Packet, syscall, disk, and tracepoint sources represent transient events rather than retained current state, so snapshot mode rejects them.
+
+To observe block requests issued to a device on Linux, use the eBPF `disk` source:
+
+```sh
+./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub \
+  --query 'disk where operation = write and device = 0x800'
+```
+
+Each disk event includes the kernel device ID, start sector, sector count (512-byte sectors), and operation (`read`, `write`, `discard`, `flush`, or `other`). Filters `device` (decimal or `0x` hex ID) and `operation` (`read`, `write`, `discard`, `flush`) may be combined or omitted; the equivalent flags are `--source disk --device 0x800 --operation write`. This traces `block:block_rq_issue`, not filesystem paths, application PIDs, completed requests, or file contents. Operation and device filters are applied inside eBPF before records reach user space, then checked again before streaming. The source needs a readable tracepoint `format` under tracefs and permission to attach eBPF tracepoints. Its layout is discovered at attachment time; unsupported kernel formats fail explicitly. Capture is best-effort under load.
+
+For probes not covered by a built-in event type, `tracepoint` attaches to a named Linux tracepoint and streams selected scalar integer fields from the **server's** kernel format. For example, to observe processes waking on CPU 2:
+
+```sh
+./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
+  --key operator --cert operator-cert.pub \
+  --query 'tracepoint where event = sched:sched_wakeup and fields in (pid, target_cpu, prio) and field.target_cpu = 2'
+```
+
+The result has `tracepoint.event` (`sched:sched_wakeup`) and `tracepoint.fields` (a map of exact JSON integer values), alongside the UTC receipt `time`. The probe name is `category:name`; `fields in (...)` selects 1–16 names from `/sys/kernel/tracing/events/CATEGORY/NAME/format` (or debug tracing). Add `field.NAME = NUMBER` for equality filters on selected fields; negative decimal and `0x` hex numbers are accepted. Field names are case-sensitive to the kernel format and numeric filters are applied **on the server after eBPF collection**, before streaming; these filters do not reduce ring-buffer traffic. The running kernel must expose the tracepoint and support ring buffers. Pointer, array, bitfield and dynamic (`__data_loc`) fields are rejected, not decoded as arbitrary memory; no arbitrary ELF/eBPF programs or kprobe/uprobe/XDP hooks are loaded. This source requires a root server **and explicit `root` policy authorization** because tracepoints can expose other accounts' activity. It is event-only; on non-Linux servers it returns an unsupported-platform error.
+
+The query DSL has the form `SOURCE [where FIELD = VALUE [and FIELD = VALUE ...]]`. Event sources are `process`, `packets`, `syscalls`, `disk`, and `tracepoint`. Process fields are `pid`, `name` and `action` (`start` or `exit`); `name` accepts exact names or a leading/trailing `*`. Packet fields are `protocol` (`tcp` or `udp`), `direction` (`incoming` or `outgoing`), `src.ip`, `dst.ip`, `src.port`, and `dst.port`. Syscall fields are `pid` and `syscall`; `syscall in (0, 1, 9)` selects several syscall IDs. Disk fields are `device` and `operation`. Tracepoint requires `event = CATEGORY:NAME` and `fields in (NAME, ...)`, with optional `field.NAME = NUMBER` filters. For example, `syscalls where pid = 1234 and syscall in (0, 1)` selects read/write entries for a process. The parser uses PeggySue. Keywords and condition names are case-insensitive; kernel tracepoint field names are case-sensitive. Quote values with spaces or quotes. All conditions are combined with `and`; `or`, negation, and ranges are not supported. Omit `where` to match all supported events from sources other than `tracepoint`. The Go API exposes `ParseMonitorQuery(query)` to produce a `MonitorRequest` for `Client.Monitor(ctx, request, callback)`. `--query` cannot be combined with source/filter flags; the existing flags remain available as an alternative.
+
+Each packet JSON event contains `packet` with protocol, direction, source/destination IPs and ports, full frame length, and up to 2048 raw Ethernet-frame bytes in base64 `data`. This shows **individual packets**, not reassembled or decrypted TCP streams. It accepts Ethernet IPv4/IPv6 (including up to two VLAN tags); IPv6 extension headers and noninitial IPv4 fragments are not decoded. Capture is best-effort under load.
+
+Filters are part of the signed request and applied on the server: syscall PID/ID filters run in eBPF before the ring buffer; the packet eBPF socket filter admits IP frames and limits captured bytes, then the server parses and checks packet-header filters before forwarding. Omit `--pid` and `--syscall` to match all syscalls, or packet flags to match all supported TCP/UDP packets. The Go API accepts `Client.Monitor(ctx, MonitorRequest{Source: "packets", Packet: &PacketFilter{Protocol: "tcp", Direction: "outgoing", DestinationPort: 80}}, callback)` (or `Source: "syscalls"` with `PID` and `Syscalls`). Cancel the context or return an error from the callback to detach. Syscall IDs depend on the server architecture.
+
+Syscall monitoring requires policy access to the server process's account. Non-root servers export only events from that account; a root server with a policy allowing the client to act as root can export system-wide events. Packet capture, disk, and generic tracepoint monitoring require a root server and **explicit `root` authorization** for the client identity in the policy, since they can expose other users' activity. The server also needs Linux eBPF privileges to load programs and attach tracepoints or a packet-socket filter, plus CAP_NET_RAW for packet capture. If unavailable, the stream returns the source error. Treat event data as sensitive and grant root access only to identities that should see it.
+
+## Server-side aggregations
+
+Append an aggregate followed by `over DURATION [by FIELD, ...]` to an event query. The server collects a **new** window of matching events, maintains aggregate state rather than storing raw events, and returns one JSON result after the window ends. Each query selects one aggregate:
+
+| Function | Meaning |
+| --- | --- |
+| `count` | Number of matching events (existing syntax unchanged) |
+| `sum(FIELD)` | Sum of integer values |
+| `avg(FIELD)` | Arithmetic mean, rounded to 18 decimal places |
+| `min(FIELD)` / `max(FIELD)` | Smallest / largest integer value |
+| `count_distinct(FIELD)` | Exact number of distinct scalar values, including strings |
+| `percentile(FIELD, PERCENT)` | Exact nearest-rank percentile, with a finite percentage from 0 to 100 |
+
+```sh
+# Linux x86-64: count legacy open(2) syscall entries by process for 30 seconds.
+portal query --name node-a --query 'syscalls where syscall = 2 count over 30s by pid'
+
+# Named Linux tracepoint, when exposed by the server kernel:
+portal query --name node-a --query 'tracepoint where event = syscalls:sys_enter_open and fields in (common_pid) count over 30s by field.common_pid'
+
+# Modern libc often uses openat/openat2 instead of open. Linux x86-64 IDs:
+portal query --name node-a --query 'syscalls where syscall in (2,257,437) count over 30s by pid'
+
+portal query --name node-a --query 'process where action = start count over 1m by name'
+portal query --name node-a --query 'packets where protocol = tcp and dst.port = 80 count over 30s by src.ip,dst.port'
+portal query --name node-a --query 'disk where operation = write count over 30s by device'
+
+portal query --name node-a --query 'packets where protocol = tcp sum(length) over 30s by dst.ip'
+portal query --name node-a --query 'disk avg(sectors) over 30s by device'
+portal query --name node-a --query 'disk min(sectors) over 30s by device'
+portal query --name node-a --query 'disk max(sectors) over 30s by device'
+portal query --name node-a --query 'process count_distinct(name) over 1m'
+portal query --name node-a --query 'packets percentile(length, 95) over 30s by dst.port'
+```
+
+Syscall numbers depend on the **server architecture**. These count syscall **entries/attempts**, not successful opens or currently open files. Named `sys_enter_openat` and `sys_enter_openat2` tracepoints can be selected separately when present. Tracepoint `common_pid` is a task/thread ID; the `syscalls` source's `pid` is the process/thread-group ID. Tracepoint queries retain their root/policy requirements.
+
+Results retain `source` and `time` (window end) and add `aggregation` with UTC `start`, `end`, `group_by`, and `counts`. For example, the counts might be `[{"group":{"pid":123},"count":7},{"group":{"pid":456},"count":2}]`. Group values retain their JSON scalar types and full-width integer precision. Omitting `by` returns one total count, including zero if nothing matches; an empty grouped window returns `counts: []`.
+
+Other functions return `function`, `field`, and `values` instead of `counts`, with entries such as `{"group":{"device":2048},"value":1234}`; percentiles also carry `percentile` (omitted zero means the minimum). In Go, `AggregationResult.Values` contains `AggregateValue` entries whose `Value` is `json.RawMessage`, preserving numeric precision. For an empty ungrouped window, `sum` and `count_distinct` return zero; `avg`, `min`, `max`, and `percentile` return `null`. An empty grouped window returns `values: []`. Sums use arbitrary-precision integers and do not wrap at 64 bits. Means are computed from an exact integer sum before decimal rounding. Use a precision-preserving JSON decoder if consuming large values outside the Go API.
+
+Percentiles sort integer samples numerically and select the nearest rank: for a nonempty group, rank is the ceiling of percentage × sample count / 100, clamped to at least one. Thus 0 returns the minimum, 100 the maximum, and 50 selects the lower middle sample for an even-sized group; there is no interpolation or sampling. Percentile storage is capped at 65,536 samples **across the entire query**, and distinct counting at 65,536 retained `(group, value)` pairs. Duplicates within a distinct group consume no additional capacity. Exceeding a cap fails explicitly rather than returning a partial or approximate result. Sum, mean, and extrema do not retain individual samples.
+
+Available aggregate/grouping fields are `pid`, `tid`, `syscall` for syscalls; `pid`, `name`, `action` for process events; `protocol`, `direction`, `src.ip`, `dst.ip`, `src.port`, `dst.port`, `length` for packets; `device`, `operation`, `sector`, `sectors` for disk; and selected `field.NAME` values for tracepoints. Numeric functions accept only integer fields: process `pid`, packet ports and `length` (full captured frame length in bytes), disk `device`, `sector` and `sectors` (512-byte sector units), and all syscall/tracepoint fields. Strings can be grouped or counted distinctly, not summed or averaged. These additions do not change the available `where` filters. Up to four grouping fields can be combined. Windows must be positive and at most one hour. More than 4,096 groups fails explicitly rather than returning truncated results.
+
+The window is half-open `[start, end)` using server ingestion time, beginning immediately before the source is attached; attachment time is included and events outside that interval are excluded. This does not query registered-monitor history, repeat windows, or aggregate snapshot-only sources. Collection is still best-effort according to each source's capture limits. Disconnecting or canceling stops collection; source failures and premature termination return errors, not a misleading complete result. Filters, function, field, percentile, grouping fields, and window duration are signed and checked server-side with the existing source authorization rules. `portal monitor` and registered monitors reject aggregation queries; use `portal query` or `Client.Query(ctx, request)`, where `request` comes from `ParseMonitorQuery` or specifies `Aggregation: &AggregationRequest{Window: 30*time.Second, Function: "sum", Field: "length", GroupBy: []string{"dst.ip"}}` with `Source: "packets"`. Omitted `Function` still means `count`. The result is in `Snapshot.Aggregation`.
+
 ## Local walkthrough
 
 In a temporary directory, generate a CA and client key, then sign a one-hour user certificate with the `admin` principal:

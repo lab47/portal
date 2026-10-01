@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,11 +110,18 @@ func TestPackageAPI(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	result, err := (portal.Client{
-		Name: "node-a", CoordinatorURL: coord.URL, KeyFile: keyFile, CertFile: certFile,
-	}).Run(ctx, []string{"/bin/echo", "package-api"})
+	configData, err := json.Marshal(portal.ClientConfig{Key: keyFile, Cert: certFile, CA: caFile, Coordinator: coord.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configFile := write("client.json", configData)
+	result, err := (portal.Client{Name: "node-a", ConfigFile: configFile}).Run(ctx, []string{"/bin/echo", "package-api"})
 	if err != nil || result.Output != "package-api\n" || result.ExitCode != 0 || result.Error != "" {
 		t.Fatalf("package client result: %+v, %v", result, err)
+	}
+	wrongCA := write("wrong-ca.pub", ssh.MarshalAuthorizedKey(operator.PublicKey()))
+	if _, err := (portal.Client{Name: "node-a", ConfigFile: configFile, CAFile: wrongCA}).Run(ctx, []string{"/bin/echo", "must-not-run"}); err == nil || !strings.Contains(err.Error(), "untrusted certificate authority") {
+		t.Fatalf("configured CA trust ignored: %v", err)
 	}
 	result, err = (portal.Client{
 		Name: "node-a", CoordinatorURL: coord.URL, KeyFile: keyFile, CertFile: certFile, User: account.Username,

@@ -41,6 +41,7 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	}, mflags.WithUsage("Serve passkey-backed SSH CA (separate from inventory coordinator)")))
 
 	request := mflags.NewFlagSet("cert request")
+	requestConfig := request.String("config", 0, "", "client config file (default: user config directory/portal/config.json)")
 	caURL := request.String("ca-url", 0, "", "CA HTTPS origin")
 	keyPath := request.String("key", 0, "", "local SSH private key (created if absent)")
 	certPath := request.String("cert", 0, "", "output SSH certificate (renewals replace this file)")
@@ -48,6 +49,9 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	trustedCA := request.String("ca", 0, "", "trusted CA public key file")
 	certPrincipal := request.String("principal", 0, "admin", "expected SSH principal")
 	dispatcher.Dispatch("cert request", mflags.NewCommand(request, func(_ *mflags.FlagSet, _ []string) error {
+		if err := certificateConfigDefaults(request, *requestConfig, map[string]*string{"key": keyPath, "cert": certPath, "ca": trustedCA, "ca-url": caURL, "principal": certPrincipal}); err != nil {
+			return err
+		}
 		if *caURL == "" || *keyPath == "" || *certPath == "" || *trustedCA == "" {
 			return errors.New("--ca-url, --key, --cert and --ca are required")
 		}
@@ -79,6 +83,7 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	}, mflags.WithUsage("Generate a local SSH key and request a passkey-approved certificate")))
 
 	refresh := mflags.NewFlagSet("cert refresh")
+	refreshConfig := refresh.String("config", 0, "", "client config file (default: user config directory/portal/config.json)")
 	refreshURL := refresh.String("ca-url", 0, "", "CA HTTPS origin")
 	refreshKey := refresh.String("key", 0, "", "local SSH private key")
 	refreshCert := refresh.String("cert", 0, "", "SSH certificate output")
@@ -86,6 +91,9 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	refreshCA := refresh.String("ca", 0, "", "trusted CA public key file")
 	refreshPrincipal := refresh.String("principal", 0, "admin", "expected SSH principal")
 	dispatcher.Dispatch("cert refresh", mflags.NewCommand(refresh, func(_ *mflags.FlagSet, _ []string) error {
+		if err := certificateConfigDefaults(refresh, *refreshConfig, map[string]*string{"key": refreshKey, "cert": refreshCert, "ca": refreshCA, "ca-url": refreshURL, "principal": refreshPrincipal}); err != nil {
+			return err
+		}
 		if *refreshURL == "" || *refreshKey == "" || *refreshCert == "" || *refreshCA == "" {
 			return errors.New("--ca-url, --key, --cert and --ca are required")
 		}

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/user"
-	"strconv"
 )
 
 // policy maps CA-signed certificate key IDs to local account UIDs.
@@ -71,7 +70,7 @@ func (p policy) authorize(identity, name string) (*user.User, error) {
 	var account *user.User
 	var err error
 	if name == "" {
-		account, err = user.LookupId(strconv.Itoa(os.Geteuid()))
+		account, err = user.Current()
 	} else {
 		account, err = user.Lookup(name)
 	}

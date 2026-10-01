@@ -10,11 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
-	"os/user"
-	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
@@ -62,6 +58,13 @@ func register(ctx context.Context, url, token string, reg registration) error {
 }
 
 func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal string, policy policy) error {
+	return serveWithSource(ctx, ep, ca, principal, policy, monitorEvents)
+}
+
+func serveWithSource(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal string, policy policy, source eventSource) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	store := newMonitorStore(ctx, source)
 	for {
 		conn, err := ep.Accept(ctx)
 		if err != nil {
@@ -74,7 +77,7 @@ func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal s
 			defer conn.CloseWithError(0, "")
 			stream, err := conn.AcceptStream(ctx)
 			if err == nil {
-				handleCommand(ctx, stream, ca, principal, policy)
+				handleStream(ctx, stream, ca, principal, policy, source, store)
 			} else {
 				log.Printf("accept stream: %v", err)
 			}
@@ -82,13 +85,28 @@ func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal s
 	}
 }
 
+func handleStream(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy, source eventSource, store *monitorStore) {
+	var opener [1]byte
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(stream, opener[:]); err != nil {
+		stream.Close()
+		return
+	}
+	switch opener[0] {
+	case 1:
+		handleCommand(ctx, stream, ca, principal, policy)
+	case 2:
+		handleMonitor(ctx, stream, ca, principal, policy, source)
+	case 3:
+		handleRegisteredMonitor(ctx, stream, ca, principal, policy, store)
+	default:
+		stream.Close()
+	}
+}
+
 func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy) {
 	defer stream.Close()
 	stream.SetDeadline(time.Now().Add(65 * time.Second))
-	var opener [1]byte
-	if _, err := io.ReadFull(stream, opener[:]); err != nil || opener[0] != 1 {
-		return
-	}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return
@@ -136,38 +154,6 @@ func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		}
 	}
 	writeResponse(stream, response)
-}
-
-func setCommandUser(cmd *exec.Cmd, account *user.User) error {
-	uid, err := strconv.ParseUint(account.Uid, 10, 32)
-	if err != nil {
-		return err
-	}
-	gid, err := strconv.ParseUint(account.Gid, 10, 32)
-	if err != nil {
-		return err
-	}
-	if uid != uint64(os.Geteuid()) || gid != uint64(os.Getegid()) {
-		if os.Geteuid() != 0 {
-			return errors.New("switching users requires the server to run as root")
-		}
-		groups, err := account.GroupIds()
-		if err != nil {
-			return err
-		}
-		credential := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
-		for _, group := range groups {
-			id, err := strconv.ParseUint(group, 10, 32)
-			if err != nil {
-				return err
-			}
-			credential.Groups = append(credential.Groups, uint32(id))
-		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
-	}
-	cmd.Dir = "/"
-	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + account.HomeDir, "USER=" + account.Username, "LOGNAME=" + account.Username}
-	return nil
 }
 
 func writeResponse(stream *iroh.Stream, response Result) {
