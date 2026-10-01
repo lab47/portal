@@ -8,11 +8,25 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./... -count=1
+
   build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        os: [linux, darwin]
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
@@ -22,13 +36,48 @@ jobs:
       - name: Build portal
         env:
           CGO_ENABLED: "0"
-          GOOS: linux
+          GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
           mkdir -p dist
-          go build -trimpath -o "dist/portal-linux-${GOARCH}" ./cmd/portal
+          go build -trimpath -o "dist/portal-${GOOS}-${GOARCH}" ./cmd/portal
       - uses: actions/upload-artifact@v4
         with:
-          name: portal-linux-${{ matrix.arch }}
-          path: dist/portal-linux-${{ matrix.arch }}
+          name: portal-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/portal-${{ matrix.os }}-${{ matrix.arch }}
           if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: portal-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum portal-* > SHA256SUMS
+      - name: Publish latest successful main build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Do not promote a rerun of an older commit over current main.
+          head=$(gh api "repos/${GH_REPO}/commits/main" --jq .sha)
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo "Skipping release: main has advanced."
+            exit 0
+          fi
+          tag="build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" dist/portal-* dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --draft \
+            --title "Portal build ${GITHUB_RUN_NUMBER}" \
+            --notes "Built from https://github.com/${GH_REPO}/commit/${GITHUB_SHA}. SHA256SUMS verifies the release binaries."
+          # Publish only after every binary and the checksum manifest are uploaded.
+          gh release edit "$tag" --draft=false --latest

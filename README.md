@@ -2,9 +2,34 @@
 
 A small coordinator, server, and client for running commands over [go-iroh](https://github.com/tmc/go-iroh). The coordinator keeps short-lived in-memory inventory; the server checks in every 30 seconds and accepts commands from holders of SSH **user** certificates signed by its trusted CA, subject to its local authorization policy. The client looks up the server, connects to its authenticated iroh endpoint, and signs a fresh challenge bound to the command arguments. Commands run directly (not through a shell) as the server process's OS user unless another account is requested and allowed.
 
-Requires Go 1.26 and outbound access to an iroh relay from both server and client. Inventory contains only an endpoint ID and relay URL, never a server UDP address. Iroh establishes the connection via the relay, then discovers and selects a direct UDP path when reachable, retaining the relay as fallback. Build the CLI with `go build -o portal ./cmd/portal`.
+Requires outbound access to an iroh relay from both server and client. Inventory contains only an endpoint ID and relay URL, never a server UDP address. Iroh establishes the connection via the relay, then discovers and selects a direct UDP path when reachable, retaining the relay as fallback. Building from source requires Go 1.26: `go build -o portal ./cmd/portal`.
 
 The importable `github.com/lab47/portal` package exposes `NewCoordinator(token)` as an HTTP handler, `Server.Serve(ctx)` for registration and command serving, and `Client.Run(ctx, argv)` for lookup and execution. `Client.Run` returns a `Result` containing output and remote exit status; the CLI in `cmd/portal` uses `miren.dev/mflags` for subcommands and flags. Use `--` before the remote command to pass flag-like arguments through unchanged.
+
+## Installation
+
+Install the latest published build on Linux or macOS (amd64 or arm64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lab47/portal/main/install.sh | bash
+```
+
+The installer needs Bash, curl, and either `sha256sum` or `shasum`; Go and sudo are not required. It installs to `~/.local/bin/portal`. If that directory is not already on your PATH, add this to your shell's startup file:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Override the destination or select a specific release tag:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lab47/portal/main/install.sh | PORTAL_INSTALL_DIR=/your/bin bash
+curl -fsSL https://raw.githubusercontent.com/lab47/portal/main/install.sh | PORTAL_VERSION=build-42-1 bash
+```
+
+To inspect the script before running it, download it with `curl -fsSL https://raw.githubusercontent.com/lab47/portal/main/install.sh -o install.sh`, review it, then run `bash install.sh`.
+
+The installer verifies the binary against the release's `SHA256SUMS` before replacing an existing installation atomically. Run it again to upgrade. The build workflow publishes all four platform binaries after tests and builds succeed on current `main`; “latest” means the latest published main build, not a semantic-versioned release. The first successful run of this workflow on `main` must publish a release before installation is available. Find actual tags on the [releases page](https://github.com/lab47/portal/releases).
 
 ## Client configuration
 
