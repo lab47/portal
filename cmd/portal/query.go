@@ -99,6 +99,9 @@ func validateFoldedQuery(request portal.MonitorRequest, field string, index int)
 	if request.Mode != "aggregate" || request.Aggregation == nil || (field != "user.stack" && field != "kernel.stack") || !slices.Contains(request.Aggregation.GroupBy, field) {
 		return errors.New("folded output requires an aggregate grouped by the selected user.stack or kernel.stack")
 	}
+	if request.Aggregation.Compact || request.Aggregation.Nonzero || request.Aggregation.Limit != 0 || request.Aggregation.SortMetric != 0 {
+		return errors.New("folded output cannot be combined with compact result controls")
+	}
 	metrics := max(1, len(request.Aggregation.Metrics))
 	if index < 0 || index >= metrics {
 		return errors.New("folded-metric must select an existing zero-based metric index")

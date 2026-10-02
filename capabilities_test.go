@@ -44,7 +44,7 @@ func TestCapabilityReference(t *testing.T) {
 		}
 		if source.Name == "syscalls" || source.Name == "tracepoint" {
 			for _, prefix := range []string{"user.stack", "kernel.stack"} {
-				for _, suffix := range []string{"offsets", "top", "drop_bottom", "until"} {
+				for _, suffix := range []string{"offsets", "top", "drop_bottom", "drop_top", "from", "until"} {
 					if !slices.ContainsFunc(source.Filters, func(f FilterCapability) bool {
 						return f.Field == prefix+"."+suffix && slices.Contains(f.Modes, "aggregate")
 					}) {
@@ -64,6 +64,11 @@ func TestCapabilityReference(t *testing.T) {
 			}
 		}
 		if slices.Contains(source.Modes, "aggregate") {
+			for _, field := range []string{"result.format", "result.limit", "result.nonzero", "result.sort_metric"} {
+				if !slices.ContainsFunc(source.Filters, func(f FilterCapability) bool { return f.Field == field && slices.Contains(f.Modes, "aggregate") }) {
+					t.Fatalf("result control not discoverable: %s.%s", source.Name, field)
+				}
+			}
 			r := MonitorRequest{Source: source.Name}
 			if source.Name == "syscalls" || source.Name == "disk" {
 				r.Phase = "completion"

@@ -23,6 +23,43 @@ type diskBTFLayout struct {
 	issueArg, completeArg            int
 	rqQ, rqSector, rqBytes, rqFlags  int16
 	qDisk, diskMajor, diskFirstMinor int16
+	flagBits                         requestFlagBits
+}
+
+type requestFlagBits struct {
+	valid                             bool
+	sync, meta, fua, preflush, rahead uint8
+}
+
+func loadRequestFlagBits(spec *btf.Spec) (requestFlagBits, error) {
+	b := requestFlagBits{}
+	want := map[string]*uint8{"__REQ_SYNC": &b.sync, "__REQ_META": &b.meta,
+		"__REQ_FUA": &b.fua, "__REQ_PREFLUSH": &b.preflush, "__REQ_RAHEAD": &b.rahead}
+	found := make(map[string]bool)
+	for typ, err := range spec.All() {
+		if err != nil {
+			return b, fmt.Errorf("iterate kernel BTF request flags: %w", err)
+		}
+		e, ok := typ.(*btf.Enum)
+		if !ok {
+			continue
+		}
+		for _, value := range e.Values {
+			if dst := want[value.Name]; dst != nil {
+				if value.Value >= 32 {
+					return b, fmt.Errorf("unsupported kernel BTF request flag %s=%d", value.Name, value.Value)
+				}
+				*dst, found[value.Name] = uint8(value.Value), true
+			}
+		}
+	}
+	for name := range want {
+		if !found[name] {
+			return b, fmt.Errorf("kernel BTF lacks request flag enum %s", name)
+		}
+	}
+	b.valid = true
+	return b, nil
 }
 
 func memberOffset(s *btf.Struct, name string) (int16, btf.Type, error) {
@@ -32,6 +69,21 @@ func memberOffset(s *btf.Struct, name string) (int16, btf.Type, error) {
 				return 0, nil, fmt.Errorf("unsupported bitfield/offset for %s.%s", s.Name, name)
 			}
 			return int16(m.Offset / 8), m.Type, nil
+		}
+		if m.Name == "" && m.Offset%8 == 0 {
+			var members []btf.Member
+			switch t := btf.UnderlyingType(m.Type).(type) {
+			case *btf.Struct:
+				members = t.Members
+			case *btf.Union:
+				members = t.Members
+			}
+			if members != nil {
+				offset, typ, err := memberOffset(&btf.Struct{Name: s.Name, Members: members}, name)
+				if err == nil && int64(offset)+int64(m.Offset/8) <= 4095 {
+					return offset + int16(m.Offset/8), typ, nil
+				}
+			}
 		}
 	}
 	return 0, nil, fmt.Errorf("kernel BTF %s lacks %s", s.Name, name)
@@ -116,6 +168,9 @@ func loadDiskBTFLayout() (diskBTFLayout, error) {
 		return diskBTFLayout{}, err
 	}
 	l := diskBTFLayout{issueArg: issue, completeArg: complete}
+	if l.flagBits, err = loadRequestFlagBits(spec); err != nil {
+		return l, err
+	}
 	var qt btf.Type
 	if l.rqQ, qt, err = memberOffset(rq, "q"); err != nil {
 		return l, err
@@ -171,34 +226,49 @@ func probeRead(dst int16, base asm.Register, off int16, size int32, fail string)
 }
 
 // Pending value: issuing identity (24), ktime, device, bytes remaining,
-// sector, sectors, operation, padding (64 bytes).
+// sector, sectors, operation, status, and the original cmd_flags (64 bytes).
 func diskIssueCompletionInstructions(l diskBTFLayout, pendingFD int, collection *collectionState) asm.Instructions {
-	i := asm.Instructions{asm.LoadMem(asm.R6, asm.R1, int16(l.issueArg*8), asm.DWord), asm.JEq.Imm(asm.R6, 0, "exit")}
+	// BlockIssues counts raw issue callbacks before pointer/layout/map handling.
+	// BlockReissues counts issue callbacks whose request pointer is already
+	// pending; it is callback context, not a count of distinct requests.
+	i := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1)}
+	i = appendCollectionCounter(i, collection, collectionBlockIssues, "issue_counted")
+	i = append(i, asm.LoadMem(asm.R6, asm.R6, int16(l.issueArg*8), asm.DWord), asm.JEq.Imm(asm.R6, 0, "pairing_failed"))
 	i = appendTaskIdentity(i, -72)
 	i = append(i, asm.FnKtimeGetNs.Call(), asm.StoreMem(asm.RFP, -48, asm.R0, asm.DWord))
-	i = append(i, probeRead(-36, asm.R6, l.rqBytes, 4, "exit")...)
-	i = append(i, probeRead(-32, asm.R6, l.rqSector, 8, "exit")...)
-	i = append(i, probeRead(-20, asm.R6, l.rqFlags, 4, "exit")...)
-	i = append(i, probeRead(-16, asm.R6, l.rqQ, 8, "exit")...)
-	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -16, asm.DWord), asm.JEq.Imm(asm.R7, 0, "exit"))
-	i = append(i, probeRead(-16, asm.R7, l.qDisk, 8, "exit")...)
-	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -16, asm.DWord), asm.JEq.Imm(asm.R7, 0, "exit"))
-	i = append(i, probeRead(-40, asm.R7, l.diskMajor, 4, "exit")...)
-	i = append(i, probeRead(-16, asm.R7, l.diskFirstMinor, 4, "exit")...)
+	i = append(i, probeRead(-36, asm.R6, l.rqBytes, 4, "pairing_failed")...)
+	i = append(i, probeRead(-32, asm.R6, l.rqSector, 8, "pairing_failed")...)
+	i = append(i, probeRead(-20, asm.R6, l.rqFlags, 4, "pairing_failed")...)
+	i = append(i, probeRead(-16, asm.R6, l.rqQ, 8, "pairing_failed")...)
+	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -16, asm.DWord), asm.JEq.Imm(asm.R7, 0, "pairing_failed"))
+	i = append(i, probeRead(-16, asm.R7, l.qDisk, 8, "pairing_failed")...)
+	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -16, asm.DWord), asm.JEq.Imm(asm.R7, 0, "pairing_failed"))
+	i = append(i, probeRead(-40, asm.R7, l.diskMajor, 4, "pairing_failed")...)
+	i = append(i, probeRead(-16, asm.R7, l.diskFirstMinor, 4, "pairing_failed")...)
 	// Kernel tracepoint dev_t uses MKDEV (major << 20 | minor), not
 	// userspace new_encode_dev, which moves the high minor bits.
 	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -40, asm.Word), asm.LSh.Imm(asm.R7, 20), asm.LoadMem(asm.R8, asm.RFP, -16, asm.Word), asm.Or.Reg(asm.R7, asm.R8), asm.StoreMem(asm.RFP, -40, asm.R7, asm.Word), asm.Mov.Imm(asm.R0, 0), asm.StoreMem(asm.RFP, -16, asm.R0, asm.DWord))
 	// Save original byte count as sectors and the low REQ_OP_BITS byte.
-	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -36, asm.Word), asm.RSh.Imm(asm.R7, 9), asm.StoreMem(asm.RFP, -24, asm.R7, asm.Word), asm.LoadMem(asm.R7, asm.RFP, -20, asm.Word), asm.And.Imm(asm.R7, 0xff), asm.StoreMem(asm.RFP, -20, asm.R7, asm.Byte),
-		asm.StoreMem(asm.RFP, -80, asm.R6, asm.DWord), asm.LoadMapPtr(asm.R1, pendingFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.Mov.Reg(asm.R3, asm.RFP), asm.Add.Imm(asm.R3, -72), asm.Mov.Imm(asm.R4, 0), asm.FnMapUpdateElem.Call(), asm.JEq.Imm(asm.R0, 0, "exit"))
+	i = append(i, asm.LoadMem(asm.R7, asm.RFP, -36, asm.Word), asm.RSh.Imm(asm.R7, 9), asm.StoreMem(asm.RFP, -24, asm.R7, asm.Word), asm.LoadMem(asm.R7, asm.RFP, -20, asm.Word), asm.StoreMem(asm.RFP, -12, asm.R7, asm.Word), asm.And.Imm(asm.R7, 0xff), asm.StoreMem(asm.RFP, -20, asm.R7, asm.Byte), asm.StoreMem(asm.RFP, -80, asm.R6, asm.DWord))
+	if collection != nil {
+		i = append(i, asm.LoadMapPtr(asm.R1, pendingFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.FnMapLookupElem.Call(), asm.JEq.Imm(asm.R0, 0, "not_reissue"))
+		i = appendCollectionCounter(i, collection, collectionBlockReissues, "not_reissue")
+	}
+	i = append(i, asm.LoadMapPtr(asm.R1, pendingFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.Mov.Reg(asm.R3, asm.RFP), asm.Add.Imm(asm.R3, -72), asm.Mov.Imm(asm.R4, 0), asm.FnMapUpdateElem.Call(), asm.JEq.Imm(asm.R0, 0, "exit"), asm.Mov.Imm(asm.R0, 0).WithSymbol("pairing_failed"))
 	i = appendCollectionCounter(i, collection, collectionPairingFailed, "pairing_done")
+	i = append(i, asm.Ja.Label("exit"))
 	return append(i, asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"), asm.Return())
 }
 
 func diskCompleteInstructions(l diskBTFLayout, pendingFD, eventsFD int, collection *collectionState) asm.Instructions {
 	// Completion prototype is (rq, error, nr_bytes). Partial completions retain
-	// the pointer-keyed entry with decremented remaining bytes.
-	i := asm.Instructions{asm.LoadMem(asm.R6, asm.R1, int16(l.completeArg*8), asm.DWord), asm.LoadMem(asm.R7, asm.R1, int16((l.completeArg+2)*8), asm.DWord), asm.LoadMem(asm.R8, asm.R1, int16((l.completeArg+1)*8), asm.DWord), asm.StoreMem(asm.RFP, -84, asm.R8, asm.Word), asm.StoreMem(asm.RFP, -80, asm.R6, asm.DWord), asm.LoadMapPtr(asm.R1, pendingFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.FnMapLookupElem.Call(), asm.JEq.Imm(asm.R0, 0, "unmatched"), asm.Mov.Reg(asm.R9, asm.R0), asm.LoadMem(asm.R8, asm.R9, 36, asm.Word), asm.JLT.Reg(asm.R7, asm.R8, "partial")}
+	// the pointer-keyed entry with decremented remaining bytes. BlockCompletions
+	// counts every callback. UnmatchedExits therefore also counts callbacks
+	// without a pending pointer, including repeated/partial callbacks; it is not
+	// a count of distinct requests.
+	i := asm.Instructions{asm.LoadMem(asm.R6, asm.R1, int16(l.completeArg*8), asm.DWord), asm.LoadMem(asm.R7, asm.R1, int16((l.completeArg+2)*8), asm.DWord), asm.LoadMem(asm.R8, asm.R1, int16((l.completeArg+1)*8), asm.DWord), asm.StoreMem(asm.RFP, -84, asm.R8, asm.Word), asm.StoreMem(asm.RFP, -80, asm.R6, asm.DWord)}
+	i = appendCollectionCounter(i, collection, collectionBlockCompletions, "completion_counted")
+	i = append(i, asm.LoadMapPtr(asm.R1, pendingFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.FnMapLookupElem.Call(), asm.JEq.Imm(asm.R0, 0, "unmatched"), asm.Mov.Reg(asm.R9, asm.R0), asm.LoadMem(asm.R8, asm.R9, 36, asm.Word), asm.JLT.Reg(asm.R7, asm.R8, "partial"))
 	// Copy metadata before deleting; map-value pointers are invalid afterwards.
 	for off := int16(0); off < 64; off += 8 {
 		load := asm.LoadMem(asm.R8, asm.R9, off, asm.DWord)
@@ -208,7 +278,12 @@ func diskCompleteInstructions(l diskBTFLayout, pendingFD, eventsFD int, collecti
 		i = append(i, load, asm.StoreMem(asm.RFP, -72+off, asm.R8, asm.DWord))
 	}
 	i = append(i, asm.LoadMem(asm.R8, asm.RFP, -84, asm.Word), asm.JEq.Imm(asm.R8, 0, "status_saved"), asm.StoreMem(asm.RFP, -16, asm.R8, asm.Word))
-	i = append(i, asm.LoadMapPtr(asm.R1, pendingFD).WithSymbol("status_saved"), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.FnMapDeleteElem.Call(), asm.FnKtimeGetNs.Call(), asm.LoadMem(asm.R7, asm.RFP, -48, asm.DWord), asm.Sub.Reg(asm.R0, asm.R7), asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord), asm.LoadMapPtr(asm.R1, eventsFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -72), asm.Mov.Imm(asm.R3, 72), asm.Mov.Imm(asm.R4, 0), asm.FnRingbufOutput.Call())
+	i = append(i, asm.LoadMapPtr(asm.R1, pendingFD).WithSymbol("status_saved"), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -80), asm.FnMapDeleteElem.Call())
+	if collection != nil {
+		i = append(i, asm.JEq.Imm(asm.R0, 0, "delete_done"))
+		i = appendCollectionCounter(i, collection, collectionPairingFailed, "delete_done")
+	}
+	i = append(i, asm.FnKtimeGetNs.Call(), asm.LoadMem(asm.R7, asm.RFP, -48, asm.DWord), asm.Sub.Reg(asm.R0, asm.R7), asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord), asm.LoadMapPtr(asm.R1, eventsFD), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, -72), asm.Mov.Imm(asm.R3, 72), asm.Mov.Imm(asm.R4, 0), asm.FnRingbufOutput.Call())
 	i = appendRingLoss(i, collection)
 	i = append(i, asm.Ja.Label("exit"), asm.Sub.Reg(asm.R8, asm.R7).WithSymbol("partial"), asm.StoreMem(asm.R9, 36, asm.R8, asm.Word), asm.LoadMem(asm.R8, asm.RFP, -84, asm.Word), asm.JEq.Imm(asm.R8, 0, "exit"), asm.StoreMem(asm.R9, 56, asm.R8, asm.Word), asm.Ja.Label("exit"))
 	i = append(i, asm.Mov.Imm(asm.R0, 0).WithSymbol("unmatched"))
@@ -217,6 +292,39 @@ func diskCompleteInstructions(l diskBTFLayout, pendingFD, eventsFD int, collecti
 }
 
 func decodeDiskCompletionRecord(raw []byte) (Event, error) {
+	return decodeDiskCompletionRecordWithFlags(raw, requestFlagBits{})
+}
+
+func requestRWBS(operation byte, flags uint32, b requestFlagBits) string {
+	// Match Linux blk_fill_rwbs: preflush precedes the operation; FUA,
+	// readahead, sync and metadata follow it. Other request flags are not RWBS.
+	rwbs := map[byte]string{0: "R", 1: "W", 2: "F", 3: "D", 5: "DE"}[operation]
+	if rwbs == "" {
+		rwbs = "N"
+	}
+	if !b.valid {
+		return rwbs
+	}
+	has := func(bit uint8) bool { return flags&(uint32(1)<<bit) != 0 }
+	if has(b.preflush) {
+		rwbs = "F" + rwbs
+	}
+	if has(b.fua) {
+		rwbs += "F"
+	}
+	if has(b.rahead) {
+		rwbs += "A"
+	}
+	if has(b.sync) {
+		rwbs += "S"
+	}
+	if has(b.meta) {
+		rwbs += "M"
+	}
+	return rwbs
+}
+
+func decodeDiskCompletionRecordWithFlags(raw []byte, bits requestFlagBits) (Event, error) {
 	if len(raw) != 72 {
 		return Event{}, errors.New("invalid eBPF disk completion record")
 	}
@@ -226,7 +334,8 @@ func decodeDiskCompletionRecord(raw []byte) (Event, error) {
 	if op == "" {
 		op = "other"
 	}
-	e.Disk = &DiskEvent{Device: binary.NativeEndian.Uint32(raw[32:36]), Sectors: binary.NativeEndian.Uint32(raw[48:52]), Sector: binary.NativeEndian.Uint64(raw[40:48]), Operation: op}
+	flags := binary.NativeEndian.Uint32(raw[60:64])
+	e.Disk = &DiskEvent{Device: binary.NativeEndian.Uint32(raw[32:36]), Sectors: binary.NativeEndian.Uint32(raw[48:52]), Sector: binary.NativeEndian.Uint64(raw[40:48]), Operation: op, RWBS: requestRWBS(raw[52], flags, bits), RequestFlags: &flags}
 	d := binary.NativeEndian.Uint64(raw[64:72])
 	e.Disk.DurationNS = &d
 	status := binary.NativeEndian.Uint32(raw[56:60])
@@ -281,6 +390,7 @@ func diskCompletionEvents(ctx context.Context, request MonitorRequest, emit func
 	defer r.Close()
 	stop := context.AfterFunc(ctx, func() { r.Close() })
 	defer stop()
+	deviceNames := newDiskDeviceNames()
 	for {
 		rec, err := r.Read()
 		if err != nil {
@@ -299,10 +409,11 @@ func diskCompletionEvents(ctx context.Context, request MonitorRequest, emit func
 			}
 			return err
 		}
-		e, err := decodeDiskCompletionRecord(rec.RawSample)
+		e, err := decodeDiskCompletionRecordWithFlags(rec.RawSample, l.flagBits)
 		if err != nil {
 			return err
 		}
+		e.Disk.DeviceName = deviceNames.lookup(e.Disk.Device)
 		if err = c.report(&e); err != nil {
 			return err
 		}

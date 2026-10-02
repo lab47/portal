@@ -35,6 +35,10 @@ type AggregationRequest struct {
 	Percentile float64           `json:"percentile,omitempty"` // 0–100, only for percentile
 	Every      time.Duration     `json:"every,omitempty"`      // Snapshot sampling interval; zero defaults to 1s for snapshot-only sources.
 	Metrics    []AggregateMetric `json:"metrics,omitempty"`    // Alternative to Function/Field/Percentile; all share Window/Every/GroupBy.
+	Compact    bool              `json:"compact,omitempty"`
+	Limit      int               `json:"limit,omitempty"`       // top rows by SortMetric (descending); zero is unlimited
+	Nonzero    bool              `json:"nonzero,omitempty"`     // omit rows whose every metric is numeric zero
+	SortMetric int               `json:"sort_metric,omitempty"` // zero-based metric index, default first
 }
 
 type AggregateCount struct {
@@ -47,24 +51,46 @@ type AggregateValue struct {
 	Value json.RawMessage            `json:"value"` // JSON number (avg rounded to 18 decimal places), or null
 }
 
+type AggregateRow struct {
+	Group  map[string]json.RawMessage `json:"group"`
+	Values []json.RawMessage          `json:"values"` // aligned with Columns, null if unavailable
+}
+
 // AggregationResult describes a half-open server ingestion window [Start, End).
 type AggregationResult struct {
-	Start      time.Time            `json:"start"`
-	End        time.Time            `json:"end"`
-	GroupBy    []string             `json:"group_by"`
-	Counts     []AggregateCount     `json:"counts,omitempty"`
-	Function   string               `json:"function,omitempty"`
-	Field      string               `json:"field,omitempty"`
-	Percentile float64              `json:"percentile,omitempty"`
-	Values     []AggregateValue     `json:"values,omitempty"`
-	Every      time.Duration        `json:"every,omitempty"`
-	Collection *CollectionStats     `json:"collection,omitempty"`
-	Metrics    []*AggregationResult `json:"metrics,omitempty"` // In request order; each has the same window/grouping. Single queries retain their old shape.
+	Start             time.Time            `json:"start"`
+	End               time.Time            `json:"end"`
+	GroupBy           []string             `json:"group_by"`
+	Counts            []AggregateCount     `json:"counts,omitempty"`
+	Function          string               `json:"function,omitempty"`
+	Field             string               `json:"field,omitempty"`
+	Percentile        float64              `json:"percentile,omitempty"`
+	Values            []AggregateValue     `json:"values,omitempty"`
+	Every             time.Duration        `json:"every,omitempty"`
+	Collection        *CollectionStats     `json:"collection,omitempty"`
+	Metrics           []*AggregationResult `json:"metrics,omitempty"` // In request order; each has the same window/grouping. Single queries retain their old shape.
+	Columns           []AggregateMetric    `json:"columns,omitempty"`
+	Rows              []AggregateRow       `json:"rows,omitempty"`
+	TotalGroups       int                  `json:"total_groups,omitempty"`
+	OmittedZeroGroups int                  `json:"omitted_zero_groups,omitempty"`
 }
 
 // Keep the selected result collection visible even for an empty grouped window.
 func (a AggregationResult) MarshalJSON() ([]byte, error) {
 	type fields AggregationResult
+	if a.Columns != nil {
+		return json.Marshal(struct {
+			Start             time.Time         `json:"start"`
+			End               time.Time         `json:"end"`
+			GroupBy           []string          `json:"group_by"`
+			Every             time.Duration     `json:"every,omitempty"`
+			Collection        *CollectionStats  `json:"collection,omitempty"`
+			Columns           []AggregateMetric `json:"columns"`
+			Rows              []AggregateRow    `json:"rows"`
+			TotalGroups       int               `json:"total_groups"`
+			OmittedZeroGroups int               `json:"omitted_zero_groups,omitempty"`
+		}{a.Start, a.End, a.GroupBy, a.Every, a.Collection, a.Columns, a.Rows, a.TotalGroups, a.OmittedZeroGroups})
+	}
 	if len(a.Metrics) != 0 {
 		return json.Marshal(fields(a))
 	}
@@ -104,11 +130,11 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 		fields = []string{"protocol", "direction", "src.ip", "dst.ip", "src.port", "dst.port", "length"}
 		numeric = []string{"src.port", "dst.port", "length"}
 	case "disk":
-		fields = []string{"device", "operation", "sector", "sectors"}
+		fields = []string{"device", "device_name", "operation", "rwbs", "sector", "sectors"}
 		numeric = []string{"device", "sector", "sectors"}
 		if r.Phase == "completion" {
-			fields = append(fields, "duration_ns", "status")
-			numeric = append(numeric, "duration_ns", "status")
+			fields = append(fields, "duration_ns", "status", "request_flags")
+			numeric = append(numeric, "duration_ns", "status", "request_flags")
 		}
 	case "tracepoint":
 		if r.Tracepoint != nil {
@@ -125,7 +151,7 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 			fields = append(fields, "pid", "tid")
 			numeric = append(append([]string{}, numeric...), "pid", "tid")
 		}
-		fields = append(fields, "name")
+		fields = append(fields, "name", "process_name", "name_group")
 	}
 	if r.Stacks != nil {
 		if r.Stacks.User {
@@ -139,6 +165,9 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 }
 
 func (a AggregationRequest) validate(r MonitorRequest) error {
+	if a.Limit < 0 || a.Limit > maxAggregateGroups || a.SortMetric < 0 || a.SortMetric >= max(1, len(a.Metrics)) {
+		return errors.New("result limit must be 0–4096 and sort_metric must select an existing zero-based metric")
+	}
 	if len(a.Metrics) != 0 {
 		if len(a.Metrics) > maxAggregateMetrics {
 			return errors.New("aggregation supports at most 8 metrics")
@@ -157,6 +186,7 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 			seen[metric] = true
 			one := a
 			one.Metrics = nil
+			one.SortMetric = 0
 			one.Function, one.Field, one.Percentile = metric.Function, metric.Field, metric.Percentile
 			if err := one.validate(r); err != nil {
 				return err
@@ -228,7 +258,13 @@ func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 		p := event.Packet
 		fields = map[string]any{"protocol": p.Protocol, "direction": p.Direction, "src.ip": p.SourceIP, "dst.ip": p.DestinationIP, "src.port": p.SourcePort, "dst.port": p.DestinationPort, "length": p.Length}
 	case event.Disk != nil:
-		fields = map[string]any{"device": event.Disk.Device, "operation": event.Disk.Operation, "sector": event.Disk.Sector, "sectors": event.Disk.Sectors}
+		fields = map[string]any{"device": event.Disk.Device, "operation": event.Disk.Operation, "rwbs": event.Disk.RWBS, "sector": event.Disk.Sector, "sectors": event.Disk.Sectors}
+		if event.Disk.DeviceName != "" {
+			fields["device_name"] = event.Disk.DeviceName
+		}
+		if event.Disk.RequestFlags != nil {
+			fields["request_flags"] = *event.Disk.RequestFlags
+		}
 		if event.Disk.DurationNS != nil {
 			fields["duration_ns"] = *event.Disk.DurationNS
 		}
@@ -259,6 +295,13 @@ func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 	}
 	if event.Process == nil && event.Packet == nil {
 		fields["pid"], fields["tid"], fields["name"] = event.PID, event.TID, event.Name
+		if event.ProcessName != "" {
+			fields["process_name"] = event.ProcessName
+		}
+		fields["name_group"] = event.NameGroup
+		if event.NameGroup == "" {
+			fields["name_group"] = event.Name
+		}
 	}
 	if event.DurationNS != nil {
 		fields["duration_ns"] = *event.DurationNS
@@ -390,6 +433,7 @@ func newAggregateReduction(a AggregationRequest) *aggregateReduction {
 		for _, metric := range a.Metrics {
 			one := a
 			one.Metrics = nil
+			one.Compact, one.Nonzero, one.Limit, one.SortMetric = false, false, 0, 0
 			one.Function, one.Field, one.Percentile = metric.Function, metric.Field, metric.Percentile
 			if one.Function == "" {
 				one.Function = "count"
@@ -415,13 +459,20 @@ func (r *aggregateReduction) add(fields map[string]any) error {
 		}
 		return nil
 	}
+	var value any
+	if r.request.Field != "" {
+		var ok bool
+		value, ok = fields[r.request.Field]
+		// Optional metrics use available observations, just like sampled
+		// snapshots. Do not turn a missing numeric value into a zero.
+		if !ok || value == nil {
+			return nil
+		}
+	}
 	group := make(map[string]json.RawMessage, len(r.request.GroupBy))
 	var key strings.Builder
 	for _, field := range r.request.GroupBy {
-		value, ok := fields[field]
-		if !ok {
-			return fmt.Errorf("record missing aggregation field %q", field)
-		}
+		value := fields[field] // absent optional grouping fields form a null bucket
 		data, err := json.Marshal(value)
 		if err != nil {
 			return err
@@ -437,14 +488,6 @@ func (r *aggregateReduction) add(fields map[string]any) error {
 		entry = &aggregateAccumulator{AggregateCount: AggregateCount{Group: group}}
 		r.groups[key.String()] = entry
 	}
-	var value any
-	if r.request.Field != "" {
-		var ok bool
-		value, ok = fields[r.request.Field]
-		if !ok {
-			return fmt.Errorf("record missing aggregation field %q", r.request.Field)
-		}
-	}
 	return entry.add(r.request, value, r.retained)
 }
 
@@ -454,6 +497,7 @@ func (r *aggregateReduction) result(source string, start, end time.Time) Snapsho
 		for _, metric := range r.metrics {
 			result.Metrics = append(result.Metrics, metric.result(source, start, end).Aggregation)
 		}
+		r.formatRows(result)
 		return Snapshot{Source: source, Time: end.UTC(), Aggregation: result}
 	}
 	keys := make([]string, 0, len(r.groups))
@@ -475,7 +519,85 @@ func (r *aggregateReduction) result(source string, start, end time.Time) Snapsho
 			result.Values = append(result.Values, AggregateValue{Group: r.groups[key].Group, Value: r.groups[key].value(a)})
 		}
 	}
+	r.formatRows(result)
 	return Snapshot{Source: source, Time: end.UTC(), Aggregation: result}
+}
+
+// Join on the group, not positional row indexes: sampled metrics can have
+// different available groups. Rendering controls never change collection.
+func (r *aggregateReduction) formatRows(a *AggregationResult) {
+	if !r.request.Compact && !r.request.Nonzero && r.request.Limit == 0 && r.request.SortMetric == 0 {
+		return
+	}
+	metrics := a.Metrics
+	if len(metrics) == 0 {
+		metrics = []*AggregationResult{a}
+	}
+	rows := make(map[string]*AggregateRow)
+	for index, metric := range metrics {
+		function := metric.Function
+		if function == "" {
+			function = "count"
+		}
+		a.Columns = append(a.Columns, AggregateMetric{Function: function, Field: metric.Field, Percentile: metric.Percentile})
+		add := func(group map[string]json.RawMessage, value json.RawMessage) {
+			data, _ := json.Marshal(group)
+			key := string(data)
+			if rows[key] == nil {
+				values := make([]json.RawMessage, len(metrics))
+				for i := range values {
+					values[i] = json.RawMessage("null")
+				}
+				rows[key] = &AggregateRow{Group: group, Values: values}
+			}
+			rows[key].Values[index] = value
+		}
+		if function == "count" {
+			for _, row := range metric.Counts {
+				add(row.Group, json.RawMessage(fmt.Sprint(row.Count)))
+			}
+		} else {
+			for _, row := range metric.Values {
+				add(row.Group, row.Value)
+			}
+		}
+	}
+	a.TotalGroups = len(rows)
+	keys := make([]string, 0, len(rows))
+	for key, row := range rows {
+		allZero := true
+		for _, value := range row.Values {
+			n, ok := new(big.Rat).SetString(string(value))
+			if !ok || n.Sign() != 0 {
+				allZero = false
+				break
+			}
+		}
+		if r.request.Nonzero && allZero {
+			a.OmittedZeroGroups++
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	sort.SliceStable(keys, func(i, j int) bool {
+		x, xok := new(big.Rat).SetString(string(rows[keys[i]].Values[r.request.SortMetric]))
+		y, yok := new(big.Rat).SetString(string(rows[keys[j]].Values[r.request.SortMetric]))
+		if !xok {
+			return false
+		}
+		if !yok {
+			return true
+		}
+		return x.Cmp(y) > 0
+	})
+	if r.request.Limit > 0 && len(keys) > r.request.Limit {
+		keys = keys[:r.request.Limit]
+	}
+	a.Rows = make([]AggregateRow, 0, len(keys))
+	for _, key := range keys {
+		a.Rows = append(a.Rows, *rows[key])
+	}
 }
 
 func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSource) (Snapshot, error) {

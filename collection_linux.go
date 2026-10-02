@@ -6,6 +6,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -18,6 +23,11 @@ const (
 	collectionStackCollision
 	collectionPairingFailed
 	collectionUnmatchedExit
+	// Block counters are callback-scoped diagnostics for the completion
+	// collector, rather than counts of unique requests.
+	collectionBlockIssues
+	collectionBlockCompletions
+	collectionBlockReissues
 	collectionCounterCount
 )
 
@@ -83,7 +93,12 @@ func (s *collectionState) snapshot() (*CollectionStats, error) {
 			return nil, err
 		}
 	}
-	return &CollectionStats{RingBufferDropped: values[0], StackCaptureFailures: values[1], StackCollisions: values[2], PairingFailures: values[3], UnmatchedExits: values[4]}, nil
+	return &CollectionStats{
+		RingBufferDropped: values[collectionRingDropped], StackCaptureFailures: values[collectionStackFailed],
+		StackCollisions: values[collectionStackCollision], PairingFailures: values[collectionPairingFailed],
+		UnmatchedExits: values[collectionUnmatchedExit], BlockIssues: values[collectionBlockIssues],
+		BlockCompletions: values[collectionBlockCompletions], BlockReissues: values[collectionBlockReissues],
+	}, nil
 }
 
 func (s *collectionState) report(event *Event) error {
@@ -92,4 +107,52 @@ func (s *collectionState) report(event *Event) error {
 		event.Collection = stats
 	}
 	return err
+}
+
+// Enrichment is deliberately separate from kernel-time task comm. The bounded
+// one-second cache avoids procfs I/O per event; names are best-effort, not an
+// atomic identity assertion, and may lag exec/exit/PID reuse by one second.
+func enrichEventNames(emit func(Event) error) func(Event) error {
+	type entry struct {
+		name    string
+		kernel  bool
+		expires time.Time
+	}
+	cache := make(map[uint32]entry)
+	return func(event Event) error {
+		if event.Kind == "collection_stats" {
+			return emit(event)
+		}
+		event.NameGroup = event.Name
+		if event.PID != 0 {
+			now := time.Now()
+			e, ok := cache[event.PID]
+			if !ok || !now.Before(e.expires) {
+				e = entry{expires: now.Add(time.Second)}
+				if verifyHostPID(event.PID) == nil {
+					if path, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", event.PID)); err == nil {
+						e.name = filepath.Base(strings.TrimSuffix(path, " (deleted)"))
+					}
+					if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", event.PID)); err == nil {
+						if end := strings.LastIndex(string(data), ")"); end >= 0 {
+							fields := strings.Fields(string(data)[end+1:])
+							if len(fields) > 6 {
+								flags, _ := strconv.ParseUint(fields[6], 10, 64)
+								e.kernel = flags&0x00200000 != 0
+							}
+						}
+					}
+				}
+				if len(cache) >= 1024 {
+					clear(cache)
+				}
+				cache[event.PID] = e
+			}
+			event.ProcessName = e.name
+			if e.kernel && strings.HasPrefix(event.Name, "kworker/") {
+				event.NameGroup = "kworker"
+			}
+		}
+		return emit(event)
+	}
 }

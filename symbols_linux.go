@@ -273,11 +273,13 @@ func inspectProcess(ctx context.Context, r SymbolRequest) (SymbolResult, error) 
 	if e != nil {
 		return SymbolResult{}, e
 	}
-	_, maps, e := readMaps(r.PID)
+	_, processMaps, e := readMaps(r.PID)
 	if e != nil {
 		return SymbolResult{}, e
 	}
-	maps = symbolMappings(maps)
+	// symbolMappings filters in place; retain the complete snapshot for address
+	// fallback metadata and the final process-mapping identity check.
+	maps := symbolMappings(slices.Clone(processMaps))
 	res := SymbolResult{Frames: make([]SymbolFrame, len(r.Addresses))}
 	type mappedSymbols struct {
 		symbols []inspectedSymbol
@@ -298,9 +300,9 @@ func inspectProcess(ctx context.Context, r SymbolRequest) (SymbolResult, error) 
 			m = &maps[i]
 		} else {
 			a = r.Addresses[i]
-			for j := range maps {
-				if a >= maps[j].start && a < maps[j].end {
-					m = &maps[j]
+			for j := range processMaps {
+				if a >= processMaps[j].start && a < processMaps[j].end {
+					m = &processMaps[j]
 					break
 				}
 			}
@@ -309,6 +311,24 @@ func inspectProcess(ctx context.Context, r SymbolRequest) (SymbolResult, error) 
 		if m == nil {
 			res.Frames[i] = fr
 			continue
+		}
+		if r.Name == "" {
+			setMappingFallback(&fr, a, m)
+			if !strings.Contains(m.perms, "x") {
+				fr.Error = "address is in a non-executable mapping; no containing function symbol"
+				res.Frames[i] = fr
+				continue
+			}
+			if m.path == "" {
+				fr.Error = "address is in an anonymous executable mapping; no containing function symbol"
+				res.Frames[i] = fr
+				continue
+			}
+			if m.path[0] == '[' {
+				fr.Error = "address is in a special executable mapping; no containing function symbol"
+				res.Frames[i] = fr
+				continue
+			}
 		}
 		key := fmt.Sprintf("%s/%d/%s/%x/%x", m.dev, m.inode, m.path, m.start, m.offset)
 		cached, ok := cache[key]
@@ -352,6 +372,7 @@ func inspectProcess(ctx context.Context, r SymbolRequest) (SymbolResult, error) 
 				fr.Name = s.name
 				fr.Module = filepath.Base(cleanDeletedPath(m.path))
 				fr.Offset = a - bias - s.address
+				fr.FileOffset = nil
 				fr.Error = ""
 			} else {
 				fr.Error = "no containing function symbol"
@@ -364,10 +385,33 @@ func inspectProcess(ctx context.Context, r SymbolRequest) (SymbolResult, error) 
 		return SymbolResult{}, errors.New("process identity changed during symbol inspection")
 	}
 	_, current, e := readMaps(r.PID)
-	if e != nil || !slices.Equal(symbolMappings(current), maps) {
+	// Allocations during symbol inspection can grow unrelated anonymous maps.
+	// Verify only mappings that determine the requested result, plus PID lifetime.
+	relevant := func(ms []procMap) []procMap {
+		if r.Name != "" {
+			return symbolMappings(ms)
+		}
+		return slices.DeleteFunc(ms, func(m procMap) bool {
+			return !slices.ContainsFunc(r.Addresses, func(a uint64) bool { return a >= m.start && a < m.end })
+		})
+	}
+	if e != nil || !slices.Equal(relevant(current), relevant(processMaps)) {
 		return SymbolResult{}, errors.New("process mappings changed during symbol inspection")
 	}
 	return res, nil
+}
+
+// setMappingFallback records mapping metadata without implying that the PC was
+// resolved to a function. FileOffset is meaningful only for file-backed maps.
+func setMappingFallback(fr *SymbolFrame, address uint64, m *procMap) {
+	if m.path == "" {
+		return
+	}
+	fr.Module = m.path
+	if m.path[0] != '[' {
+		offset := m.offset + address - m.start
+		fr.FileOffset = &offset
+	}
 }
 
 func readMappedSymbols(pid uint32, m *procMap) ([]inspectedSymbol, uint64, error) {

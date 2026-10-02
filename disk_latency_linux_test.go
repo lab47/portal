@@ -20,6 +20,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestDiskRequestRWBS(t *testing.T) {
+	// Deliberately asymmetric bit positions: never assume a kernel's layout.
+	b := requestFlagBits{valid: true, sync: 12, meta: 15, fua: 18, preflush: 20, rahead: 10}
+	for _, tc := range []struct {
+		op    byte
+		flags uint32
+		want  string
+	}{
+		{1, 1<<20 | 1<<18 | 1<<12 | 1<<15 | 1<<30, "FWFSM"},
+		{0, 1<<10 | 1<<12, "RAS"},
+		{2, 0, "F"},
+		{3, 1 << 12, "DS"},
+		{5, 1 << 15, "DEM"},
+		{255, 0, "N"},
+	} {
+		if got := requestRWBS(tc.op, tc.flags, b); got != tc.want {
+			t.Fatalf("operation=%d flags=%x: %s, want %s", tc.op, tc.flags, got, tc.want)
+		}
+	}
+}
+
 func TestDiskCompletionDecoderAndInstructions(t *testing.T) {
 	raw := make([]byte, 72)
 	binary.NativeEndian.PutUint64(raw[0:8], uint64(12)<<32|34)
@@ -28,13 +49,19 @@ func TestDiskCompletionDecoderAndInstructions(t *testing.T) {
 	binary.NativeEndian.PutUint64(raw[40:48], 1234)
 	binary.NativeEndian.PutUint32(raw[48:52], 16)
 	raw[52] = 1
+	bits := requestFlagBits{valid: true, sync: 10, meta: 13, fua: 21, preflush: 25, rahead: 17}
+	flags := uint32(1<<bits.sync | 1<<bits.fua | 1<<bits.preflush)
+	binary.NativeEndian.PutUint32(raw[60:64], flags)
 	binary.NativeEndian.PutUint64(raw[64:72], 999)
-	e, err := decodeDiskCompletionRecord(raw)
+	e, err := decodeDiskCompletionRecordWithFlags(raw, bits)
 	if err != nil || e.PID != 12 || e.TID != 34 || e.Name != "issuer" || e.Phase != "completion" || e.Disk.Device != 0x800001 || e.Disk.Sector != 1234 || e.Disk.Sectors != 16 || e.Disk.Operation != "write" {
 		t.Fatalf("decode: %+v, %v", e, err)
 	}
 	if e.Disk.DurationNS == nil || *e.Disk.DurationNS != 999 {
 		t.Fatalf("duration: %+v", e.Disk)
+	}
+	if e.Disk.RWBS != "FWFS" || e.Disk.RequestFlags == nil || *e.Disk.RequestFlags != flags {
+		t.Fatalf("flags: %+v", e.Disk)
 	}
 	if _, err := decodeDiskCompletionRecord(raw[:71]); err == nil {
 		t.Fatal("accepted truncated completion")
@@ -202,7 +229,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 	}
 	trigger(101, 1, 0)
 	stats, err := c.snapshot()
-	if err != nil || stats.UnmatchedExits != 1 {
+	if err != nil || stats.UnmatchedExits != 1 || stats.BlockCompletions != 4 || stats.BlockIssues != 0 || stats.BlockReissues != 0 {
 		t.Fatalf("unmatched: %+v %v", stats, err)
 	}
 	seed(303, 33, 20*time.Millisecond)
@@ -281,7 +308,7 @@ func TestDiskCompletionEventsLive(t *testing.T) {
 			t.Fatal("no completed block request after repeated writes/fsync")
 		}
 	}
-	if found.Phase != "completion" || found.Disk.DurationNS == nil || *found.Disk.DurationNS == 0 || found.Disk.Status == nil || found.Name == "" {
+	if found.Phase != "completion" || found.Disk.DurationNS == nil || *found.Disk.DurationNS == 0 || found.Disk.Status == nil || found.Disk.RequestFlags == nil || found.Disk.RWBS == "" || found.Disk.DeviceName == "" || found.Name == "" {
 		t.Fatalf("incomplete event: %+v %+v", found, found.Disk)
 	}
 	major, minor := found.Disk.Device>>20, found.Disk.Device&0xfffff

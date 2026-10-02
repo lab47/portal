@@ -4,6 +4,7 @@ package portal
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -11,6 +12,30 @@ import (
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
+
+func TestEventProcessNameEnrichment(t *testing.T) {
+	exe, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Event
+	emit := enrichEventNames(func(e Event) error { got = e; return nil })
+	for _, comm := range []string{"truncated-name", "kworker/16:1H"} {
+		if err := emit(Event{PID: uint32(os.Getpid()), Name: comm}); err != nil {
+			t.Fatal(err)
+		}
+		if got.Name != comm || got.NameGroup != comm || got.ProcessName != filepath.Base(exe) {
+			t.Fatalf("lost full name or normalized a userspace worker: %+v", got)
+		}
+	}
+	if err := emit(Event{PID: ^uint32(0), Name: "gone"}); err != nil || got.ProcessName != "" || got.NameGroup != "gone" {
+		t.Fatalf("unavailable process name: %+v, %v", got, err)
+	}
+	fields := eventGroupFields(Event{Name: "original"}, nil)
+	if fields["name_group"] != "original" {
+		t.Fatal("unenriched event lost its task-name grouping")
+	}
+}
 
 func TestCollectionKernelLossCounters(t *testing.T) {
 	if os.Geteuid() != 0 {

@@ -277,11 +277,6 @@ func (r *aggregateReduction) addSample(fields map[string]any) error {
 	if r.request.Field != "" && fields[r.request.Field] == nil {
 		return nil
 	}
-	for _, field := range r.request.GroupBy {
-		if fields[field] == nil {
-			return nil
-		}
-	}
 	return r.add(fields)
 }
 

@@ -31,11 +31,12 @@ type SymbolResult struct {
 }
 
 type SymbolFrame struct {
-	Address string `json:"address"`
-	Name    string `json:"name,omitempty"`
-	Module  string `json:"module,omitempty"`
-	Offset  uint64 `json:"offset,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Address    string  `json:"address"`
+	Name       string  `json:"name,omitempty"`
+	Module     string  `json:"module,omitempty"`
+	Offset     uint64  `json:"offset,omitempty"`
+	FileOffset *uint64 `json:"file_offset,omitempty"`
+	Error      string  `json:"error,omitempty"`
 }
 
 type SymbolRecord struct {

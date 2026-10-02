@@ -233,7 +233,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		}
 		if s.Name == "syscalls" {
 			s.Filters = append(s.Filters, filter("phase", "string", "entry is the default; completion emits only paired exits. duration_ns/return_value require completion. Completion needs readable raw_syscalls:sys_exit format and sched_process_exit.", events, "entry", "completion"))
-			s.Filters = append(s.Filters, filter("paths", "boolean", "Opt-in FD capture for fsync/fdatasync, read/write, vectored/positional variants, ftruncate and fallocate. Resolve /proc/TID/fd/FD on receipt; may fail or race close/reuse. Not an atomic syscall-time path; completion resolves after exit. Requires native 64-bit syscall ABI and readable raw_syscalls:sys_enter format.", events, "true", "false"))
+			s.Filters = append(s.Filters, filter("paths", "boolean", "Opt-in kernel FD path capture at syscall entry for fsync/fdatasync, read/write, vectored/positional variants, ftruncate and fallocate; retained through completion so later close/reuse does not affect it. Best-effort walk relative to process root, up to 32 steps and 256 encoded component bytes; errors instead of truncation. Concurrent rename/FD-table changes may race. Requires native 64-bit syscall ABI, runtime BTF and readable raw_syscalls:sys_enter format.", events, "true", "false"))
 			s.Fields = append(s.Fields, outputFields(SyscallFile{}, "file")...)
 			s.Fields = append(s.Fields, FieldCapability{Path: "phase", Type: "string"}, FieldCapability{Path: "duration_ns", Type: "integer", Optional: true, Unit: "nanoseconds", Description: "Completion only; caller elapsed time including scheduling and waits, not pure disk time."}, FieldCapability{Path: "return_value", Type: "integer", Optional: true, Description: "Completion only; signed kernel return value, including negative errno."})
 			s.Examples = append(s.Examples, "syscalls where phase = completion and syscall in (:fsync,:fdatasync) and stacks = user sum(duration_ns) over 30s by pid, name, user.stack")
@@ -252,7 +252,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			r.Paths = s.Name == "syscalls"
 			s.GroupByFields, s.NumericFields, _ = aggregateFields(r)
 		} else {
-			s.GroupByFields = append(s.GroupByFields, "pid", "tid", "name")
+			s.GroupByFields = append(s.GroupByFields, "pid", "tid", "name", "process_name", "name_group")
 			s.NumericFields = append(s.NumericFields, "pid", "tid")
 		}
 		if s.Name == "syscalls" || s.Name == "tracepoint" || s.Name == "disk" {
@@ -260,6 +260,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				s.Fields = append(s.Fields, FieldCapability{Path: "pid", Type: "integer"}, FieldCapability{Path: "tid", Type: "integer"})
 			}
 			s.Fields = append(s.Fields, FieldCapability{Path: "name", Type: "string", Description: "Current task comm captured in kernel (up to 15 bytes); may differ between threads. Block events identify the issuing task, not necessarily the original application."})
+			s.Fields = append(s.Fields, FieldCapability{Path: "process_name", Type: "string", Optional: true, Description: "Best-effort full executable basename from procfs at receipt; cached up to one second, may lag exec/PID reuse; unavailable for kernel tasks."}, FieldCapability{Path: "name_group", Type: "string", Optional: true, Description: "Task comm except verified kernel kworker/* tasks normalize to kworker; original name remains unchanged."})
 			s.Fields = append(s.Fields, outputFields(CollectionStats{}, "collection")...)
 		}
 		if s.Name == "syscalls" || s.Name == "tracepoint" {
@@ -268,6 +269,8 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				s.Filters = append(s.Filters,
 					filter(prefix+".offsets", "boolean", "Keep offsets in aggregation keys (default true); false merges offset-only differences. Raw addresses remain distinct when unresolved.", []string{"aggregate"}, "true", "false"),
 					filter(prefix+".drop_bottom", "integer", "Remove this many root-side captured frames before other shaping, 0–64.", []string{"aggregate"}),
+					filter(prefix+".drop_top", "integer", "Remove this many leaf-side captured frames after drop_bottom, 0–64.", []string{"aggregate"}),
+					filter(prefix+".from", "string", "Discard leaf-side frames before the first matching function, retaining that frame and its callers. Exact name or one edge glob; no match leaves frames unchanged. Requires symbolization.", []string{"aggregate"}),
 					filter(prefix+".top", "integer", "Keep at most this many leaf-side frames after trimming, 0–64; zero keeps all.", []string{"aggregate"}),
 					filter(prefix+".until", "string", "Keep leaf-side frames through the first function name matching an exact name or one edge glob, inclusive; no match leaves frames unchanged. Case-sensitive; requires symbolization.", []string{"aggregate"}))
 			}
@@ -332,6 +335,13 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				f.Unit = "watts"
 			}
 		}
+		if slices.Contains(s.Modes, "aggregate") {
+			s.Filters = append(s.Filters,
+				filter("result.format", "string", "One row per group with values aligned to columns; avoids repeating long group keys per metric. CLI default remains legacy; MCP JSON aggregates without jq default to rows.", []string{"aggregate"}, "rows"),
+				filter("result.nonzero", "boolean", "Omit rows only when all metric values are numeric zero; nulls remain. Implies row format.", []string{"aggregate"}, "true", "false"),
+				filter("result.limit", "integer", "Top N groups (0 unlimited, maximum 4096), descending by sort_metric after nonzero filtering. Selection affects output, not collection or group caps. Implies row format.", []string{"aggregate"}),
+				filter("result.sort_metric", "integer", "Zero-based metric index for descending sorting (default first); exact numeric ordering, nulls last. All DSL result options select row format.", []string{"aggregate"}))
+		}
 	}
 	return Capabilities{
 		Version: 1, OS: runtime.GOOS, Arch: runtime.GOARCH,
@@ -342,6 +352,8 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			"All sources require a valid CA-signed certificate with the configured principal. Except capabilities, authorization requires access to the server account; privileged sources additionally require root. Root authorization also permits arbitrary root commands.",
 			"Filters use AND only; no OR, comparisons, regex or interior globs. Source/field keywords are case-insensitive except kernel field names and name values. Quote values containing spaces.",
 			"Aggregation collects a fresh half-open server-ingestion window [start,end), not registered-monitor history. Up to 8 distinct comma-separated functions share a single source subscription/sampler, window, interval, filters and grouping; no repeating windows or cross-source joins. Multi results appear in aggregation.metrics in request order, each with function/field/percentile and counts or values; single-function result shape is unchanged. API aggregation.metrics replaces top-level function/field/percentile. All metrics share the 65536 retained-value budget; the 4096-group limit is per metric. Missing sampled metrics are skipped independently. Capture is best-effort; cancellation stops collection and source failures return errors.",
+			"Missing grouping fields use a JSON null bucket, for events and snapshots alike. Missing optional metric values are skipped independently, never fabricated as zero. Compact output uses aggregation.columns (metric descriptors) and rows [{group, values}], with total_groups before output filtering/limiting and omitted_zero_groups. Metric arrays align with columns; unavailable group metrics are null. API controls: compact, nonzero, limit, sort_metric. Legacy output is retained by default except MCP JSON aggregates without jq; MCP format=legacy opts out. Compact controls cannot be combined with folded output.",
+			"Disk rwbs is the kernel request flag string: optional leading F=preflush, operation R/W/D/F/N (DE=secure erase), then F=FUA, A=readahead, S=sync and M=metadata. Completion reconstructs it from issue cmd_flags using runtime BTF flag positions; request_flags retains the raw flags. device_name is a best-effort sysfs name alongside numeric device. Completion collection block_issues/block_completions count callbacks before filtering; block_reissues counts issues replacing a pending pointer. unmatched_exits counts callbacks without a pending pointer, not unique requests; attachment boundaries, repeated callbacks and pairing failures need separate investigation.",
 			"Sources with sampling metadata support sampled snapshot aggregates. every defaults to 1s for snapshot-only sources; process requires explicit every to select snapshots instead of lifecycle events. Sampling fields are record-relative paths, not event field aliases.",
 			"Samples are collected immediately and on the interval grid before the window ends; slow reads skip ticks without overlap. count counts observed records. avg is an arithmetic sample mean, not time-weighted; sum of a gauge is a sum of observations, not an integral. Missing optional metrics are skipped, not zero.",
 			"Raw counters cannot be summed/averaged/minimized/maximized/percentiled. Use FIELD_per_second for rates, or CPU utilization_percent. Derived values require consecutive observations, so the first observation is only a baseline. Resets, disappearing/reappearing entities, and missing fields start a new baseline; no zero is fabricated. A derived query needs a window longer than its interval.",
@@ -353,7 +365,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			"Event time is UTC receipt time. tai64n is the resumable registered-monitor cursor. Registered monitors survive disconnects, not server restarts; bounded storage can overwrite old events. Reads reset the idle TTL.",
 			"Syscalls phase=completion pairs entries/exits by thread in a bounded map. duration_ns and return_value are completion-only aggregate fields. Stacks/name are retained from entry. Calls without observed completion are excluded; sum(duration_ns) is accumulated task time and can exceed wall time. Syscall numbers are architecture-specific.",
 			"Task-context eBPF events (syscalls, disk, tracepoint) expose pid, tid and name without stacks. Packet capture does not infer a process owner. collection counters are cumulative per subscription, never additive across events; aggregate results include a final collection snapshot. kind=collection_stats records are diagnostics, not data events. Stack capture failures include collisions; stacks use 16384 stable slots, never ID reuse. Counters describe collection before user-space tracepoint filtering; ring drops are not per-group estimates.",
-			"Stack shaping is a signed server-side aggregation projection, independent for user/kernel stacks. Order is drop_bottom, until, top, then optional offset removal. It never changes raw captured frames or erases capture-error markers. Aggregation stack keys are leaf-first; frame separators/control characters and percent are percent-escaped. CLI --format folded reverses them to root-first flame graph paths, preserving other grouping dimensions as prefix frames; --folded-stack chooses user.stack/kernel.stack and --folded-metric chooses a zero-based metric. JSON is the default; folded output and jq pipelines cannot be combined. Folded weights must be nonnegative numeric values; nonzero collection counters go to stderr.",
+			"Stack shaping is a signed server-side aggregation projection, independent for user/kernel stacks. Order is drop_bottom, drop_top, from, until, top, then optional offset removal. from keeps the matched frame and callers; until keeps leaf frames through the match. It never changes raw captured frames or erases capture-error markers. Unresolved file-backed user frames retain module path and file_offset; keys render module@file+0xOFFSET even with offsets=false. Aggregation stack keys are leaf-first; frame separators/control characters and percent are percent-escaped. CLI --format folded reverses them to root-first flame graph paths, preserving other grouping dimensions as prefix frames; --folded-stack chooses user.stack/kernel.stack and --folded-metric chooses a zero-based metric. JSON is the default; folded output and jq pipelines cannot be combined. Folded weights must be nonnegative numeric values; nonzero collection counters go to stderr.",
 		},
 		Sources: sources,
 		Aggregates: []AggregateCapability{

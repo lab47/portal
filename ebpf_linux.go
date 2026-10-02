@@ -62,14 +62,21 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 	loadID := asm.LoadMem(asm.R8, asm.R6, 8, asm.DWord)
 	var idOffset, argsOffset int16
 	var fileIDs []int
+	var pathLayout syscallPathBTFLayout
+	var pathScratch *ebpf.Map
 	if request.Paths {
-		idOffset, argsOffset, fileIDs, err = syscallPathLayout()
+		idOffset, argsOffset, fileIDs, pathLayout, err = syscallPathLayout()
 		if err != nil {
 			return err
 		}
+		pathScratch, err = ebpf.NewMap(&ebpf.MapSpec{Name: "portal_path_scratch", Type: ebpf.PerCPUArray, KeySize: 4, ValueSize: syscallPathScratchSize, MaxEntries: 1})
+		if err != nil {
+			return fmt.Errorf("create syscall path scratch map: %w", err)
+		}
+		defer pathScratch.Close()
 		entryType = ebpf.TracePoint
 		loadID = asm.LoadMem(asm.R8, asm.RFP, -472, asm.DWord)
-		recordSize += 8
+		recordSize += syscallPathRecordSize
 	}
 	entryStart := func() asm.Instructions {
 		i := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1)}
@@ -116,7 +123,7 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 	if completion {
 		pendingSize := 40
 		if request.Paths {
-			pendingSize += 8
+			pendingSize += syscallPathRecordSize
 		}
 		if stacks != nil {
 			pendingSize += stacks.recordSize()
@@ -148,7 +155,11 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 			}
 		}
 		if request.Paths {
-			exit = append(exit, asm.LoadMem(asm.R1, asm.R9, int16(pendingSize-8), asm.DWord), asm.StoreMem(asm.RFP, -8, asm.R1, asm.DWord))
+			pathBase := int16(recordSize - syscallPathRecordSize)
+			pendingBase := int16(pendingSize - syscallPathRecordSize)
+			for off := int16(0); off < syscallPathRecordSize; off += 8 {
+				exit = append(exit, asm.LoadMem(asm.R1, asm.R9, pendingBase+off, asm.DWord), asm.StoreMem(asm.RFP, base+pathBase+off, asm.R1, asm.DWord))
+			}
 		}
 		exit = append(exit, asm.LoadMapPtr(asm.R1, pending.FD()), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, syscallMapKeyOffset), asm.FnMapDeleteElem.Call(), asm.LoadMapPtr(asm.R1, events.FD()), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, int32(base)), asm.Mov.Imm(asm.R3, int32(recordSize)), asm.Mov.Imm(asm.R4, 0), asm.FnRingbufOutput.Call())
 		exit = appendRingLoss(exit, collection)
@@ -189,7 +200,7 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 			entry = appendStackCapture(entry, asm.R6, valueBase+40, stacks)
 		}
 		if request.Paths {
-			entry = appendSyscallFD(entry, -8, argsOffset, fileIDs)
+			entry = appendSyscallPath(entry, pathScratch.FD(), valueBase+int16(pendingSize-syscallPathRecordSize), argsOffset, fileIDs, pathLayout)
 		}
 		entry = append(entry, asm.LoadMapPtr(asm.R1, pending.FD()), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, syscallMapKeyOffset), asm.Mov.Reg(asm.R3, asm.RFP), asm.Add.Imm(asm.R3, int32(valueBase)), asm.Mov.Imm(asm.R4, 1), asm.FnMapUpdateElem.Call(), asm.JEq.Imm(asm.R0, 0, "exit"))
 		entry = appendCollectionCounter(entry, collection, collectionPairingFailed, "pairing_failed_done")
@@ -213,7 +224,7 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 			insns = appendStackCapture(insns, asm.R6, base+32, stacks)
 		}
 		if request.Paths {
-			insns = appendSyscallFD(insns, -8, argsOffset, fileIDs)
+			insns = appendSyscallPath(insns, pathScratch.FD(), base+int16(recordSize-syscallPathRecordSize), argsOffset, fileIDs, pathLayout)
 		}
 		insns = append(insns, asm.LoadMapPtr(asm.R1, events.FD()), asm.Mov.Reg(asm.R2, asm.RFP), asm.Add.Imm(asm.R2, int32(base)), asm.Mov.Imm(asm.R3, int32(recordSize)), asm.Mov.Imm(asm.R4, 0), asm.FnRingbufOutput.Call())
 		insns = appendRingLoss(insns, collection)
@@ -274,7 +285,7 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 			}
 		}
 		if request.Paths {
-			resolveSyscallFile(record.RawSample[recordSize-8:], &event)
+			resolveSyscallFile(record.RawSample[recordSize-syscallPathRecordSize:], &event)
 		}
 		if err := collection.report(&event); err != nil {
 			return err

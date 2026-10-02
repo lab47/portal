@@ -249,19 +249,22 @@ func run(args []string) error {
 	queryFlags := mflags.NewFlagSet("query")
 	queryOptions := clientConnectionFlags(queryFlags)
 	queryText := queryFlags.String("query", 0, "", "snapshot or aggregation query, optionally followed by | JQ_EXPRESSION")
-	queryFormat := queryFlags.String("format", 0, "json", "query output: json or folded (flame graph stacks)")
+	queryFormat := queryFlags.String("format", 0, "json", "query output: json (compact aggregates in MCP), legacy, or folded (flame graph stacks)")
 	foldedStack := queryFlags.String("folded-stack", 0, "user.stack", "stack grouping to export: user.stack or kernel.stack")
 	foldedMetric := queryFlags.Int("folded-metric", 0, 0, "zero-based aggregate metric index for folded weights")
 	dispatcher.Dispatch("query", mflags.NewCommand(queryFlags, func(_ *mflags.FlagSet, _ []string) error {
 		if *queryText == "" {
 			return errors.New("--query required")
 		}
-		if *queryFormat != "json" && *queryFormat != "folded" {
-			return errors.New("format must be json or folded")
+		if *queryFormat != "json" && *queryFormat != "legacy" && *queryFormat != "folded" {
+			return errors.New("format must be json, legacy or folded")
 		}
 		request, filter, err := parseClientQuery(*queryText)
 		if err != nil {
 			return err
+		}
+		if mcpMode && request.Aggregation != nil && filter == nil && *queryFormat == "json" {
+			request.Aggregation.Compact = true
 		}
 		if *queryFormat == "folded" {
 			if filter != nil {

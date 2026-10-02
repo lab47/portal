@@ -106,6 +106,13 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	aggregateParams, err := json.Marshal(mflags.ToolCallRequest{Name: "query", Arguments: map[string]any{
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"query": fmt.Sprintf("process where pid = %d count, max(rss_bytes) over 300ms every 100ms by pid", os.Getpid()),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	client := portal.Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: key, CertFile: cert}
 	monitorID, err := client.CreateMonitor(ctx, portal.MonitorRequest{Source: "process", Process: &portal.ProcessFilter{Name: "sleep", Action: "start"}}, time.Minute)
 	if err != nil {
@@ -142,6 +149,7 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 		{JSONRPC: "2.0", ID: 7, Method: "tools/call", Params: deleteParams},
 		{JSONRPC: "2.0", ID: 8, Method: "tools/call", Params: json.RawMessage(`{"name":"monitor-read","arguments":{"duration":"0s"}}`)},
 		{JSONRPC: "2.0", ID: 9, Method: "tools/call", Params: json.RawMessage(`{"name":"monitor-read","arguments":{"duration":"61s"}}`)},
+		{JSONRPC: "2.0", ID: 10, Method: "tools/call", Params: aggregateParams},
 	} {
 		if err := encoder.Encode(req); err != nil {
 			t.Fatal(err)
@@ -160,7 +168,7 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 		Result json.RawMessage  `json:"result"`
 		Error  *mflags.MCPError `json:"error"`
 	}
-	for id := 1; id <= 9; id++ {
+	for id := 1; id <= 10; id++ {
 		if err := decoder.Decode(&response); err != nil || response.ID != id || response.Error != nil {
 			t.Fatalf("MCP response %d: %+v, %v; output: %s", id, response, err, out)
 		}
@@ -221,6 +229,20 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 			var result mflags.ToolCallResult
 			if err := json.Unmarshal(response.Result, &result); err != nil || !result.IsError || len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "invalid read duration") {
 				t.Fatalf("MCP accepted unbounded read: %+v, %v", result, err)
+			}
+		case 10:
+			var result mflags.ToolCallResult
+			if err := json.Unmarshal(response.Result, &result); err != nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("MCP aggregate: %+v, %v", result, err)
+			}
+			var snapshot portal.Snapshot
+			text := result.Content[0].Text
+			if err := json.Unmarshal([]byte(text), &snapshot); err != nil || snapshot.Aggregation == nil {
+				t.Fatalf("MCP aggregate wire: %s, %v", text, err)
+			}
+			a := snapshot.Aggregation
+			if len(a.Columns) != 2 || len(a.Rows) != 1 || len(a.Rows[0].Values) != 2 || string(a.Rows[0].Group["pid"]) != fmt.Sprint(os.Getpid()) || a.Rows[0].Values[0][0] == '0' || strings.Contains(text, `"metrics"`) {
+				t.Fatalf("MCP did not compact shared metrics: %s", text)
 			}
 		}
 	}

@@ -3,11 +3,13 @@
 package portal
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -85,24 +87,39 @@ func diskInstructions(fields map[string]diskField, eventsFD int, filter *DiskFil
 	}
 	insns = append(insns, asm.LoadMem(asm.R8, asm.R6, fields["rwbs"].offset, asm.Byte))
 	if filter != nil && filter.Operation != "" {
+		// A leading F is PREFLUSH when followed by an operation byte.
+		if fields["rwbs"].size > 1 {
+			insns = append(insns, asm.JNE.Imm(asm.R8, 'F', "operation_ready"), asm.LoadMem(asm.R0, asm.R6, fields["rwbs"].offset+1, asm.Byte))
+			for _, op := range []int32{'R', 'W', 'D', 'F', 'N'} {
+				insns = append(insns, asm.JEq.Imm(asm.R0, op, "after_preflush"))
+			}
+			insns = append(insns, asm.Ja.Label("operation_ready"), asm.Mov.Reg(asm.R8, asm.R0).WithSymbol("after_preflush"), asm.Mov.Reg(asm.R8, asm.R8).WithSymbol("operation_ready"))
+		}
 		ops := map[string]int32{"read": 'R', "write": 'W', "discard": 'D', "flush": 'F'}
 		insns = append(insns, asm.JNE.Imm(asm.R8, ops[filter.Operation], "exit"))
 	}
-	// Capture current before R6 is reused for nr_sector below.
-	insns = appendTaskIdentity(insns, -48)
+	// The record retains the complete tracefs rwbs array (up to the validated
+	// 32-byte maximum), rather than just its operation byte.
+	insns = appendTaskIdentity(insns, -72)
 	insns = append(insns,
 		asm.LoadMem(asm.R9, asm.R6, fields["sector"].offset, asm.DWord),
-		asm.LoadMem(asm.R6, asm.R6, fields["nr_sector"].offset, asm.Word),
-		asm.StoreMem(asm.RFP, -24, asm.R7, asm.Word),
-		asm.StoreMem(asm.RFP, -20, asm.R6, asm.Word),
-		asm.StoreMem(asm.RFP, -16, asm.R9, asm.DWord),
+		asm.LoadMem(asm.R0, asm.R6, fields["nr_sector"].offset, asm.Word),
+		asm.StoreMem(asm.RFP, -48, asm.R7, asm.Word),
+		asm.StoreMem(asm.RFP, -44, asm.R0, asm.Word),
+		asm.StoreMem(asm.RFP, -40, asm.R9, asm.DWord),
 		asm.Mov.Imm(asm.R0, 0),
-		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
-		asm.StoreMem(asm.RFP, -8, asm.R8, asm.Byte),
+		asm.StoreMem(asm.RFP, -32, asm.R0, asm.DWord), asm.StoreMem(asm.RFP, -24, asm.R0, asm.DWord),
+		asm.StoreMem(asm.RFP, -16, asm.R0, asm.DWord), asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
+	)
+	// Direct tracepoint context accesses are verifier-checked constant loads.
+	for off := 0; off < fields["rwbs"].size; off++ {
+		insns = append(insns, asm.LoadMem(asm.R0, asm.R6, fields["rwbs"].offset+int16(off), asm.Byte), asm.StoreMem(asm.RFP, -32+int16(off), asm.R0, asm.Byte))
+	}
+	insns = append(insns,
 		asm.LoadMapPtr(asm.R1, eventsFD),
 		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -48),
-		asm.Mov.Imm(asm.R3, 48),
+		asm.Add.Imm(asm.R2, -72),
+		asm.Mov.Imm(asm.R3, 72),
 		asm.Mov.Imm(asm.R4, 0),
 		asm.FnRingbufOutput.Call(),
 	)
@@ -112,21 +129,48 @@ func diskInstructions(fields map[string]diskField, eventsFD int, filter *DiskFil
 }
 
 func decodeDiskRecord(raw []byte) (Event, error) {
-	if len(raw) != taskIdentitySize+24 {
+	if len(raw) != taskIdentitySize+48 {
 		return Event{}, errors.New("invalid eBPF disk record")
 	}
 	event := Event{Time: time.Now().UTC()}
 	decodeTaskIdentity(raw[:taskIdentitySize], &event)
 	raw = raw[taskIdentitySize:]
-	op := map[byte]string{'R': "read", 'W': "write", 'D': "discard", 'F': "flush"}[raw[16]]
+	rwbs := string(bytes.TrimRight(raw[16:48], "\x00"))
+	opByte := raw[16]
+	if len(rwbs) > 1 && rwbs[0] == 'F' && strings.ContainsRune("RWDFN", rune(rwbs[1])) {
+		opByte = rwbs[1]
+	}
+	op := map[byte]string{'R': "read", 'W': "write", 'D': "discard", 'F': "flush"}[opByte]
 	if op == "" {
 		op = "other"
 	}
 	event.Disk = &DiskEvent{
 		Device: binary.NativeEndian.Uint32(raw[:4]), Sectors: binary.NativeEndian.Uint32(raw[4:8]),
-		Sector: binary.NativeEndian.Uint64(raw[8:16]), Operation: op,
+		Sector: binary.NativeEndian.Uint64(raw[8:16]), Operation: op, RWBS: rwbs,
 	}
 	return event, nil
+}
+
+const diskDeviceCacheMax = 256
+
+type diskDeviceNames struct{ names map[uint32]string }
+
+func newDiskDeviceNames() *diskDeviceNames { return &diskDeviceNames{names: make(map[uint32]string)} }
+
+func (d *diskDeviceNames) lookup(device uint32) string {
+	if name, ok := d.names[device]; ok {
+		return name
+	}
+	major, minor := device>>20, device&0xfffff
+	target, err := filepath.EvalSymlinks(fmt.Sprintf("/sys/dev/block/%d:%d", major, minor))
+	name := ""
+	if err == nil {
+		name = filepath.Base(target)
+	}
+	if len(d.names) < diskDeviceCacheMax {
+		d.names[device] = name
+	}
+	return name
 }
 
 func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
@@ -164,6 +208,7 @@ func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) er
 	defer attached.Close()
 	stop := context.AfterFunc(ctx, func() { reader.Close() })
 	defer stop()
+	deviceNames := newDiskDeviceNames()
 	for {
 		record, err := reader.Read()
 		if err != nil {
@@ -183,6 +228,7 @@ func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) er
 		if err != nil {
 			return err
 		}
+		event.Disk.DeviceName = deviceNames.lookup(event.Disk.Device)
 		if err := collection.report(&event); err != nil {
 			return err
 		}

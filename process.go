@@ -13,6 +13,9 @@ import (
 )
 
 func monitorEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
+	if request.Source == "syscalls" || request.Source == "disk" || request.Source == "tracepoint" {
+		emit = enrichEventNames(emit)
+	}
 	switch request.Source {
 	case "process":
 		return processEvents(ctx, request, emit)

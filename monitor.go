@@ -105,16 +105,19 @@ type DiskFilter struct {
 
 // DiskEvent describes a block request issued to a device. Sector units are 512 bytes.
 type DiskEvent struct {
-	Device     uint32  `json:"device"`
-	Sector     uint64  `json:"sector"`
-	Sectors    uint32  `json:"sectors"`
-	Operation  string  `json:"operation"`
-	DurationNS *uint64 `json:"duration_ns,omitempty"`
-	Status     *uint32 `json:"status,omitempty"` // completion blk_status_t; zero is success, not errno
+	Device       uint32  `json:"device"`
+	Sector       uint64  `json:"sector"`
+	Sectors      uint32  `json:"sectors"`
+	Operation    string  `json:"operation"`
+	RWBS         string  `json:"rwbs,omitempty"`
+	DeviceName   string  `json:"device_name,omitempty"`
+	RequestFlags *uint32 `json:"request_flags,omitempty"`
+	DurationNS   *uint64 `json:"duration_ns,omitempty"`
+	Status       *uint32 `json:"status,omitempty"` // completion blk_status_t; zero is success, not errno
 }
 
-// SyscallFile is a best-effort snapshot of the captured descriptor. Path is
-// resolved in /proc after receipt, not atomically with syscall execution.
+// SyscallFile is a best-effort kernel path snapshot captured at syscall entry
+// and retained through completion. Concurrent rename/descriptor changes may race.
 type SyscallFile struct {
 	FD    int32  `json:"fd"`
 	Path  string `json:"path,omitempty"`
@@ -239,6 +242,9 @@ type CollectionStats struct {
 	StackCollisions      uint64 `json:"stack_collisions"`
 	PairingFailures      uint64 `json:"pairing_failures"`
 	UnmatchedExits       uint64 `json:"unmatched_exits"`
+	BlockIssues          uint64 `json:"block_issues,omitempty"`
+	BlockCompletions     uint64 `json:"block_completions,omitempty"`
+	BlockReissues        uint64 `json:"block_reissues,omitempty"`
 }
 
 // Event is a source data record or a collection_stats diagnostic.
@@ -247,7 +253,9 @@ type Event struct {
 	TAI64N      string           `json:"tai64n"`
 	PID         uint32           `json:"pid,omitempty"`
 	TID         uint32           `json:"tid,omitempty"`
-	Name        string           `json:"name,omitempty"` // current task comm, up to 15 bytes; may differ between threads
+	Name        string           `json:"name,omitempty"`         // current task comm, up to 15 bytes; may differ between threads
+	ProcessName string           `json:"process_name,omitempty"` // best-effort full executable basename, resolved on receipt
+	NameGroup   string           `json:"name_group,omitempty"`   // kernel workers normalized for grouping; otherwise task name
 	Phase       string           `json:"phase,omitempty"`
 	DurationNS  *uint64          `json:"duration_ns,omitempty"`
 	ReturnValue *int64           `json:"return_value,omitempty"`
@@ -279,20 +287,11 @@ func (e Event) MarshalJSON() ([]byte, error) {
 		return json.Marshal(fields(e))
 	}
 	return json.Marshal(struct {
-		Time        time.Time        `json:"time"`
-		TAI64N      string           `json:"tai64n"`
-		PID         uint32           `json:"pid"`
-		TID         uint32           `json:"tid"`
-		Syscall     int              `json:"syscall"`
-		Name        string           `json:"name,omitempty"`
-		Phase       string           `json:"phase,omitempty"`
-		DurationNS  *uint64          `json:"duration_ns,omitempty"`
-		ReturnValue *int64           `json:"return_value,omitempty"`
-		File        *SyscallFile     `json:"file,omitempty"`
-		Collection  *CollectionStats `json:"collection,omitempty"`
-		UserStack   *CapturedStack   `json:"user_stack,omitempty"`
-		KernelStack *CapturedStack   `json:"kernel_stack,omitempty"`
-	}{e.Time, e.TAI64N, e.PID, e.TID, e.Syscall, e.Name, e.Phase, e.DurationNS, e.ReturnValue, e.File, e.Collection, e.UserStack, e.KernelStack})
+		fields
+		PID     uint32 `json:"pid"`
+		TID     uint32 `json:"tid"`
+		Syscall int    `json:"syscall"`
+	}{fields(e), e.PID, e.TID, e.Syscall})
 }
 
 type monitorRequest struct {

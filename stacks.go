@@ -17,12 +17,14 @@ type StackCapture struct {
 }
 
 // StackShape projects leaf-first frames into aggregation keys, without changing
-// raw event frames. Order: remove bottom frames, stop at Until, then keep Top.
+// raw event frames. Order: DropBottom, DropTop, From, Until, Top, DropOffsets.
 type StackShape struct {
 	DropOffsets bool   `json:"drop_offsets,omitempty"`
 	DropBottom  int    `json:"drop_bottom,omitempty"`
+	DropTop     int    `json:"drop_top,omitempty"`
 	Top         int    `json:"top,omitempty"`   // zero keeps all remaining frames
 	Until       string `json:"until,omitempty"` // exact function name or one edge glob; matching frame is included
+	From        string `json:"from,omitempty"`  // discard leaf-side frames before the first match, inclusive match retained
 }
 
 type CapturedStack struct {
@@ -45,11 +47,13 @@ func (s StackCapture) Validate() error {
 		if !option.enabled {
 			return errors.New("stack shaping requires capture of that stack")
 		}
-		if shape.Top < 0 || shape.Top > 64 || shape.DropBottom < 0 || shape.DropBottom > 64 {
-			return errors.New("stack top/drop_bottom must be between 0 and 64")
+		if shape.Top < 0 || shape.Top > 64 || shape.DropBottom < 0 || shape.DropBottom > 64 || shape.DropTop < 0 || shape.DropTop > 64 {
+			return errors.New("stack top/drop_bottom/drop_top must be between 0 and 64")
 		}
-		if shape.Until != "" && (!s.Symbolize || !validEdgeGlob(shape.Until) || len(shape.Until) > 256) {
-			return errors.New("stack until requires symbolization and an exact name or one edge glob (up to 256 bytes)")
+		for _, pattern := range []string{shape.Until, shape.From} {
+			if pattern != "" && (!s.Symbolize || !validEdgeGlob(pattern) || len(pattern) > 256) {
+				return errors.New("stack until/from requires symbolization and an exact name or one edge glob (up to 256 bytes)")
+			}
 		}
 	}
 	return nil
@@ -66,6 +70,15 @@ func (s CapturedStack) key(shape *StackShape) string {
 	selected := s.Frames
 	if shape != nil {
 		selected = selected[:max(0, len(selected)-shape.DropBottom)]
+		selected = selected[min(shape.DropTop, len(selected)):]
+		if shape.From != "" {
+			for i, frame := range selected {
+				if frame.Name != "" && processNameMatches(shape.From, frame.Name) {
+					selected = selected[i:]
+					break
+				}
+			}
+		}
 		if shape.Until != "" {
 			for i, frame := range selected {
 				if frame.Name != "" && processNameMatches(shape.Until, frame.Name) {
@@ -86,6 +99,8 @@ func (s CapturedStack) key(shape *StackShape) string {
 				name += fmt.Sprintf("+0x%x", frame.Offset)
 			}
 			frames = append(frames, escapeStackFrame(name))
+		} else if frame.Module != "" && frame.FileOffset != nil {
+			frames = append(frames, escapeStackFrame(fmt.Sprintf("%s@file+0x%x", frame.Module, *frame.FileOffset)))
 		} else {
 			frames = append(frames, escapeStackFrame(frame.Address))
 		}

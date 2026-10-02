@@ -28,6 +28,10 @@ func TestStackShapeKeys(t *testing.T) {
 		{&StackShape{Until: "*start", DropBottom: 1}, "app:fsync+0x23;app:logstorage.merge+0x37;0x987"},
 		{&StackShape{Until: "missing", Top: 1}, "app:fsync+0x23"},
 		{&StackShape{DropBottom: 64}, ""},
+		{&StackShape{From: "logstorage.*", DropOffsets: true}, "app:logstorage.merge;0x987;app:runtime.start"},
+		{&StackShape{DropTop: 1, From: "logstorage.*", Until: "*start", Top: 2}, "app:logstorage.merge+0x37;0x987"},
+		{&StackShape{From: "missing", DropTop: 2}, "0x987;app:runtime.start+0x2"},
+		{&StackShape{DropTop: 64}, ""},
 	} {
 		if got := stack.key(tc.shape); got != tc.want {
 			t.Fatalf("%+v: %q, want %q", tc.shape, got, tc.want)
@@ -43,12 +47,18 @@ func TestStackShapeKeys(t *testing.T) {
 	if (CapturedStack{Frames: []SymbolFrame{{Name: "a;b", Module: "m"}}}).key(nil) == (CapturedStack{Frames: []SymbolFrame{{Name: "a%3Bb", Module: "m"}}}).key(nil) {
 		t.Fatal("escaping collided")
 	}
+	offset := uint64(0x823)
+	fileStack := CapturedStack{Frames: []SymbolFrame{{Module: "/usr/bin/qemu", Address: "0x100823", FileOffset: &offset}}}
+	if got := fileStack.key(&StackShape{DropOffsets: true}); got != "/usr/bin/qemu@file+0x823" {
+		t.Fatalf("stripped frame identity erased: %s", got)
+	}
 }
 
 func TestStackShapeQueriesAndProof(t *testing.T) {
 	for _, text := range []string{
 		"syscalls where stacks = user and user.stack.offsets = false and user.stack.until = logstorage.* and user.stack.top = 8 count over 1s by user.stack",
 		"syscalls where kernel.stack.drop_bottom = 3 and stack.depth = 64 and stacks = both count over 1s by kernel.stack",
+		"syscalls where stacks = both and kernel.stack.from = submit_bio* and user.stack.drop_top = 5 count over 1s by kernel.stack",
 	} {
 		r, err := ParseMonitorQuery(text)
 		if err != nil {
@@ -67,6 +77,8 @@ func TestStackShapeQueriesAndProof(t *testing.T) {
 		"syscalls where stacks = both and kernel.stack.drop_bottom = nope count over 1s",
 		"syscalls where stacks = both and user.stack.until = '*' count over 1s",
 		"syscalls where stacks = both and user.stack.until = a*b count over 1s",
+		"syscalls where stacks = both and user.stack.from = a*b count over 1s",
+		"syscalls where stacks = both and user.stack.drop_top = 65 count over 1s",
 		"syscalls where stacks = both and user.stack.until = '' count over 1s",
 		"syscalls where stacks = both and user.stack.offsets = nope count over 1s",
 		"syscalls where stacks = both and kernel.stack.bogus = 2 count over 1s",

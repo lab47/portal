@@ -238,6 +238,36 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 }
 
 func setQueryFilter(r *MonitorRequest, field, value string) error {
+	if strings.HasPrefix(field, "result.") {
+		if r.Aggregation == nil {
+			return errors.New("result options require aggregate mode")
+		}
+		r.Aggregation.Compact = true
+		switch field {
+		case "result.format":
+			if value != "rows" {
+				return errors.New("result.format must be rows")
+			}
+		case "result.nonzero":
+			if value != "true" && value != "false" {
+				return errors.New("result.nonzero must be true or false")
+			}
+			r.Aggregation.Nonzero = value == "true"
+		case "result.limit", "result.sort_metric":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return errors.New("result limit/sort_metric must be nonnegative integers")
+			}
+			if field == "result.limit" {
+				r.Aggregation.Limit = n
+			} else {
+				r.Aggregation.SortMetric = n
+			}
+		default:
+			return fmt.Errorf("unknown result option %q", field)
+		}
+		return nil
+	}
 	if field == "stacks" {
 		if value != "user" && value != "kernel" && value != "both" {
 			return errors.New("stacks must be user, kernel or both")
@@ -277,21 +307,27 @@ func setQueryFilter(r *MonitorRequest, field, value string) error {
 				return errors.New("stack.offsets must be true or false")
 			}
 			(*shape).DropOffsets = value == "false"
-		case "top", "drop_bottom":
+		case "top", "drop_bottom", "drop_top":
 			n, err := strconv.Atoi(value)
 			if err != nil || n < 0 || n > 64 {
-				return errors.New("stack top/drop_bottom must be between 0 and 64")
+				return errors.New("stack top/drop_bottom/drop_top must be between 0 and 64")
 			}
 			if option == "top" {
 				(*shape).Top = n
+			} else if option == "drop_top" {
+				(*shape).DropTop = n
 			} else {
 				(*shape).DropBottom = n
 			}
-		case "until":
+		case "until", "from":
 			if value == "" {
-				return errors.New("stack.until cannot be empty")
+				return errors.New("stack.until/from cannot be empty")
 			}
-			(*shape).Until = value
+			if option == "from" {
+				(*shape).From = value
+			} else {
+				(*shape).Until = value
+			}
 		default:
 			return fmt.Errorf("unknown stack option %q", field)
 		}

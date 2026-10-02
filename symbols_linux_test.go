@@ -152,6 +152,19 @@ func TestMapBiasUsesMappingFileOffset(t *testing.T) {
 	t.Fatal("no load segment")
 }
 
+func TestUnresolvedMappingMetadataUsesMapRelativeFileOffset(t *testing.T) {
+	fr := SymbolFrame{Address: "0x91ab", Error: "no containing function symbol"}
+	setMappingFallback(&fr, 0x91ab, &procMap{start: 0x8123, end: 0xa123, offset: 0x2345, path: "/opt/full path/app (deleted)"})
+	if fr.Module != "/opt/full path/app (deleted)" || fr.FileOffset == nil || *fr.FileOffset != 0x33cd || fr.Name != "" {
+		t.Fatalf("incorrect mapping fallback: %+v", fr)
+	}
+	anon := SymbolFrame{}
+	setMappingFallback(&anon, 0x5555, &procMap{start: 0x5000, end: 0x6000})
+	if anon.Module != "" || anon.FileOffset != nil {
+		t.Fatalf("anonymous mapping acquired file metadata: %+v", anon)
+	}
+}
+
 func TestProcessSymbolsResolveCurrentFunction(t *testing.T) {
 	address := uint64(reflect.ValueOf(TestProcessSymbolsResolveCurrentFunction).Pointer())
 	result, err := InspectSymbols(context.Background(), SymbolRequest{Target: "process", PID: uint32(os.Getpid()), Addresses: []uint64{address, 1}})
@@ -164,6 +177,82 @@ func TestProcessSymbolsResolveCurrentFunction(t *testing.T) {
 	result, err = InspectSymbols(context.Background(), SymbolRequest{Target: "process", PID: uint32(os.Getpid()), Name: "github.com/lab47/portal.TestProcessSymbolsResolveCurrentFunction"})
 	if err != nil || len(result.Symbols) != 1 || result.Symbols[0].Address != symbolHex(address) {
 		t.Fatalf("Go process name search: %+v, %v", result, err)
+	}
+}
+
+func TestStrippedProcessAddressFallsBackToMappedFile(t *testing.T) {
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("C compiler required for stripped ELF fixture")
+	}
+	strip, err := exec.LookPath("strip")
+	if err != nil {
+		t.Skip("strip required for stripped ELF fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stripped-app")
+	source := filepath.Join(dir, "app.c")
+	if err := os.WriteFile(source, []byte(`#include <stdio.h>
+static __attribute__((noinline)) int hidden_portal_function(void) { return 7; }
+int main(void) {
+    printf("%p\n", (void *)hidden_portal_function);
+    fflush(stdout);
+    return getchar() == EOF ? 0 : hidden_portal_function();
+}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.CommandContext(ctx, cc, "-O0", "-fPIE", "-pie", source, "-o", path).CombinedOutput(); err != nil {
+		t.Fatalf("build fixture: %v: %s", err, output)
+	}
+	if output, err := exec.CommandContext(ctx, strip, "--strip-all", path).CombinedOutput(); err != nil {
+		t.Fatalf("strip fixture: %v: %s", err, output)
+	}
+	child := exec.CommandContext(ctx, path)
+	stdin, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stdin.Close(); child.Wait() }()
+	var addressText string
+	if _, err := fmt.Fscan(bufio.NewReader(stdout), &addressText); err != nil {
+		t.Fatal(err)
+	}
+	address, err := strconv.ParseUint(addressText, 0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := uint32(child.Process.Pid)
+	_, maps, err := readMaps(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mapping *procMap
+	for i := range maps {
+		if address >= maps[i].start && address < maps[i].end {
+			mapping = &maps[i]
+			break
+		}
+	}
+	if mapping == nil {
+		t.Fatal("fixture function has no process mapping")
+	}
+	wantOffset := mapping.offset + address - mapping.start
+	result, err := InspectSymbols(ctx, SymbolRequest{Target: "process", PID: pid, Addresses: []uint64{address}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := result.Frames[0]
+	if frame.Address != symbolHex(address) || frame.Name != "" || frame.Module != path || frame.FileOffset == nil || *frame.FileOffset != wantOffset || frame.Error != "no containing function symbol" {
+		t.Fatalf("incorrect stripped mapping fallback: %+v; mapping %+v", frame, mapping)
 	}
 }
 
