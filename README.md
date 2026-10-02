@@ -326,8 +326,7 @@ With explicit `every`, process aggregates also expose `cpu_seconds_per_second` a
 
 ```sh
 # Top ten processes by sampled CPU usage during a fresh five-second window.
-portal query --name node-a --query 'process avg(cpu_percent) over 5s every 1s by pid,name' |
-  jq -r '.aggregation.values | map(select(.value != null)) | sort_by(.value) | reverse | .[:10][] | [.group.pid, .group.name, .value] | @tsv'
+portal query --name node-a --query 'process avg(cpu_percent) over 5s every 1s by pid,name | .aggregation.values | map(select(.value != null)) | sort_by(.value) | reverse | .[:10][] | {pid: .group.pid, name: .group.name, cpu_percent: .value}'
 
 # Peak resident memory by process during the window, in bytes.
 portal query --name node-a --query 'process max(rss_bytes) over 5s every 1s by pid,name'
@@ -337,6 +336,21 @@ portal query --name node-a --query 'process where name = worker*'
 ```
 
 Sorting and limiting are client-side; the DSL does not implement `order by` or `limit`, and the CLI does not yet provide an interactive `top` screen. To keep separate results for different lifetimes of a reused PID, add `started` to `by pid,name,started`.
+
+### Built-in jq processing
+
+`portal query --query 'SERVER_QUERY | JQ_EXPRESSION'` evaluates the suffix locally using [gojq](https://github.com/itchyny/gojq), with no external `jq` executable required. Keep the pipe **inside the quoted `--query` argument**. The first unquoted pipe separates the server query from jq; subsequent pipes are jq operators. Pipes inside quoted server-filter values are preserved (quote values containing literal pipes).
+
+```sh
+portal query --name node-a --query 'memory | .memory.used'
+portal query --name node-a --query 'process | .processes | sort_by(.rss_bytes) | reverse | .[:10]'
+portal query --name node-a --query 'process max(rss_bytes) over 5s every 1s by pid,name | .aggregation.values | sort_by(.value) | reverse | .[:10]'
+portal query --name node-a --query 'capabilities | .sources[] | {name, modes}'
+```
+
+The jq stage receives the full snapshot JSON, including `aggregation` when present. It runs only in the client: only the server selection is sent and signed, and collection/policy checks are unchanged. jq syntax and compilation errors are reported before connecting or collecting a window. Runtime errors fail the command; earlier emitted results may already have been written. Cancellation also stops jq evaluation.
+
+Each jq result is emitted as a compact JSON line; multiple results produce multiple lines, `empty` produces none, and strings remain JSON-quoted (this is not jq's `-r` mode). Without a suffix, existing JSON output is unchanged. Integer inputs preserve full-width precision, including through integer arithmetic; decimal operations follow gojq's floating-point semantics. This CLI suffix is not part of the server DSL accepted by `ParseMonitorQuery`, `monitor`, or registered monitors.
 
 ## Local walkthrough
 

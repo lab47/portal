@@ -226,12 +226,12 @@ func run(args []string) error {
 	}, mflags.WithUsage("Stop a registered monitor and discard its history")))
 	queryFlags := mflags.NewFlagSet("query")
 	queryOptions := clientConnectionFlags(queryFlags)
-	queryText := queryFlags.String("query", 0, "", "snapshot or aggregation query (for example: syscalls count over 30s by pid)")
+	queryText := queryFlags.String("query", 0, "", "snapshot or aggregation query, optionally followed by | JQ_EXPRESSION")
 	dispatcher.Dispatch("query", mflags.NewCommand(queryFlags, func(_ *mflags.FlagSet, _ []string) error {
 		if *queryText == "" {
 			return errors.New("--query required")
 		}
-		request, err := portal.ParseMonitorQuery(*queryText)
+		request, filter, err := parseClientQuery(*queryText)
 		if err != nil {
 			return err
 		}
@@ -239,8 +239,8 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(os.Stdout).Encode(snapshot)
-	}, mflags.WithUsage("Return current server state or windowed event aggregates as JSON")))
+		return writeQueryResult(ctx, os.Stdout, snapshot, filter)
+	}, mflags.WithUsage("Query server state or aggregates, with optional client-side jq processing")))
 	capabilityFlags := mflags.NewFlagSet("capabilities")
 	capabilityOptions := clientConnectionFlags(capabilityFlags)
 	dispatcher.Dispatch("capabilities", mflags.NewCommand(capabilityFlags, func(_ *mflags.FlagSet, _ []string) error {

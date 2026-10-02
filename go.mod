@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/cilium/ebpf v0.19.0
 	github.com/go-webauthn/webauthn v0.17.0
+	github.com/itchyny/gojq v0.12.19
 	github.com/lab47/peggysue v0.0.0-20250702204832-6234b23da0a5
 	github.com/shirou/gopsutil/v4 v4.26.8
 	github.com/tmc/go-iroh v0.2.1
@@ -24,6 +25,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/itchyny/timefmt-go v0.1.8 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
