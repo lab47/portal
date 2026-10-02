@@ -11,7 +11,7 @@ require (
 	github.com/tmc/go-iroh v0.2.1
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
-	miren.dev/mflags v0.0.0-20260913023833-b11db8e63177
+	miren.dev/mflags v0.0.0-20261002160926-2c18f3c616d1
 )
 
 require (

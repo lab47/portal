@@ -96,7 +96,7 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 	var requests strings.Builder
 	encoder := json.NewEncoder(&requests)
 	for _, req := range []mflags.MCPRequest{
-		{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: json.RawMessage(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}`)},
+		{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}`)},
 		{JSONRPC: "2.0", ID: 2, Method: "tools/list"},
 		{JSONRPC: "2.0", ID: 3, Method: "tools/call", Params: callParams},
 	} {
@@ -122,6 +122,11 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 			t.Fatalf("MCP response %d: %+v, %v; output: %s", id, response, err, out)
 		}
 		switch id {
+		case 1:
+			var result mflags.InitializeResult
+			if err := json.Unmarshal(response.Result, &result); err != nil || result.ProtocolVersion != "2025-06-18" {
+				t.Fatalf("MCP negotiated version: %+v, %v", result, err)
+			}
 		case 2:
 			var listed mflags.ToolsListResult
 			if err := json.Unmarshal(response.Result, &listed); err != nil || len(listed.Tools) != 1 || listed.Tools[0].Name != "client" || listed.Tools[0].InputSchema.Properties["arguments"].Type != "array" {

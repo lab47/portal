@@ -96,5 +96,5 @@ golang.org/x/term v0.46.0/go.mod h1:+K02xbkittuwc0Am4abfA3Fc+XRGXkvBXNO88NCXPoc=
 golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 lukechampine.com/blake3 v1.4.1 h1:I3Smz7gso8w4/TunLKec6K2fn+kyKtDxr/xcQEN84Wg=
 lukechampine.com/blake3 v1.4.1/go.mod h1:QFosUxmjB8mnrWFSNwKmvxHpfY72bmD2tQ0kBMM3kwo=
-miren.dev/mflags v0.0.0-20260913023833-b11db8e63177 h1:7w7JpoGLuFwv3WQHDeYQHyruWA6y+SLNuZIO4LOZggk=
-miren.dev/mflags v0.0.0-20260913023833-b11db8e63177/go.mod h1:G1eQ/upWVdO6BGT6dlh5Yqjt+9ncH5RUAKX6UKi1F9Q=
+miren.dev/mflags v0.0.0-20261002160926-2c18f3c616d1 h1:yPMudunPpiYnF/bw0OKTSJ+AaymD0ickNWkuwck1yPk=
+miren.dev/mflags v0.0.0-20261002160926-2c18f3c616d1/go.mod h1:G1eQ/upWVdO6BGT6dlh5Yqjt+9ncH5RUAKX6UKi1F9Q=
