@@ -201,22 +201,44 @@ func run(args []string) error {
 	readID := readFlags.String("id", 0, "", "registered monitor ID")
 	readAfter := readFlags.String("after", 0, "0", "last processed sequence (0 starts from beginning)")
 	readTimestamp := readFlags.String("after-timestamp", 0, "", "last event TAI64N timestamp (best-effort resume)")
+	mcpMode := len(args) > 0 && args[0] == "mcp-server"
+	readDefaultDuration := time.Duration(0)
+	if mcpMode {
+		readDefaultDuration = 5 * time.Second
+	}
+	readDuration := readFlags.Duration("duration", 0, readDefaultDuration, "maximum read duration (0 follows indefinitely in CLI; MCP requires >0 and <=1m)")
 	dispatcher.Dispatch("monitor-read", mflags.NewCommand(readFlags, func(_ *mflags.FlagSet, _ []string) error {
+		if *readDuration < 0 || (mcpMode && (*readDuration == 0 || *readDuration > time.Minute)) {
+			return errors.New("invalid read duration: MCP requires >0 and <=1m; CLI requires >=0")
+		}
+		readCtx := ctx
+		if *readDuration > 0 {
+			var cancel context.CancelFunc
+			readCtx, cancel = context.WithTimeout(ctx, *readDuration)
+			defer cancel()
+		}
+		received := false
+		onRecord := func(record portal.MonitorRecord) error {
+			received = true
+			return json.NewEncoder(os.Stdout).Encode(record)
+		}
+		finish := func(err error) error {
+			if received && errors.Is(err, context.DeadlineExceeded) && readCtx.Err() != nil && ctx.Err() == nil {
+				return nil
+			}
+			return err
+		}
 		if readFlags.Lookup("after-timestamp").HasValue {
 			if readFlags.Lookup("after").HasValue {
 				return errors.New("--after and --after-timestamp are mutually exclusive")
 			}
-			return readOptions().ReadMonitorSince(ctx, *readID, *readTimestamp, func(record portal.MonitorRecord) error {
-				return json.NewEncoder(os.Stdout).Encode(record)
-			})
+			return finish(readOptions().ReadMonitorSince(readCtx, *readID, *readTimestamp, onRecord))
 		}
 		cursor, err := strconv.ParseUint(*readAfter, 10, 64)
 		if err != nil {
 			return fmt.Errorf("invalid monitor cursor %q: %w", *readAfter, err)
 		}
-		return readOptions().ReadMonitor(ctx, *readID, cursor, func(record portal.MonitorRecord) error {
-			return json.NewEncoder(os.Stdout).Encode(record)
-		})
+		return finish(readOptions().ReadMonitor(readCtx, *readID, cursor, onRecord))
 	}, mflags.WithUsage("Replay records after a sequence, then follow the monitor as JSON lines")))
 	deleteFlags := mflags.NewFlagSet("monitor-delete")
 	deleteOptions := clientConnectionFlags(deleteFlags)
@@ -253,7 +275,9 @@ func run(args []string) error {
 		return encoder.Encode(docs)
 	}, mflags.WithUsage("Describe server sources, fields, filters, aggregates and caller authorization as JSON")))
 	mcpCommands := mflags.NewDispatcher("portal")
-	mcpCommands.Dispatch("client", clientCommand)
+	for _, name := range []string{"client", "capabilities", "query", "monitor-register", "monitor-read", "monitor-delete"} {
+		mcpCommands.Dispatch(name, dispatcher.GetCommand(name))
+	}
 	dispatcher.Dispatch("mcp-server", mflags.NewMCPServerCommand(mcpCommands))
 
 	registerCertCommands(dispatcher)

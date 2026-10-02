@@ -93,12 +93,55 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	capabilityParams, err := json.Marshal(mflags.ToolCallRequest{Name: "capabilities", Arguments: map[string]any{
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryParams, err := json.Marshal(mflags.ToolCallRequest{Name: "query", Arguments: map[string]any{
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"query": fmt.Sprintf("process where pid = %d | .processes[0].pid", os.Getpid()),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := portal.Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: key, CertFile: cert}
+	monitorID, err := client.CreateMonitor(ctx, portal.MonitorRequest{Source: "process", Process: &portal.ProcessFilter{Name: "sleep", Action: "start"}}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sleeper := exec.CommandContext(ctx, "/bin/sleep", "20")
+	if err := sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { sleeper.Process.Kill(); sleeper.Wait() }()
+	time.Sleep(1200 * time.Millisecond) // Allow the lifecycle poll to buffer the start.
+	readParams, err := json.Marshal(mflags.ToolCallRequest{Name: "monitor-read", Arguments: map[string]any{
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"id": monitorID, "duration": "200ms",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteParams, err := json.Marshal(mflags.ToolCallRequest{Name: "monitor-delete", Arguments: map[string]any{
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "id": monitorID,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var requests strings.Builder
 	encoder := json.NewEncoder(&requests)
 	for _, req := range []mflags.MCPRequest{
 		{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}`)},
 		{JSONRPC: "2.0", ID: 2, Method: "tools/list"},
 		{JSONRPC: "2.0", ID: 3, Method: "tools/call", Params: callParams},
+		{JSONRPC: "2.0", ID: 4, Method: "tools/call", Params: capabilityParams},
+		{JSONRPC: "2.0", ID: 5, Method: "tools/call", Params: queryParams},
+		{JSONRPC: "2.0", ID: 6, Method: "tools/call", Params: readParams},
+		{JSONRPC: "2.0", ID: 7, Method: "tools/call", Params: deleteParams},
+		{JSONRPC: "2.0", ID: 8, Method: "tools/call", Params: json.RawMessage(`{"name":"monitor-read","arguments":{"duration":"0s"}}`)},
+		{JSONRPC: "2.0", ID: 9, Method: "tools/call", Params: json.RawMessage(`{"name":"monitor-read","arguments":{"duration":"61s"}}`)},
 	} {
 		if err := encoder.Encode(req); err != nil {
 			t.Fatal(err)
@@ -117,7 +160,7 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 		Result json.RawMessage  `json:"result"`
 		Error  *mflags.MCPError `json:"error"`
 	}
-	for id := 1; id <= 3; id++ {
+	for id := 1; id <= 9; id++ {
 		if err := decoder.Decode(&response); err != nil || response.ID != id || response.Error != nil {
 			t.Fatalf("MCP response %d: %+v, %v; output: %s", id, response, err, out)
 		}
@@ -129,13 +172,55 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 			}
 		case 2:
 			var listed mflags.ToolsListResult
-			if err := json.Unmarshal(response.Result, &listed); err != nil || len(listed.Tools) != 1 || listed.Tools[0].Name != "client" || listed.Tools[0].InputSchema.Properties["arguments"].Type != "array" {
+			if err := json.Unmarshal(response.Result, &listed); err != nil || len(listed.Tools) != 6 {
 				t.Fatalf("MCP tools: %+v, %v", listed, err)
+			}
+			want := map[string]bool{"client": true, "capabilities": true, "query": true, "monitor-register": true, "monitor-read": true, "monitor-delete": true}
+			for _, tool := range listed.Tools {
+				if !want[tool.Name] || tool.InputSchema.Properties["config"].Type != "string" {
+					t.Fatalf("unexpected MCP tool or missing config: %+v", tool)
+				}
+				delete(want, tool.Name)
+				if tool.Name == "monitor-read" && tool.InputSchema.Properties["duration"].Default != "5s" {
+					t.Fatalf("unbounded MCP monitor read: %+v", tool)
+				}
 			}
 		case 3:
 			var result mflags.ToolCallResult
 			if err := json.Unmarshal(response.Result, &result); err != nil || result.IsError || len(result.Content) != 1 || result.Content[0].Text != "--mcp-arg\n" {
 				t.Fatalf("MCP remote result: %+v, %v", result, err)
+			}
+		case 4, 5:
+			var result mflags.ToolCallResult
+			if err := json.Unmarshal(response.Result, &result); err != nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("MCP query/capabilities result: %+v, %v", result, err)
+			}
+			if id == 4 {
+				var docs portal.Capabilities
+				if err := json.Unmarshal([]byte(result.Content[0].Text), &docs); err != nil || len(docs.Sources) == 0 || len(docs.Aggregates) == 0 {
+					t.Fatalf("MCP capabilities: %+v, %v", docs, err)
+				}
+			} else if result.Content[0].Text != fmt.Sprintf("%d\n", os.Getpid()) {
+				t.Fatalf("MCP snapshot/jq: %+v", result)
+			}
+		case 6:
+			var result mflags.ToolCallResult
+			if err := json.Unmarshal(response.Result, &result); err != nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("MCP bounded read: %+v, %v", result, err)
+			}
+			var record portal.MonitorRecord
+			if err := json.NewDecoder(strings.NewReader(result.Content[0].Text)).Decode(&record); err != nil || record.Sequence == 0 || record.Event.Process == nil || record.Event.Process.Action != "start" {
+				t.Fatalf("MCP monitor record: %+v, %v", record, err)
+			}
+		case 7:
+			var result mflags.ToolCallResult
+			if err := json.Unmarshal(response.Result, &result); err != nil || result.IsError {
+				t.Fatalf("MCP monitor delete: %+v, %v", result, err)
+			}
+		case 8, 9:
+			var result mflags.ToolCallResult
+			if err := json.Unmarshal(response.Result, &result); err != nil || !result.IsError || len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "invalid read duration") {
+				t.Fatalf("MCP accepted unbounded read: %+v, %v", result, err)
 			}
 		}
 	}

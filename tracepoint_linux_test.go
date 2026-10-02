@@ -6,16 +6,20 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"golang.org/x/sys/unix"
 )
 
 const schedWakeupFormat = `name: sched_wakeup
 format:
 	field:unsigned short common_type; offset:0; size:2; signed:0;
 	field:unsigned char common_flags; offset:2; size:1; signed:0;
+	field:int common_pid; offset:4; size:4; signed:1;
 	field:char comm[16]; offset:8; size:16; signed:0;
 	field:pid_t pid; offset:24; size:4; signed:1;
 	field:int prio; offset:28; size:4; signed:1;
@@ -38,8 +42,14 @@ func TestGenericTracepointFormatAndRecord(t *testing.T) {
 	if err := insns.Marshal(&bytes.Buffer{}, binary.LittleEndian); err != nil {
 		t.Fatalf("invalid eBPF instructions: %v", err)
 	}
-	if insns[1].Offset != 32 || insns[3].Offset != 24 || insns[5].Offset != 40 || insns[7].Offset != 28 || insns[1].OpCode != asm.LoadMem(asm.R7, asm.R6, 32, asm.Word).OpCode {
-		t.Fatalf("wrong eBPF field loads: %v", insns)
+	for i, field := range fields {
+		start := 1 + i*9
+		if insns[start] != asm.Mov.Imm(asm.R7, 0) || insns[start+1] != asm.StoreMem(asm.RFP, int16(-8*(len(fields)-i)), asm.R7, asm.DWord) ||
+			insns[start+4] != asm.Mov.Imm(asm.R2, int32(field.size)) ||
+			insns[start+6] != asm.Add.Imm(asm.R3, int32(field.offset)) ||
+			insns[start+7] != asm.FnProbeReadKernel.Call() {
+			t.Fatalf("wrong eBPF field read for %+v: %v", field, insns)
+		}
 	}
 	raw := make([]byte, 32)
 	binary.NativeEndian.PutUint64(raw[0:8], 3)
@@ -74,6 +84,26 @@ func TestGenericTracepointFormatAndRecord(t *testing.T) {
 	if _, err := decodeTracepointRecord(raw[:31], spec, fields); err == nil {
 		t.Fatal("accepted truncated ringbuf record")
 	}
+}
+
+func TestGenericTracepointKernelCommonFields(t *testing.T) {
+	fields, err := parseTracepointFormat(schedWakeupFormat, []string{"common_type", "common_flags", "common_pid", "pid", "timestamp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.RingBuf, MaxEntries: 1 << 16})
+	if err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skipf("kernel eBPF loading unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer events.Close()
+	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD())})
+	if err != nil {
+		t.Fatalf("load tracepoint with common_pid at offset 4: %+v", err)
+	}
+	program.Close()
 }
 
 func TestGenericTracepointRejectsUnsupportedFields(t *testing.T) {

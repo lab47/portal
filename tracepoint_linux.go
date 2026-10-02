@@ -89,20 +89,20 @@ func readTracepointFormat(category, name string, fields []string) ([]tracepointF
 func tracepointInstructions(fields []tracepointField, eventsFD int) asm.Instructions {
 	insns := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1)}
 	for i, field := range fields {
-		var width asm.Size
-		switch field.size {
-		case 1:
-			width = asm.Byte
-		case 2:
-			width = asm.Half
-		case 4:
-			width = asm.Word
-		case 8:
-			width = asm.DWord
-		}
+		// TracePoint programs cannot directly load the common trace header
+		// (including common_pid at offset 4). Probe reads also permit scalar
+		// fields whose kernel-provided offsets are not naturally aligned.
+		offset := int16(-8 * (len(fields) - i))
 		insns = append(insns,
-			asm.LoadMem(asm.R7, asm.R6, field.offset, width),
-			asm.StoreMem(asm.RFP, int16(-8*(len(fields)-i)), asm.R7, asm.DWord),
+			asm.Mov.Imm(asm.R7, 0),
+			asm.StoreMem(asm.RFP, offset, asm.R7, asm.DWord),
+			asm.Mov.Reg(asm.R1, asm.RFP),
+			asm.Add.Imm(asm.R1, int32(offset)),
+			asm.Mov.Imm(asm.R2, int32(field.size)),
+			asm.Mov.Reg(asm.R3, asm.R6),
+			asm.Add.Imm(asm.R3, int32(field.offset)),
+			asm.FnProbeReadKernel.Call(),
+			asm.JNE.Imm(asm.R0, 0, "exit"),
 		)
 	}
 	insns = append(insns,
@@ -112,7 +112,7 @@ func tracepointInstructions(fields []tracepointField, eventsFD int) asm.Instruct
 		asm.Mov.Imm(asm.R3, int32(8*len(fields))),
 		asm.Mov.Imm(asm.R4, 0),
 		asm.FnRingbufOutput.Call(),
-		asm.Mov.Imm(asm.R0, 0),
+		asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"),
 		asm.Return(),
 	)
 	return insns
