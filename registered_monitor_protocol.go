@@ -48,7 +48,7 @@ func authorizeMonitorSource(p policy, cert *ssh.Certificate, source string) erro
 		}
 		return nil
 	}
-	privileged := source == "packets" || source == "disk" || source == "containers" || source == "tracepoint"
+	privileged := source == "packets" || source == "disk" || source == "containers" || source == "cgroups" || source == "tracepoint"
 	if privileged && os.Geteuid() != 0 {
 		return fmt.Errorf("%s monitoring requires a root server", source)
 	}

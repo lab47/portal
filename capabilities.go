@@ -176,6 +176,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		{Name: "kernel", Description: "Boot time, uptime, load averages and optional Linux scheduling counters.", Modes: snapshot, Fields: outputFields(KernelInfo{}, "kernel"), Examples: []string{"kernel"}},
 		{Name: "sensors", Description: "Host-exposed temperature sensors; may legitimately be empty.", Modes: snapshot, Fields: outputFields([]SensorInfo{}, "sensors"), Filters: []FilterCapability{nameFilter(snapshot)}, Examples: []string{"sensors"}},
 		{Name: "containers", Description: "Docker container metadata, not container events.", Modes: snapshot, Requirements: []string{"Linux, readable /var/run/docker.sock", "root server and explicit root policy authorization (also permits root commands)"}, Fields: outputFields([]ContainerInfo{}, "containers"), Filters: []FilterCapability{nameFilter(snapshot)}, Examples: []string{"containers where name = web*"}},
+		{Name: "cgroups", Description: "Linux cgroup v2 resource accounting from the visible /sys/fs/cgroup hierarchy. Usage includes descendants: summing parents and children double-counts usage. Limits are local configuration, not effective ancestor/cpuset limits. Unlimited or unavailable limits are omitted.", Modes: snapshot, Requirements: []string{"Linux cgroup v2 mounted at /sys/fs/cgroup with readable controller files", "root server and explicit root policy authorization (also permits root commands)"}, Fields: outputFields([]CgroupInfo{}, "cgroups"), Filters: []FilterCapability{filter("path", "string", "Path relative to the visible mount, beginning with /; exact, prefix*, or *suffix, not a shell glob or filesystem path.", snapshot)}, Examples: []string{"cgroups", "cgroups where path = /system.slice/*"}},
 		{Name: "gpu", Description: "Nvidia GPU metrics; unavailable optional metrics are omitted.", Modes: snapshot, Requirements: []string{"nvidia-smi on the server PATH and an Nvidia driver"}, Fields: outputFields([]GPUInfo{}, "gpus"), Filters: []FilterCapability{nameFilter(snapshot)}, Examples: []string{"gpu"}},
 	}
 	for i := range sources {
@@ -200,10 +201,12 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				s.Examples = append(s.Examples, "gpu avg(utilization_percent) over 30s every 1s by uuid")
 			case "process":
 				s.Examples = append(s.Examples, "process avg(cpu_percent) over 5s every 1s by pid,name", "process max(rss_bytes) over 5s every 1s by pid,name")
+			case "cgroups":
+				s.Examples = append(s.Examples, "cgroups avg(cpu_percent) over 30s every 1s by path", "cgroups max(memory_bytes) over 30s every 1s by path")
 			}
 		}
 		s.PlatformSupported = true
-		if s.Name == "syscalls" || s.Name == "packets" || s.Name == "disk" || s.Name == "tracepoint" || s.Name == "containers" {
+		if s.Name == "syscalls" || s.Name == "packets" || s.Name == "disk" || s.Name == "tracepoint" || s.Name == "containers" || s.Name == "cgroups" {
 			s.PlatformSupported = runtime.GOOS == "linux"
 		}
 		// Authorization is the same check used by real requests, independent
@@ -258,8 +261,12 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				f.Unit = "bytes"
 			case f.Path == "disk.sector" || f.Path == "disk.sectors":
 				f.Unit = "512-byte sectors"
-			case s.Name == "cpu" && !strings.HasSuffix(f.Path, ".name") || f.Path == "kernel.uptime_seconds" || f.Path == "processes[].cpu_seconds":
+			case s.Name == "cpu" && !strings.HasSuffix(f.Path, ".name") || f.Path == "kernel.uptime_seconds" || strings.HasSuffix(f.Path, ".cpu_seconds"):
 				f.Unit = "seconds"
+			case f.Path == "cgroups[].cpu_limit_cores":
+				f.Unit = "cores"
+			case f.Path == "cgroups[].pids_current":
+				f.Unit = "tasks"
 			case f.Path == "processes[].threads":
 				f.Unit = "threads"
 			case f.Path == "processes[].command_line":

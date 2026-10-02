@@ -26,7 +26,7 @@ import (
 
 func TestCapabilityReference(t *testing.T) {
 	docs := describeCapabilities(policy{"reader": {"other-uid": true}}, &ssh.Certificate{KeyId: "reader"})
-	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 12 || len(docs.Aggregates) != 7 {
+	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 13 || len(docs.Aggregates) != 7 {
 		t.Fatalf("incomplete capability reference: %+v", docs)
 	}
 	for _, source := range docs.Sources {
@@ -173,7 +173,7 @@ func TestClientCapabilities(t *testing.T) {
 	})
 	client := Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: keyPath, CertFile: certPath}
 	docs, err := client.Capabilities(ctx)
-	if err != nil || docs.Version != 1 || len(docs.Sources) != 12 {
+	if err != nil || docs.Version != 1 || len(docs.Sources) != 13 {
 		t.Fatalf("capability request: %+v, %v", docs, err)
 	}
 	for _, source := range docs.Sources {

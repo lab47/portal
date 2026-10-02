@@ -76,6 +76,20 @@ type ContainerInfo struct {
 	State string `json:"state"`
 }
 
+// CgroupInfo describes a visible Linux cgroup v2 directory. Usage includes
+// descendants; limits are configured locally, not effective ancestor limits.
+type CgroupInfo struct {
+	Path             string   `json:"path"`
+	ID               string   `json:"id"` // Filesystem device/inode identity, used to detect recreated groups.
+	CPUSeconds       *float64 `json:"cpu_seconds,omitempty"`
+	CPULimitCores    *float64 `json:"cpu_limit_cores,omitempty"`
+	MemoryBytes      *uint64  `json:"memory_bytes,omitempty"`
+	MemoryLimitBytes *uint64  `json:"memory_limit_bytes,omitempty"`
+	MemoryAnonBytes  *uint64  `json:"memory_anon_bytes,omitempty"`
+	MemoryFileBytes  *uint64  `json:"memory_file_bytes,omitempty"`
+	PIDsCurrent      *uint64  `json:"pids_current,omitempty"` // Counts tasks, including threads.
+}
+
 type GPUInfo struct {
 	Index       int      `json:"index"`
 	UUID        string   `json:"uuid"`
@@ -176,6 +190,12 @@ func querySnapshot(ctx context.Context, request MonitorRequest) (Snapshot, error
 	case "containers":
 		var err error
 		snapshot.Containers, err = readContainers(ctx, request.Name)
+		if err != nil {
+			return Snapshot{}, err
+		}
+	case "cgroups":
+		var err error
+		snapshot.Cgroups, err = readCgroups(ctx, request.Path)
 		if err != nil {
 			return Snapshot{}, err
 		}

@@ -340,6 +340,9 @@ func TestMonitorStream(t *testing.T) {
 		if _, err := monitorRequestRemote(ctx, client, reg, signer, cert, MonitorRequest{Source: "containers", Mode: "snapshot"}, nil); err == nil || !strings.Contains(err.Error(), "root server") {
 			t.Fatalf("unprivileged Docker inventory allowed: %v", err)
 		}
+		if _, err := monitorRequestRemote(ctx, client, reg, signer, cert, MonitorRequest{Source: "cgroups", Mode: "snapshot", Path: "/"}, nil); err == nil || !strings.Contains(err.Error(), "root server") {
+			t.Fatalf("unprivileged cgroup inventory allowed: %v", err)
+		}
 		if err := monitorRemote(ctx, client, reg, signer, cert, packetRequest, func(Event) error { return nil }); err == nil || !strings.Contains(err.Error(), "root server") {
 			t.Fatalf("unprivileged packet capture allowed: %v", err)
 		}
@@ -348,6 +351,24 @@ func TestMonitorStream(t *testing.T) {
 		}
 	} else {
 		// The identity has explicit root access on this test server.
+		if _, err := readCgroups(ctx, "/"); err == nil {
+			for _, query := range []string{"cgroups where path = /", "cgroups where path = / avg(cpu_percent) over 300ms every 100ms by path"} {
+				r, err := ParseMonitorQuery(query)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := monitorRequestRemote(ctx, client, reg, signer, cert, r, nil)
+				if err != nil || got.Source != "cgroups" {
+					t.Fatalf("remote cgroup query: %+v, %v", got, err)
+				}
+				if r.Mode == "snapshot" && (len(got.Cgroups) != 1 || got.Cgroups[0].Path != "/" || got.Cgroups[0].CPUSeconds == nil) {
+					t.Fatalf("remote cgroup snapshot lost selection or metrics: %+v", got.Cgroups)
+				}
+				if r.Mode == "aggregate" && (got.Aggregation == nil || len(got.Aggregation.Values) != 1 || string(got.Aggregation.Values[0].Value) == "null") {
+					t.Fatalf("remote cgroup aggregation missing: %+v", got.Aggregation)
+				}
+			}
+		}
 		seen := 0
 		err := monitorRemote(ctx, client, reg, signer, cert, traceRequest, func(event Event) error {
 			seen++

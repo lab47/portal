@@ -33,6 +33,7 @@ type MonitorRequest struct {
 	Disk        *DiskFilter         `json:"disk,omitempty"`
 	Tracepoint  *TracepointFilter   `json:"tracepoint,omitempty"`
 	Name        string              `json:"name,omitempty"` // network interface or sensor key (exact or edge glob)
+	Path        string              `json:"path,omitempty"` // cgroup path relative to the visible v2 mount (exact or edge glob)
 }
 
 // TracepointFilter selects scalar fields from a Linux tracepoint. Equals values
@@ -141,6 +142,7 @@ type Snapshot struct {
 	Kernel       *KernelInfo        `json:"kernel,omitempty"`
 	Sensors      []SensorInfo       `json:"sensors,omitempty"`
 	Containers   []ContainerInfo    `json:"containers,omitempty"`
+	Cgroups      []CgroupInfo       `json:"cgroups,omitempty"`
 	GPUs         []GPUInfo          `json:"gpus,omitempty"`
 	Aggregation  *AggregationResult `json:"aggregation,omitempty"`
 	Capabilities *Capabilities      `json:"capabilities,omitempty"`
@@ -169,6 +171,8 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		collection = "sensors"
 	case "containers":
 		collection = "containers"
+	case "cgroups":
+		collection = "cgroups"
 	case "gpu":
 		collection = "gpus"
 	}
@@ -266,8 +270,11 @@ func (r MonitorRequest) validate() error {
 	} else if r.Aggregation != nil {
 		return errors.New("aggregation requires aggregate mode")
 	}
-	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu" && r.Source != "capabilities" {
+	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" {
 		return errors.New("unsupported snapshot source")
+	}
+	if r.Path != "" && (r.Source != "cgroups" || !validEdgeGlob(r.Path)) {
+		return errors.New("path is a cgroups filter and supports only a single leading or trailing *")
 	}
 	if r.Name != "" && !validEdgeGlob(r.Name) {
 		return errors.New("name supports only a single leading or trailing *")
@@ -325,7 +332,7 @@ func (r MonitorRequest) validate() error {
 		if r.Disk != nil && r.Disk.Operation != "" && r.Disk.Operation != "read" && r.Disk.Operation != "write" && r.Disk.Operation != "discard" && r.Disk.Operation != "flush" {
 			return errors.New("disk operation must be read, write, discard or flush")
 		}
-	case "cpu", "memory", "network", "kernel", "sensors", "containers", "gpu", "capabilities":
+	case "cpu", "memory", "network", "kernel", "sensors", "containers", "cgroups", "gpu", "capabilities":
 		if (r.Mode != "snapshot" && !(r.Mode == "aggregate" && sampledAggregation(r))) || r.PID != 0 || len(r.Syscalls) != 0 || r.Packet != nil || r.Process != nil || r.Disk != nil || r.Tracepoint != nil ||
 			(r.Name != "" && r.Source != "network" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu") {
 			return errors.New("invalid snapshot source filters")

@@ -28,6 +28,7 @@ var sampledSources = map[string]struct {
 	"gpu":        {"GPUs", []string{"uuid"}},
 	"containers": {"Containers", []string{"id"}},
 	"process":    {"Processes", []string{"pid", "started"}},
+	"cgroups":    {"Cgroups", []string{"path", "id"}},
 }
 
 func sampledAggregation(r MonitorRequest) bool {
@@ -76,7 +77,7 @@ func snapshotSampleFields(source string) []SampleField {
 			}
 		case source == "kernel" && field.Path == "counters.context_switches":
 			kind, field.Unit = "counter", "switches"
-		case source == "process" && field.Path == "cpu_seconds":
+		case (source == "process" || source == "cgroups") && field.Path == "cpu_seconds":
 			kind, field.Unit = "counter", "seconds"
 		case source == "process" && field.Path == "pid" || source == "gpu" && field.Path == "index" || source == "network" && field.Path == "index":
 			kind = "identity"
@@ -84,6 +85,10 @@ func snapshotSampleFields(source string) []SampleField {
 			field.Unit = "bytes"
 		case source == "process" && field.Path == "threads":
 			field.Unit = "threads"
+		case source == "cgroups" && field.Path == "cpu_limit_cores":
+			field.Unit = "cores"
+		case source == "cgroups" && field.Path == "pids_current":
+			field.Unit = "tasks"
 		case strings.HasSuffix(field.Path, "_celsius"):
 			field.Unit = "degrees Celsius"
 		case strings.HasSuffix(field.Path, "_percent"):
@@ -106,6 +111,9 @@ func snapshotSampleFields(source string) []SampleField {
 	}
 	if source == "process" {
 		fields = append(fields, SampleField{FieldCapability{Path: "cpu_percent", QueryField: "cpu_percent", Type: "number", Optional: true, Unit: "percent", Description: "100 × delta process user + system CPU seconds / elapsed seconds; 100% is one fully occupied core, may exceed 100%. Excludes child processes and needs consecutive observations of the same PID/start time."}, "utilization"})
+	}
+	if source == "cgroups" {
+		fields = append(fields, SampleField{FieldCapability{Path: "cpu_percent", QueryField: "cpu_percent", Type: "number", Optional: true, Unit: "percent", Description: "100 × delta cpu_seconds / elapsed seconds, including descendants; 100% is one busy core, may exceed 100%. Not normalized to quota; needs consecutive observations of the same directory identity."}, "utilization"})
 	}
 	return fields
 }

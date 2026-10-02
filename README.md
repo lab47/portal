@@ -207,9 +207,36 @@ Other one-shot sources use the same `portal query --query 'SOURCE [where name = 
 | `kernel` | `kernel` | Boot time, uptime seconds, 1/5/15-minute load averages, and context-switch/running/blocked counters where available |
 | `sensors` | `sensors` | Available temperature readings in Celsius, including high/critical thresholds when reported |
 | `containers` | `containers` | Docker ID, name, image, and state, including stopped containers |
+| `cgroups` | `cgroups` | Linux cgroup v2 paths, identities, CPU accounting/quota, memory accounting/limit, and task counts |
 | `gpu` | `gpus` | Nvidia GPU index, UUID, name, and available temperature, utilization, memory, and power readings |
 
-`network`, `sensors`, `containers`, and `gpu` support `where name = ...` with exact names or one leading/trailing `*` glob, for example `network where name = eth*`. Other sources do not take filters. An empty collection is returned as `[]`; metric fields unavailable from `nvidia-smi` are omitted. Docker requires Linux, a readable `/var/run/docker.sock`, a root server and **explicit `root` policy authorization**, because it exposes other workloads' metadata. GPU queries require `nvidia-smi` installed on the server and an Nvidia driver. Missing dependencies and unsupported platforms return errors, not fabricated empty results. Sensors depend on the host's exposed sensors and may legitimately be empty. Packet, syscall, disk, and tracepoint sources represent transient events rather than retained current state, so snapshot mode rejects them.
+`network`, `sensors`, `containers`, and `gpu` support `where name = ...` with exact names or one leading/trailing `*` glob, for example `network where name = eth*`. `cgroups` instead supports `where path = ...` with the same edge-glob rules. Other sources do not take filters. An empty collection is returned as `[]`; metric fields unavailable from `nvidia-smi` are omitted. Docker requires Linux, a readable `/var/run/docker.sock`, a root server and **explicit `root` policy authorization**, because it exposes other workloads' metadata. GPU queries require `nvidia-smi` installed on the server and an Nvidia driver. Missing dependencies and unsupported platforms return errors, not fabricated empty results. Sensors depend on the host's exposed sensors and may legitimately be empty. Packet, syscall, disk, and tracepoint sources represent transient events rather than retained current state, so snapshot mode rejects them.
+
+### Cgroup resource usage
+
+`cgroups` reads the server's visible **cgroup v2** hierarchy at `/sys/fs/cgroup`, independently of Docker or any container runtime. It requires Linux, a root server, and explicit `root` policy access for the client identity, since groups may expose other workloads. Cgroup v1 and missing/non-v2 mounts return errors. In a cgroup namespace or container, the source only sees the mounted subtree; `/` means that visible root, not necessarily the host root. Paths returned in `cgroups[]` are relative to the mount and begin with `/`.
+
+| Field | Meaning |
+| --- | --- |
+| `path`, `id` | Visible path and filesystem device/inode identity |
+| `cpu_seconds` | Cumulative CPU usage from `cpu.stat` (`usage_usec` converted to seconds) |
+| `cpu_limit_cores` | Locally configured `cpu.max` quota divided by period, when finite |
+| `memory_bytes` | Current charged memory, including page cache; not process RSS |
+| `memory_limit_bytes` | Locally configured finite `memory.max` limit |
+| `memory_anon_bytes`, `memory_file_bytes` | Anonymous memory and file cache from `memory.stat` |
+| `pids_current` | Current tasks, including threads |
+
+Controller files may be absent, especially on the hierarchy root or when controllers are disabled; unavailable fields are omitted, and unlimited limits (`max`) are omitted rather than encoded as zero. Present zero usage remains zero. Permission/read failures and malformed metrics fail the query. Snapshots are best-effort observations, not atomic reads across controller files. Up to 4,096 matching groups are returned; exceeding that bound fails explicitly, so narrow the path filter on large systems.
+
+Sampled aggregates add `cpu_percent` and `cpu_seconds_per_second` through the generic sampler. **100% means one busy core**, so usage can exceed 100%; it is not normalized to quota. Limits describe the group's own configuration, not effective restrictions from ancestors or cpusets. Directory identity is part of the CPU baseline, so recreating a group at the same path starts a new baseline even when its new counter is larger.
+
+```sh
+portal query --name node-a --query 'cgroups where path = /system.slice/*'
+portal query --name node-a --query 'cgroups avg(cpu_percent) over 30s every 1s by path'
+portal query --name node-a --query 'cgroups max(memory_bytes) over 30s every 1s by path | .aggregation.values | sort_by(.value) | reverse | .[:10]'
+```
+
+Usage includes descendants: **do not sum overlapping parent and child groups**, which would double-count usage. Prefix globs match all descendant depths; `/system.slice/*` is a literal prefix filter, not a shell glob restricted to one level. Omit `where` to enumerate all visible groups, including `/`. Add `id` to grouping (`by path,id`) to return different lifetimes separately. The source supports snapshots and sampled aggregates, not event monitors; capability discovery describes its fields, units, filters, and requirements.
 
 To observe block requests issued to a device on Linux, use the eBPF `disk` source:
 
@@ -288,7 +315,7 @@ For event sources, the window is half-open `[start, end)` using server ingestion
 
 ### Sampled snapshot aggregations
 
-CPU, memory, network, kernel, sensors, GPU, containers, and process snapshots use the same functions and grouping mechanism:
+CPU, memory, network, kernel, sensors, GPU, containers, cgroups, and process snapshots use the same functions and grouping mechanism:
 
 ```sh
 portal query --name node-a --query 'memory avg(used) over 30s every 1s'

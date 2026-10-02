@@ -157,10 +157,10 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	}
 	parsed := value.(parsedMonitorQuery)
 	r := MonitorRequest{Source: parsed.source}
-	if r.Source != "packets" && r.Source != "syscalls" && r.Source != "process" && r.Source != "disk" && r.Source != "tracepoint" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu" && r.Source != "capabilities" {
+	if r.Source != "packets" && r.Source != "syscalls" && r.Source != "process" && r.Source != "disk" && r.Source != "tracepoint" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" {
 		return MonitorRequest{}, fmt.Errorf("unknown monitor source %q", parsed.source)
 	}
-	if r.Source == "cpu" || r.Source == "memory" || r.Source == "network" || r.Source == "kernel" || r.Source == "sensors" || r.Source == "containers" || r.Source == "gpu" || r.Source == "capabilities" {
+	if r.Source == "cpu" || r.Source == "memory" || r.Source == "network" || r.Source == "kernel" || r.Source == "sensors" || r.Source == "containers" || r.Source == "cgroups" || r.Source == "gpu" || r.Source == "capabilities" {
 		r.Mode = "snapshot"
 	}
 	if parsed.aggregation != nil {
@@ -204,6 +204,13 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 }
 
 func setQueryFilter(r *MonitorRequest, field, value string) error {
+	if r.Source == "cgroups" {
+		if field != "path" || value == "" {
+			return fmt.Errorf("invalid cgroups field %q", field)
+		}
+		r.Path = value
+		return nil
+	}
 	if r.Source == "tracepoint" {
 		if r.Tracepoint == nil {
 			r.Tracepoint = &TracepointFilter{}
