@@ -1,0 +1,255 @@
+//go:build linux
+
+package portal
+
+import (
+	"bufio"
+	"context"
+	"debug/elf"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"testing"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+)
+
+func TestSymbolMappingsIgnoreHeapButRetainExecutableIdentity(t *testing.T) {
+	text := procMap{start: 0x1000, end: 0x2000, perms: "r-xp", path: "/bin/app", inode: 12}
+	maps := []procMap{
+		{start: 0x3000, end: 0x4000, perms: "rw-p", path: "[heap]"},
+		text,
+		{start: 0x5000, end: 0x6000, perms: "r-xp", path: "[vdso]"},
+	}
+	got := symbolMappings(maps)
+	if len(got) != 1 || got[0] != text {
+		t.Fatalf("executable mapping identity was lost: %+v", got)
+	}
+}
+
+func TestSymbolAndStackAuthorizationRequiresExplicitRoot(t *testing.T) {
+	cert := &ssh.Certificate{KeyId: "operator"}
+	for _, request := range []MonitorRequest{
+		{Source: "symbols"},
+		{Source: "syscalls", Stacks: &StackCapture{User: true}},
+		{Source: "tracepoint", Stacks: &StackCapture{Kernel: true}},
+	} {
+		if err := authorizeMonitorRequest(policy{"operator": {"65534": true}}, cert, request); err == nil {
+			t.Fatalf("accepted request without root policy: %+v", request)
+		}
+		err := authorizeMonitorRequest(policy{"operator": {"0": true}}, cert, request)
+		if os.Geteuid() == 0 && err != nil {
+			t.Fatalf("explicit root authorization rejected: %v", err)
+		}
+		if os.Geteuid() != 0 && err == nil {
+			t.Fatal("root policy alone authorized a non-root server")
+		}
+	}
+}
+
+func TestContainingSymbolRequiresActualRangeAndHandlesAliases(t *testing.T) {
+	syms := []inspectedSymbol{
+		{name: "alias_a", address: 0x100, size: 8},
+		{name: "alias_b", address: 0x100, size: 8},
+		{name: "next", address: 0x200, size: 4},
+	}
+	if got := containing(syms, 0x107); got == nil || got.address != 0x100 {
+		t.Fatalf("got %#v", got)
+	}
+	if got := containing(syms, 0x108); got != nil {
+		t.Fatalf("gap incorrectly resolved to %#v", got)
+	}
+	if got := containing(syms, 0x1ff); got != nil {
+		t.Fatalf("nearest symbol incorrectly used: %#v", got)
+	}
+	result := resultFromSymbols(context.Background(), SymbolRequest{Target: "binary", Name: "alias*"}, syms)
+	if len(result.Symbols) != 2 {
+		t.Fatalf("aliases were collapsed: %#v", result.Symbols)
+	}
+	if got := containing([]inspectedSymbol{{name: "stripped", address: 0x100}}, 0x100); got != nil {
+		t.Fatalf("zero-sized/stripped symbol incorrectly treated as a range: %#v", got)
+	}
+}
+
+func TestBinarySymbolsHaveLinkAddressesAndFileOffsets(t *testing.T) {
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	syms, err := readELFSymbols(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *inspectedSymbol
+	for i := range syms {
+		if syms[i].name == "github.com/lab47/portal.TestBinarySymbolsHaveLinkAddressesAndFileOffsets" {
+			found = &syms[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Skip("test executable has no Go ELF symbol table")
+	}
+	if found.fileOffset == nil {
+		t.Fatal("function in a load segment has no file offset")
+	}
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	valid := false
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_LOAD && found.address >= p.Vaddr && found.address-p.Vaddr < p.Filesz && *found.fileOffset == p.Off+found.address-p.Vaddr {
+			valid = true
+		}
+	}
+	if !valid {
+		t.Fatalf("address %#x has incorrect file offset %#x", found.address, *found.fileOffset)
+	}
+	result, err := InspectSymbols(context.Background(), SymbolRequest{Target: "binary", Path: path, Addresses: []uint64{found.address, found.address + found.size}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Frames[0].Name != found.name {
+		t.Fatalf("resolved %q", result.Frames[0].Name)
+	}
+	if found.size > 0 && result.Frames[1].Name == found.name {
+		t.Fatal("exclusive function end resolved to the preceding function")
+	}
+}
+
+func TestMapBiasUsesMappingFileOffset(t *testing.T) {
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		page := uint64(os.Getpagesize())
+		if p.Type == elf.PT_LOAD && p.Memsz > 0 && p.Off/page*page != 0 {
+			off := p.Off / page * page
+			v := p.Vaddr / page * page
+			m := &procMap{start: 0x70000000 + v, offset: off}
+			got, err := mapBias(f, m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != 0x70000000 {
+				t.Fatalf("bias %#x", got)
+			}
+			return
+		}
+	}
+	t.Fatal("no load segment")
+}
+
+func TestProcessSymbolsResolveCurrentFunction(t *testing.T) {
+	address := uint64(reflect.ValueOf(TestProcessSymbolsResolveCurrentFunction).Pointer())
+	result, err := InspectSymbols(context.Background(), SymbolRequest{Target: "process", PID: uint32(os.Getpid()), Addresses: []uint64{address, 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Frames[0].Name != "github.com/lab47/portal.TestProcessSymbolsResolveCurrentFunction" || result.Frames[0].Offset != 0 || result.Frames[1].Error == "" || result.Frames[1].Address != "0x1" {
+		t.Fatalf("incorrect process mapping/ASLR resolution: %+v", result)
+	}
+	result, err = InspectSymbols(context.Background(), SymbolRequest{Target: "process", PID: uint32(os.Getpid()), Name: "github.com/lab47/portal.TestProcessSymbolsResolveCurrentFunction"})
+	if err != nil || len(result.Symbols) != 1 || result.Symbols[0].Address != symbolHex(address) {
+		t.Fatalf("Go process name search: %+v, %v", result, err)
+	}
+}
+
+func TestProcessSymbolsSearchExecutableAndLibrary(t *testing.T) {
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("C compiler required for PIE/shared-library fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	for name, source := range map[string]string{
+		"lib.c": `int portal_sym_library(void) { return 7; }`,
+		"app.c": `#include <stdio.h>
+int portal_sym_library(void);
+int portal_sym_executable(void) { return 3; }
+int main(void) {
+    printf("%p %p\n", (void *)portal_sym_executable, (void *)portal_sym_library);
+    fflush(stdout);
+    return getchar() == EOF ? 0 : 1;
+}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, args := range [][]string{
+		{"-shared", "-fPIC", "lib.c", "-o", "libportaltest.so"},
+		{"-fPIE", "-pie", "app.c", "-L.", "-Wl,-rpath," + dir, "-lportaltest", "-o", "app"},
+	} {
+		build := exec.CommandContext(ctx, cc, args...)
+		build.Dir = dir
+		if output, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build fixture: %v: %s", err, output)
+		}
+	}
+	child := exec.CommandContext(ctx, filepath.Join(dir, "app"))
+	stdin, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stdin.Close(); child.Wait() }()
+	var executableAddress, libraryAddress string
+	if _, err := fmt.Fscan(bufio.NewReader(stdout), &executableAddress, &libraryAddress); err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]struct{ address, module string }{
+		"portal_sym_executable": {executableAddress, "app"},
+		"portal_sym_library":    {libraryAddress, "libportaltest.so"},
+	}
+	pid := uint32(child.Process.Pid)
+	for _, search := range []struct {
+		name  string
+		limit int
+		count int
+	}{
+		{"portal_sym_*", 0, 2},
+		{"portal_sym_library", 0, 1},
+		{"*executable", 0, 1},
+		{"portal_sym_*", 1, 1},
+		{"does_not_exist", 0, 0},
+	} {
+		result, err := InspectSymbols(ctx, SymbolRequest{Target: "process", PID: pid, Name: search.name, Limit: search.limit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Symbols) != search.count || len(result.Frames) != 0 {
+			t.Fatalf("search %+v: %+v", search, result)
+		}
+		seen := map[string]bool{}
+		for _, symbol := range result.Symbols {
+			want, ok := expected[symbol.Name]
+			address, err := strconv.ParseUint(symbol.Address, 0, 64)
+			wantAddress, _ := strconv.ParseUint(want.address, 0, 64)
+			if !ok || err != nil || address != wantAddress || symbol.Module != want.module || symbol.FileOffset == nil || seen[symbol.Name] {
+				t.Fatalf("incorrect or duplicate runtime symbol: %+v, want %+v", symbol, want)
+			}
+			seen[symbol.Name] = true
+		}
+	}
+}

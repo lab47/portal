@@ -21,9 +21,10 @@ import (
 )
 
 type tracepointField struct {
-	offset int16
-	size   int
-	signed bool
+	offset    int16
+	size      int
+	signed    bool
+	commonPID bool
 }
 
 var tracepointFormatLine = regexp.MustCompile(`field:([^;]+);\s*offset:(\d+);\s*size:(\d+);\s*signed:([01]);`)
@@ -63,7 +64,14 @@ func parseTracepointFormat(format string, names []string) ([]tracepointField, er
 			(size != 1 && size != 2 && size != 4 && size != 8) || offset < 0 || offset+size > 4096 {
 			return nil, fmt.Errorf("unsupported tracepoint field %q", name)
 		}
-		fields[i] = tracepointField{offset: int16(offset), size: size, signed: m[4] == "1"}
+		commonPID := name == "common_pid"
+		if commonPID && (offset != 4 || size != 4 || m[4] != "1") {
+			return nil, fmt.Errorf("unsupported tracepoint field %q", name)
+		}
+		if offset < 8 && !commonPID {
+			return nil, fmt.Errorf("tracepoint header field %q is unavailable to eBPF", name)
+		}
+		fields[i] = tracepointField{offset: int16(offset), size: size, signed: m[4] == "1", commonPID: commonPID}
 	}
 	for _, name := range names {
 		if !seen[name] {
@@ -86,13 +94,32 @@ func readTracepointFormat(category, name string, fields []string) ([]tracepointF
 	return nil, fmt.Errorf("read %s:%s tracepoint format: %w", category, name, err)
 }
 
-func tracepointInstructions(fields []tracepointField, eventsFD int) asm.Instructions {
+func tracepointInstructions(fields []tracepointField, eventsFD int, stacks ...*stackCaptureState) asm.Instructions {
 	insns := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1)}
+	var stackState *stackCaptureState
+	if len(stacks) != 0 {
+		stackState = stacks[0]
+	}
+	stackSize := 0
+	if stackState != nil {
+		stackSize = stackState.recordSize()
+		insns = appendStackCapture(insns, asm.R6, int16(-8*len(fields)-stackSize), stackState)
+	}
 	for i, field := range fields {
-		// TracePoint programs cannot directly load the common trace header
-		// (including common_pid at offset 4). Probe reads also permit scalar
-		// fields whose kernel-provided offsets are not naturally aligned.
 		offset := int16(-8 * (len(fields) - i))
+		if field.commonPID {
+			// The tracepoint context's first eight bytes contain a hidden
+			// pt_regs pointer, not the tracefs common header. common_pid is
+			// current->pid (TID), the low 32 bits of this helper, not TGID.
+			insns = append(insns,
+				asm.FnGetCurrentPidTgid.Call(),
+				asm.Mov.Reg32(asm.R7, asm.R0),
+				asm.StoreMem(asm.RFP, offset, asm.R7, asm.DWord),
+			)
+			continue
+		}
+		// Probe reads permit scalar payload fields whose kernel-provided
+		// offsets are not naturally aligned.
 		insns = append(insns,
 			asm.Mov.Imm(asm.R7, 0),
 			asm.StoreMem(asm.RFP, offset, asm.R7, asm.DWord),
@@ -108,8 +135,8 @@ func tracepointInstructions(fields []tracepointField, eventsFD int) asm.Instruct
 	insns = append(insns,
 		asm.LoadMapPtr(asm.R1, eventsFD),
 		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, int32(-8*len(fields))),
-		asm.Mov.Imm(asm.R3, int32(8*len(fields))),
+		asm.Add.Imm(asm.R2, int32(-8*len(fields)-stackSize)),
+		asm.Mov.Imm(asm.R3, int32(8*len(fields)+stackSize)),
 		asm.Mov.Imm(asm.R4, 0),
 		asm.FnRingbufOutput.Call(),
 		asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"),
@@ -153,7 +180,12 @@ func tracepointEvents(ctx context.Context, request MonitorRequest, emit func(Eve
 		return fmt.Errorf("create eBPF tracepoint ring buffer: %w", err)
 	}
 	defer events.Close()
-	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_trace", Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD())})
+	stacks, err := newStackCaptureState(request.Stacks)
+	if err != nil {
+		return err
+	}
+	defer stacks.close()
+	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_trace", Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD(), stacks)})
 	if err != nil {
 		return fmt.Errorf("load eBPF tracepoint monitor: %w", err)
 	}
@@ -178,9 +210,21 @@ func tracepointEvents(ctx context.Context, request MonitorRequest, emit func(Eve
 			}
 			return err
 		}
-		event, err := decodeTracepointRecord(record.RawSample, *spec, fields)
+		stackSize := 0
+		if stacks != nil {
+			stackSize = stacks.recordSize()
+		}
+		if len(record.RawSample) < stackSize {
+			return errors.New("invalid eBPF tracepoint record")
+		}
+		event, err := decodeTracepointRecord(record.RawSample[stackSize:], *spec, fields)
 		if err != nil {
 			return err
+		}
+		if stacks != nil {
+			if err := stacks.decode(ctx, record.RawSample[:stackSize], &event); err != nil {
+				return err
+			}
 		}
 		if request.matches(event) {
 			if err := emit(event); err != nil {

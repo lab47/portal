@@ -256,7 +256,7 @@ For probes not covered by a built-in event type, `tracepoint` attaches to a name
   --query 'tracepoint where event = sched:sched_wakeup and fields in (pid, target_cpu, prio) and field.target_cpu = 2'
 ```
 
-Common trace-header fields such as `common_pid` are supported. `common_pid` identifies the task/thread executing the tracepoint, not necessarily the application that originally requested the work. In particular, block I/O may be issued by kernel workers after asynchronous writeback or request merging; grouping `block:block_rq_issue` by `field.common_pid` is issuing-task attribution, not exact per-application disk accounting.
+`common_pid` is supported via the eBPF current-task helper because the kernel hides the trace header from tracepoint programs. Other header fields (`common_type`, `common_flags`, and `common_preempt_count`) are rejected rather than returning invalid data. `common_pid` identifies the task/thread executing the tracepoint, not necessarily the application that originally requested the work. In particular, block I/O may be issued by kernel workers after asynchronous writeback or request merging; grouping `block:block_rq_issue` by `field.common_pid` is issuing-task attribution, not exact per-application disk accounting.
 
 The result has `tracepoint.event` (`sched:sched_wakeup`) and `tracepoint.fields` (a map of exact JSON integer values), alongside the UTC receipt `time`. The probe name is `category:name`; `fields in (...)` selects 1–16 names from `/sys/kernel/tracing/events/CATEGORY/NAME/format` (or debug tracing). Add `field.NAME = NUMBER` for equality filters on selected fields; negative decimal and `0x` hex numbers are accepted. Field names are case-sensitive to the kernel format and numeric filters are applied **on the server after eBPF collection**, before streaming; these filters do not reduce ring-buffer traffic. The running kernel must expose the tracepoint and support ring buffers. Pointer, array, bitfield and dynamic (`__data_loc`) fields are rejected, not decoded as arbitrary memory; no arbitrary ELF/eBPF programs or kprobe/uprobe/XDP hooks are loaded. This source requires a root server **and explicit `root` policy authorization** because tracepoints can expose other accounts' activity. It is event-only; on non-Linux servers it returns an unsupported-platform error.
 
@@ -469,6 +469,31 @@ portal cert refresh --ca-url https://ca.example.com --ca ca.pub \
 The CA requires a signature from that key, rotates the refresh token on each successful use, and returns a new 48-hour certificate. The token is bound to that key and expires **30 days after the most recent passkey approval**, not 30 days after each refresh. Schedule `cert refresh` before the certificate expires (for example, once daily); after 30 days, rerun `cert request` and approve in the browser to start another 30-day period. If the client loses the rotated token due to a crash or failed write, browser approval is required again. Keep the token file and private key together and restrict them to the client account; neither should be logged or committed.
 
 Approval requests expire after five minutes and are not durable across CA restarts. The CA keeps passkey credentials and hashed refresh tokens on disk, while challenges and pending certificates live in memory. This version does not include automatic scheduling, multiple users per CA instance, or revocation; a stolen private key and certificate can remain usable for up to 48 hours unless each server's policy is changed and reloaded or its trusted CA is rotated. Protect the enrollment token and avoid logging approval URLs. Do not mount the CA signing key into the public coordinator.
+
+## Symbols and event stacks
+
+Linux servers support symbol lookup against the running kernel, an ELF binary on the server, or a live process. All symbol lookups and stack-enabled monitors require a root server and explicit root policy authorization (which also permits root commands).
+
+```sh
+portal query --name node-a --query 'symbols where target = kernel and name = vfs_*'
+portal query --name node-a --query 'symbols where target = binary and path = /usr/bin/app and name = handle*'
+portal query --name node-a --query 'symbols where target = process and pid = 1234 and addresses in (0x7f1234567890, 0x401234)'
+portal query --name node-a --query 'symbols where target = process and pid = 1234 and name = handle* and limit = 1000'
+```
+
+Kernel/process addresses are absolute runtime addresses; binary addresses are link-time virtual addresses. Results preserve addresses as exact hexadecimal strings, with function name, module, offset, and per-address unresolved diagnostics. Name matching accepts exact names or a single edge glob, mutually exclusive with addresses. Process name searches cover functions in the executable and shared libraries' executable file mappings and return ASLR-adjusted runtime addresses, module names, sizes, and available ELF file offsets. Batches are limited to 256 addresses; name results default to 256 across all objects, with `and limit = N` up to 4096. ELF symbol tables and stripped Go runtime function metadata are supported. There is no DWARF/source-line, C++/Rust demangling, JIT, or BTF inspection in this increment. Process lookup accounts for ASLR and mapped objects, checks backing inode/device identity, and rejects a PID or mapping snapshot that changes during inspection. Unavailable/deleted mappings return explicit unresolved results for address lookup; name searches fail on unreadable mapped objects rather than silently returning incomplete results. Stripped objects without function metadata can contribute no names.
+
+Add `stacks = user`, `kernel`, or `both` to syscall or generic tracepoint queries:
+
+```sh
+portal monitor-register --name node-a --query 'syscalls where pid = 1234 and stacks = both'
+portal query --name node-a --query 'syscalls where pid = 1234 and stacks = both count over 10s by user.stack, kernel.stack'
+portal query --name node-a --query 'tracepoint where event = block:block_rq_issue and fields in (common_pid, dev) and stacks = kernel count over 30s by field.dev, kernel.stack'
+```
+
+Events gain `user_stack`/`kernel_stack`, each with frames containing raw addresses and best-effort names/modules/offsets. Capture or symbolization failures remain explicit without discarding the ordinary event. Aggregation groups by semicolon-separated full call paths (`module:function+offset`, with unresolved addresses and capture errors retained), not just the first function. Stack capture defaults to 32 frames; the Go API can request up to 64 or disable symbolization. Stack maps hold 1024 entries; collisions/full maps report capture errors rather than reusing IDs and silently misattributing buffered events. Ring-buffer loss, missing frame pointers/unwind support, stripped non-Go objects, process exit/exec/PID reuse before resolution, namespaces, and kallsyms restrictions can limit results. Kernel symbols are cached for the monitor lifetime; restart a monitor after module changes. Stacks are resolved after capture, not an atomic historical mapping snapshot. A block-event kernel stack describes the issuing path, not the originating application's stack after asynchronous writeback.
+
+These queries work through the existing MCP `query` and persistent-monitor tools. `capabilities` advertises the symbols source, stack filter, and requirements.
 
 ## MCP tool
 

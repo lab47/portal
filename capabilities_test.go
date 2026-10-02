@@ -26,7 +26,7 @@ import (
 
 func TestCapabilityReference(t *testing.T) {
 	docs := describeCapabilities(policy{"reader": {"other-uid": true}}, &ssh.Certificate{KeyId: "reader"})
-	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 13 || len(docs.Aggregates) != 7 {
+	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 14 || len(docs.Aggregates) != 7 {
 		t.Fatalf("incomplete capability reference: %+v", docs)
 	}
 	for _, source := range docs.Sources {
@@ -41,6 +41,9 @@ func TestCapabilityReference(t *testing.T) {
 		}
 		if slices.Contains(source.Modes, "aggregate") {
 			r := MonitorRequest{Source: source.Name}
+			if source.Name == "syscalls" || source.Name == "tracepoint" {
+				r.Stacks = &StackCapture{User: true, Kernel: true}
+			}
 			if source.Name == "tracepoint" {
 				r.Tracepoint = &TracepointFilter{Event: "custom:sample", Fields: []string{"NAME"}}
 			}
@@ -173,7 +176,7 @@ func TestClientCapabilities(t *testing.T) {
 	})
 	client := Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: keyPath, CertFile: certPath}
 	docs, err := client.Capabilities(ctx)
-	if err != nil || docs.Version != 1 || len(docs.Sources) != 13 {
+	if err != nil || docs.Version != 1 || len(docs.Sources) != 14 {
 		t.Fatalf("capability request: %+v, %v", docs, err)
 	}
 	for _, source := range docs.Sources {

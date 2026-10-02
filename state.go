@@ -107,6 +107,12 @@ func querySnapshot(ctx context.Context, request MonitorRequest) (Snapshot, error
 	}
 	snapshot := Snapshot{Source: request.Source}
 	switch request.Source {
+	case "symbols":
+		result, err := InspectSymbols(ctx, *request.Symbols)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		snapshot.Symbols = &result
 	case "cpu":
 		times, err := cpu.TimesWithContext(ctx, true)
 		if err != nil {

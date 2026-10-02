@@ -32,6 +32,8 @@ type MonitorRequest struct {
 	Process     *ProcessFilter      `json:"process,omitempty"`
 	Disk        *DiskFilter         `json:"disk,omitempty"`
 	Tracepoint  *TracepointFilter   `json:"tracepoint,omitempty"`
+	Symbols     *SymbolRequest      `json:"symbols,omitempty"`
+	Stacks      *StackCapture       `json:"stacks,omitempty"`
 	Name        string              `json:"name,omitempty"` // network interface or sensor key (exact or edge glob)
 	Path        string              `json:"path,omitempty"` // cgroup path relative to the visible v2 mount (exact or edge glob)
 }
@@ -146,6 +148,7 @@ type Snapshot struct {
 	GPUs         []GPUInfo          `json:"gpus,omitempty"`
 	Aggregation  *AggregationResult `json:"aggregation,omitempty"`
 	Capabilities *Capabilities      `json:"capabilities,omitempty"`
+	Symbols      *SymbolResult      `json:"symbols,omitempty"`
 }
 
 // MarshalJSON keeps empty collections visible for the selected source while
@@ -217,15 +220,17 @@ type PacketEvent struct {
 // Event is a syscall entry, captured packet, process transition, disk request,
 // or selected tracepoint record.
 type Event struct {
-	Time       time.Time        `json:"time"`
-	TAI64N     string           `json:"tai64n"`
-	PID        uint32           `json:"pid,omitempty"`
-	TID        uint32           `json:"tid,omitempty"`
-	Syscall    int              `json:"syscall,omitempty"`
-	Packet     *PacketEvent     `json:"packet,omitempty"`
-	Process    *ProcessEvent    `json:"process,omitempty"`
-	Disk       *DiskEvent       `json:"disk,omitempty"`
-	Tracepoint *TracepointEvent `json:"tracepoint,omitempty"`
+	Time        time.Time        `json:"time"`
+	TAI64N      string           `json:"tai64n"`
+	PID         uint32           `json:"pid,omitempty"`
+	TID         uint32           `json:"tid,omitempty"`
+	Syscall     int              `json:"syscall,omitempty"`
+	Packet      *PacketEvent     `json:"packet,omitempty"`
+	Process     *ProcessEvent    `json:"process,omitempty"`
+	Disk        *DiskEvent       `json:"disk,omitempty"`
+	Tracepoint  *TracepointEvent `json:"tracepoint,omitempty"`
+	UserStack   *CapturedStack   `json:"user_stack,omitempty"`
+	KernelStack *CapturedStack   `json:"kernel_stack,omitempty"`
 }
 
 // MarshalJSON keeps syscall number zero visible without putting a spurious
@@ -236,12 +241,14 @@ func (e Event) MarshalJSON() ([]byte, error) {
 		return json.Marshal(fields(e))
 	}
 	return json.Marshal(struct {
-		Time    time.Time `json:"time"`
-		TAI64N  string    `json:"tai64n"`
-		PID     uint32    `json:"pid"`
-		TID     uint32    `json:"tid"`
-		Syscall int       `json:"syscall"`
-	}{e.Time, e.TAI64N, e.PID, e.TID, e.Syscall})
+		Time        time.Time      `json:"time"`
+		TAI64N      string         `json:"tai64n"`
+		PID         uint32         `json:"pid"`
+		TID         uint32         `json:"tid"`
+		Syscall     int            `json:"syscall"`
+		UserStack   *CapturedStack `json:"user_stack,omitempty"`
+		KernelStack *CapturedStack `json:"kernel_stack,omitempty"`
+	}{e.Time, e.TAI64N, e.PID, e.TID, e.Syscall, e.UserStack, e.KernelStack})
 }
 
 type monitorRequest struct {
@@ -257,6 +264,17 @@ type monitorFrame struct {
 }
 
 func (r MonitorRequest) validate() error {
+	if r.Symbols != nil && r.Source != "symbols" {
+		return errors.New("symbols spec requires symbols source")
+	}
+	if r.Stacks != nil {
+		if r.Source != "syscalls" && r.Source != "tracepoint" {
+			return errors.New("stack capture requires syscalls or tracepoint")
+		}
+		if err := r.Stacks.Validate(); err != nil {
+			return err
+		}
+	}
 	if r.Mode != "" && r.Mode != "snapshot" && r.Mode != "aggregate" {
 		return errors.New("unsupported monitor mode")
 	}
@@ -270,7 +288,7 @@ func (r MonitorRequest) validate() error {
 	} else if r.Aggregation != nil {
 		return errors.New("aggregation requires aggregate mode")
 	}
-	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" {
+	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" && r.Source != "symbols" {
 		return errors.New("unsupported snapshot source")
 	}
 	if r.Path != "" && (r.Source != "cgroups" || !validEdgeGlob(r.Path)) {
@@ -280,6 +298,11 @@ func (r MonitorRequest) validate() error {
 		return errors.New("name supports only a single leading or trailing *")
 	}
 	switch r.Source {
+	case "symbols":
+		if r.Mode != "snapshot" || r.Symbols == nil || r.PID != 0 || len(r.Syscalls) != 0 || r.Packet != nil || r.Process != nil || r.Disk != nil || r.Tracepoint != nil || r.Name != "" || r.Path != "" {
+			return errors.New("symbols requires snapshot mode, symbols spec and no unrelated filters")
+		}
+		return r.Symbols.Validate()
 	case "tracepoint":
 		if r.PID != 0 || len(r.Syscalls) != 0 || r.Packet != nil || r.Process != nil || r.Disk != nil || r.Name != "" || r.Tracepoint == nil {
 			return errors.New("tracepoint source requires a tracepoint spec and no unrelated filters")
@@ -584,7 +607,7 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		writeMonitorError(stream, "authentication failed")
 		return
 	}
-	if err := authorizeMonitorSource(policy, cert, req.Source); err != nil {
+	if err := authorizeMonitorRequest(policy, cert, req.MonitorRequest); err != nil {
 		writeMonitorError(stream, err.Error())
 		return
 	}

@@ -334,6 +334,14 @@ func TestMonitorStream(t *testing.T) {
 		t.Fatal("modified tracepoint probe passed signature check")
 	}
 	if os.Geteuid() != 0 {
+		for _, r := range []MonitorRequest{
+			{Source: "symbols", Mode: "snapshot", Symbols: &SymbolRequest{Target: "kernel", Name: "vfs_read"}},
+			{Source: "syscalls", Stacks: &StackCapture{Kernel: true}},
+		} {
+			if _, err := monitorRequestRemote(ctx, client, reg, signer, cert, r, func(Event) error { return stopEvent }); err == nil || !strings.Contains(err.Error(), "root server") {
+				t.Fatalf("unprivileged symbol/stack request allowed: %v", err)
+			}
+		}
 		if err := monitorRemote(ctx, client, reg, signer, cert, traceRequest, func(Event) error { return nil }); err == nil || !strings.Contains(err.Error(), "root server") {
 			t.Fatalf("unprivileged tracepoint allowed: %v", err)
 		}
@@ -351,6 +359,16 @@ func TestMonitorStream(t *testing.T) {
 		}
 	} else {
 		// The identity has explicit root access on this test server.
+		if r, err := ParseMonitorQuery("symbols where target = kernel and name = vfs_read"); err != nil {
+			t.Fatal(err)
+		} else if got, err := monitorRequestRemote(ctx, client, reg, signer, cert, r, nil); err != nil || got.Symbols == nil || len(got.Symbols.Symbols) == 0 || got.Symbols.Symbols[0].Name != "vfs_read" {
+			t.Fatalf("remote kernel symbol lookup: %+v, %v", got.Symbols, err)
+		}
+		if r, err := ParseMonitorQuery(fmt.Sprintf("symbols where target = process and pid = %d and name = github.com/lab47/portal.TestMonitorStream", os.Getpid())); err != nil {
+			t.Fatal(err)
+		} else if got, err := monitorRequestRemote(ctx, client, reg, signer, cert, r, nil); err != nil || got.Symbols == nil || len(got.Symbols.Symbols) != 1 || got.Symbols.Symbols[0].Name != "github.com/lab47/portal.TestMonitorStream" {
+			t.Fatalf("remote process symbol name lookup: %+v, %v", got.Symbols, err)
+		}
 		if _, err := readCgroups(ctx, "/"); err == nil {
 			for _, query := range []string{"cgroups where path = /", "cgroups where path = / avg(cpu_percent) over 300ms every 100ms by path"} {
 				r, err := ParseMonitorQuery(query)

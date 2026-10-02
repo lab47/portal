@@ -4,11 +4,16 @@ package portal
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -19,6 +24,7 @@ const schedWakeupFormat = `name: sched_wakeup
 format:
 	field:unsigned short common_type; offset:0; size:2; signed:0;
 	field:unsigned char common_flags; offset:2; size:1; signed:0;
+	field:unsigned char common_preempt_count; offset:3; size:1; signed:0;
 	field:int common_pid; offset:4; size:4; signed:1;
 	field:char comm[16]; offset:8; size:16; signed:0;
 	field:pid_t pid; offset:24; size:4; signed:1;
@@ -87,7 +93,7 @@ func TestGenericTracepointFormatAndRecord(t *testing.T) {
 }
 
 func TestGenericTracepointKernelCommonFields(t *testing.T) {
-	fields, err := parseTracepointFormat(schedWakeupFormat, []string{"common_type", "common_flags", "common_pid", "pid", "timestamp"})
+	fields, err := parseTracepointFormat(schedWakeupFormat, []string{"pid", "common_pid", "timestamp"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,10 +112,84 @@ func TestGenericTracepointKernelCommonFields(t *testing.T) {
 	program.Close()
 }
 
+func TestGenericTracepointCommonPIDHelper(t *testing.T) {
+	fields, err := parseTracepointFormat(schedWakeupFormat, []string{"pid", "common_pid", "prio"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fields[1].commonPID || fields[0].commonPID || fields[2].commonPID {
+		t.Fatalf("incorrect current-task field selection: %+v", fields)
+	}
+	insns := tracepointInstructions(fields, 42)
+	if insns[10] != asm.FnGetCurrentPidTgid.Call() || insns[11] != asm.Mov.Reg32(asm.R7, asm.R0) || insns[12] != asm.StoreMem(asm.RFP, -16, asm.R7, asm.DWord) {
+		t.Fatalf("common_pid must store the helper's low 32-bit TID in its selected slot: %v", insns)
+	}
+	if err := insns.Marshal(&bytes.Buffer{}, binary.LittleEndian); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenericTracepointKernelCommonPIDValues(t *testing.T) {
+	if _, err := readTracepointFormat("sched", "sched_switch", []string{"common_pid", "prev_pid"}); err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			t.Skipf("tracefs unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	complete := errors.New("captured distinct scheduling tasks")
+	done := make(chan error, 1)
+	go func() {
+		seen := make(map[json.Number]bool)
+		done <- tracepointEvents(ctx, MonitorRequest{Source: "tracepoint", Tracepoint: &TracepointFilter{
+			Event: "sched:sched_switch", Fields: []string{"common_pid", "prev_pid"},
+		}}, func(event Event) error {
+			fields := event.Tracepoint.Fields
+			if fields["common_pid"] != fields["prev_pid"] {
+				return fmt.Errorf("common_pid %s != outgoing task prev_pid %s", fields["common_pid"], fields["prev_pid"])
+			}
+			if fields["prev_pid"] != "0" {
+				seen[fields["prev_pid"]] = true
+			}
+			if len(seen) >= 2 {
+				return complete
+			}
+			return nil
+		})
+	}()
+	// Force scheduling activity on multiple Go threads while capturing.
+	for {
+		select {
+		case err := <-done:
+			if !errors.Is(err, complete) {
+				var verifier *ebpf.VerifierError
+				if !errors.As(err, &verifier) && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)) {
+					t.Skipf("kernel tracepoint capture unavailable: %v", err)
+				}
+				t.Fatalf("capture common_pid values: %v", err)
+			}
+			return
+		default:
+			runtime.Gosched()
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func TestGenericTracepointRejectsUnsupportedFields(t *testing.T) {
-	for _, name := range []string{"comm", "filename", "ptr", "missing"} {
+	for _, name := range []string{"comm", "filename", "ptr", "missing", "common_type", "common_flags", "common_preempt_count"} {
 		if _, err := parseTracepointFormat(schedWakeupFormat, []string{name}); err == nil {
 			t.Fatalf("accepted unsupported or missing field %s", name)
+		}
+	}
+	for _, bad := range []string{
+		strings.Replace(schedWakeupFormat, "common_pid; offset:4; size:4; signed:1", "common_pid; offset:8; size:4; signed:1", 1),
+		strings.Replace(schedWakeupFormat, "common_pid; offset:4; size:4; signed:1", "common_pid; offset:4; size:8; signed:1", 1),
+		strings.Replace(schedWakeupFormat, "common_pid; offset:4; size:4; signed:1", "common_pid; offset:4; size:4; signed:0", 1),
+	} {
+		if _, err := parseTracepointFormat(bad, []string{"common_pid"}); err == nil {
+			t.Fatal("accepted invalid common_pid format")
 		}
 	}
 	for _, bad := range []string{

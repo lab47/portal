@@ -157,7 +157,11 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	}
 	parsed := value.(parsedMonitorQuery)
 	r := MonitorRequest{Source: parsed.source}
-	if r.Source != "packets" && r.Source != "syscalls" && r.Source != "process" && r.Source != "disk" && r.Source != "tracepoint" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" {
+	if r.Source == "symbols" {
+		r.Mode = "snapshot"
+		r.Symbols = &SymbolRequest{}
+	}
+	if r.Source != "packets" && r.Source != "syscalls" && r.Source != "process" && r.Source != "disk" && r.Source != "tracepoint" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" && r.Source != "symbols" {
 		return MonitorRequest{}, fmt.Errorf("unknown monitor source %q", parsed.source)
 	}
 	if r.Source == "cpu" || r.Source == "memory" || r.Source == "network" || r.Source == "kernel" || r.Source == "sensors" || r.Source == "containers" || r.Source == "cgroups" || r.Source == "gpu" || r.Source == "capabilities" {
@@ -174,6 +178,16 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 		}
 		seen[condition.field] = true
 		if condition.op == "in" {
+			if r.Source == "symbols" && condition.field == "addresses" {
+				for _, text := range condition.values {
+					address, err := parseTracepointNumber(text)
+					if err != nil || strings.HasPrefix(text, "-") {
+						return MonitorRequest{}, fmt.Errorf("invalid symbol address %q", text)
+					}
+					r.Symbols.Addresses = append(r.Symbols.Addresses, address)
+				}
+				continue
+			}
 			if r.Source == "tracepoint" && condition.field == "fields" {
 				if r.Tracepoint == nil {
 					r.Tracepoint = &TracepointFilter{}
@@ -204,6 +218,38 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 }
 
 func setQueryFilter(r *MonitorRequest, field, value string) error {
+	if field == "stacks" {
+		if value != "user" && value != "kernel" && value != "both" {
+			return errors.New("stacks must be user, kernel or both")
+		}
+		r.Stacks = &StackCapture{User: value == "user" || value == "both", Kernel: value == "kernel" || value == "both", Symbolize: true}
+		return nil
+	}
+	if r.Source == "symbols" {
+		switch field {
+		case "target":
+			r.Symbols.Target = value
+		case "name":
+			r.Symbols.Name = value
+		case "path":
+			r.Symbols.Path = value
+		case "pid":
+			pid, err := strconv.ParseUint(value, 10, 32)
+			if err != nil {
+				return err
+			}
+			r.Symbols.PID = uint32(pid)
+		case "limit":
+			limit, err := strconv.ParseUint(value, 10, 16)
+			if err != nil {
+				return err
+			}
+			r.Symbols.Limit = int(limit)
+		default:
+			return fmt.Errorf("unknown symbols field %q", field)
+		}
+		return nil
+	}
 	if r.Source == "cgroups" {
 		if field != "path" || value == "" {
 			return fmt.Errorf("invalid cgroups field %q", field)

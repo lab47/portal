@@ -24,6 +24,11 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 		return fmt.Errorf("create eBPF ring buffer: %w", err)
 	}
 	defer events.Close()
+	stacks, err := newStackCaptureState(request.Stacks)
+	if err != nil {
+		return err
+	}
+	defer stacks.close()
 	insns := asm.Instructions{
 		asm.Mov.Reg(asm.R6, asm.R1),
 		asm.FnGetCurrentPidTgid.Call(),
@@ -50,13 +55,26 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 		}
 		insns = append(insns, asm.Ja.Label("exit"))
 	}
+	recordSize := 16
+	emitAtStackCapture := false
+	if stacks != nil {
+		captureStart := len(insns)
+		insns = appendStackCapture(insns, asm.R6, int16(-16-stacks.recordSize()), stacks)
+		insns[captureStart] = insns[captureStart].WithSymbol("emit")
+		emitAtStackCapture = true
+		recordSize += stacks.recordSize()
+	}
+	pidStore := asm.StoreMem(asm.RFP, -16, asm.R7, asm.DWord)
+	if !emitAtStackCapture {
+		pidStore = pidStore.WithSymbol("emit")
+	}
 	insns = append(insns,
-		asm.StoreMem(asm.RFP, -16, asm.R7, asm.DWord).WithSymbol("emit"),
+		pidStore,
 		asm.StoreMem(asm.RFP, -8, asm.R8, asm.DWord),
 		asm.LoadMapPtr(asm.R1, events.FD()),
 		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -16),
-		asm.Mov.Imm(asm.R3, 16),
+		asm.Add.Imm(asm.R2, int32(-recordSize)),
+		asm.Mov.Imm(asm.R3, int32(recordSize)),
 		asm.Mov.Imm(asm.R4, 0),
 		asm.FnRingbufOutput.Call(),
 		asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"),
@@ -90,11 +108,17 @@ func syscallEvents(ctx context.Context, request MonitorRequest, emit func(Event)
 			}
 			return err
 		}
-		if len(record.RawSample) != 16 {
+		if len(record.RawSample) != recordSize {
 			return errors.New("invalid eBPF syscall record")
 		}
-		pidTID := binary.NativeEndian.Uint64(record.RawSample[:8])
-		event := Event{Time: time.Now().UTC(), PID: uint32(pidTID >> 32), TID: uint32(pidTID), Syscall: int(binary.NativeEndian.Uint64(record.RawSample[8:]))}
+		base := len(record.RawSample) - 16
+		pidTID := binary.NativeEndian.Uint64(record.RawSample[base : base+8])
+		event := Event{Time: time.Now().UTC(), PID: uint32(pidTID >> 32), TID: uint32(pidTID), Syscall: int(binary.NativeEndian.Uint64(record.RawSample[base+8:]))}
+		if stacks != nil {
+			if err := stacks.decode(ctx, record.RawSample[:base], &event); err != nil {
+				return err
+			}
+		}
 		if request.matches(event) {
 			if err := emit(event); err != nil {
 				return err

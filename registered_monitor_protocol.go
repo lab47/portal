@@ -39,6 +39,13 @@ type registeredMonitorFrame struct {
 	Oldest uint64         `json:"oldest,omitempty"`
 }
 
+func authorizeMonitorRequest(p policy, cert *ssh.Certificate, request MonitorRequest) error {
+	if request.Stacks != nil {
+		return authorizeMonitorSource(p, cert, "tracepoint")
+	}
+	return authorizeMonitorSource(p, cert, request.Source)
+}
+
 func authorizeMonitorSource(p policy, cert *ssh.Certificate, source string) error {
 	if source == "capabilities" {
 		// Any mapped identity may discover requirements, including when it
@@ -48,7 +55,7 @@ func authorizeMonitorSource(p policy, cert *ssh.Certificate, source string) erro
 		}
 		return nil
 	}
-	privileged := source == "packets" || source == "disk" || source == "containers" || source == "cgroups" || source == "tracepoint"
+	privileged := source == "packets" || source == "disk" || source == "containers" || source == "cgroups" || source == "tracepoint" || source == "symbols"
 	if privileged && os.Geteuid() != 0 {
 		return fmt.Errorf("%s monitoring requires a root server", source)
 	}
@@ -93,7 +100,7 @@ func handleRegisteredMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.Pu
 			writeRegisteredFrame(stream, registeredMonitorFrame{Error: "invalid create request"})
 			return
 		}
-		if err := authorizeMonitorSource(policy, cert, req.Request.Source); err != nil {
+		if err := authorizeMonitorRequest(policy, cert, *req.Request); err != nil {
 			writeRegisteredFrame(stream, registeredMonitorFrame{Error: err.Error()})
 			return
 		}
@@ -116,7 +123,7 @@ func handleRegisteredMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.Pu
 		}
 		m, err := store.get(req.ID, owner)
 		if err == nil {
-			err = authorizeMonitorSource(policy, cert, m.request.Source)
+			err = authorizeMonitorRequest(policy, cert, m.request)
 		}
 		if err != nil {
 			writeRegisteredFrame(stream, registeredMonitorFrame{Error: err.Error()})

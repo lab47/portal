@@ -178,6 +178,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		{Name: "containers", Description: "Docker container metadata, not container events.", Modes: snapshot, Requirements: []string{"Linux, readable /var/run/docker.sock", "root server and explicit root policy authorization (also permits root commands)"}, Fields: outputFields([]ContainerInfo{}, "containers"), Filters: []FilterCapability{nameFilter(snapshot)}, Examples: []string{"containers where name = web*"}},
 		{Name: "cgroups", Description: "Linux cgroup v2 resource accounting from the visible /sys/fs/cgroup hierarchy. Usage includes descendants: summing parents and children double-counts usage. Limits are local configuration, not effective ancestor/cpuset limits. Unlimited or unavailable limits are omitted.", Modes: snapshot, Requirements: []string{"Linux cgroup v2 mounted at /sys/fs/cgroup with readable controller files", "root server and explicit root policy authorization (also permits root commands)"}, Fields: outputFields([]CgroupInfo{}, "cgroups"), Filters: []FilterCapability{filter("path", "string", "Path relative to the visible mount, beginning with /; exact, prefix*, or *suffix, not a shell glob or filesystem path.", snapshot)}, Examples: []string{"cgroups", "cgroups where path = /system.slice/*"}},
 		{Name: "gpu", Description: "Nvidia GPU metrics; unavailable optional metrics are omitted.", Modes: snapshot, Requirements: []string{"nvidia-smi on the server PATH and an Nvidia driver"}, Fields: outputFields([]GPUInfo{}, "gpus"), Filters: []FilterCapability{nameFilter(snapshot)}, Examples: []string{"gpu"}},
+		{Name: "symbols", Description: "Server-side ELF, process mapping and kernel symbol lookup. Process name searches cover executable file mappings and return runtime addresses; unreadable objects fail the query. Addresses are exact hexadecimal strings in results. No DWARF, demangling or JIT resolution.", Modes: snapshot, Requirements: []string{"Linux, readable ELF/process mappings or unrestricted kallsyms", "root server and explicit root policy authorization"}, Fields: outputFields(SymbolResult{}, "symbols"), Filters: []FilterCapability{filter("target", "string", "Required target.", snapshot, "kernel", "process", "binary"), filter("pid", "integer", "Required for process name or address lookup.", snapshot), filter("path", "string", "Absolute server-side ELF path for binary target.", snapshot), filter("name", "string", "Exact or edge glob; mutually exclusive with addresses. Process searches include the executable and mapped libraries.", snapshot), {Field: "addresses", Type: "integer", Operators: []string{"in"}, Modes: snapshot, Description: "1–256 unsigned 64-bit decimal/hex addresses; runtime addresses for kernel/process, link-time addresses for binary."}, filter("limit", "integer", "Name matches: default 256, maximum 4096 across all objects.", snapshot)}, Examples: []string{"symbols where target = kernel and name = vfs_*", "symbols where target = process and pid = 1234 and name = handle*"}},
 	}
 	for i := range sources {
 		s := &sources[i]
@@ -206,7 +207,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			}
 		}
 		s.PlatformSupported = true
-		if s.Name == "syscalls" || s.Name == "packets" || s.Name == "disk" || s.Name == "tracepoint" || s.Name == "containers" || s.Name == "cgroups" {
+		if s.Name == "syscalls" || s.Name == "packets" || s.Name == "disk" || s.Name == "tracepoint" || s.Name == "containers" || s.Name == "cgroups" || s.Name == "symbols" {
 			s.PlatformSupported = runtime.GOOS == "linux"
 		}
 		// Authorization is the same check used by real requests, independent
@@ -231,6 +232,12 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		}
 		if s.Name != "tracepoint" {
 			s.GroupByFields, s.NumericFields, _ = aggregateFields(MonitorRequest{Source: s.Name})
+		}
+		if s.Name == "syscalls" || s.Name == "tracepoint" {
+			s.Filters = append(s.Filters, filter("stacks", "string", "Optional symbolized stacks. Requires root server and explicit root policy. user.stack/kernel.stack grouping requires the corresponding capture. Depth defaults to 32, max 64 via API; capture is best-effort.", events, "user", "kernel", "both"))
+			s.GroupByFields = append(s.GroupByFields, "user.stack", "kernel.stack")
+			s.Fields = append(s.Fields, outputFields(CapturedStack{}, "user_stack")...)
+			s.Fields = append(s.Fields, outputFields(CapturedStack{}, "kernel_stack")...)
 		}
 		if s.GroupByFields == nil {
 			s.GroupByFields = []string{}
@@ -296,6 +303,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			"Raw counters cannot be summed/averaged/minimized/maximized/percentiled. Use FIELD_per_second for rates, or CPU utilization_percent. Derived values require consecutive observations, so the first observation is only a baseline. Resets, disappearing/reappearing entities, and missing fields start a new baseline; no zero is fabricated. A derived query needs a window longer than its interval.",
 			"Process snapshots include best-effort CPU seconds, RSS/virtual memory bytes, user, state, threads and command line. Unavailable values are omitted. Sampled process cpu_percent is 100 × delta cpu_seconds / elapsed seconds, excluding children: 100% is one busy core and multithreaded processes may exceed 100%. PID/start time identifies observations so PID reuse restarts the baseline.",
 			"Group/numeric field names are DSL aliases: src.ip/dst.ip map to packet.source_ip/destination_ip; src.port/dst.port map to packet.source_port/destination_port; name/action map to process.name/action; field.NAME maps to tracepoint.fields.NAME.",
+			"Tracepoint common_pid is obtained from the eBPF current-task helper. Other hidden trace header fields, including common_type, common_flags and common_preempt_count, are unavailable and rejected.",
 			"Tracepoint common_pid is the task/thread executing the tracepoint, not necessarily the application that requested the work. Block I/O can be issued by kernel workers after asynchronous writeback or merging; grouping block:block_rq_issue by field.common_pid is not exact per-application disk accounting.",
 			"Event time is UTC receipt time. tai64n is the resumable registered-monitor cursor. Registered monitors survive disconnects, not server restarts; bounded storage can overwrite old events. Reads reset the idle TTL.",
 		},

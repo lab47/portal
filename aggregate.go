@@ -94,6 +94,14 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 	default:
 		err = errors.New("aggregation requires an event source")
 	}
+	if r.Stacks != nil {
+		if r.Stacks.User {
+			fields = append(fields, "user.stack")
+		}
+		if r.Stacks.Kernel {
+			fields = append(fields, "kernel.stack")
+		}
+	}
 	return
 }
 
@@ -154,23 +162,30 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 }
 
 func eventGroupFields(event Event) map[string]any {
+	var fields map[string]any
 	switch {
 	case event.Process != nil:
-		return map[string]any{"pid": event.PID, "name": event.Process.Name, "action": event.Process.Action}
+		fields = map[string]any{"pid": event.PID, "name": event.Process.Name, "action": event.Process.Action}
 	case event.Packet != nil:
 		p := event.Packet
-		return map[string]any{"protocol": p.Protocol, "direction": p.Direction, "src.ip": p.SourceIP, "dst.ip": p.DestinationIP, "src.port": p.SourcePort, "dst.port": p.DestinationPort, "length": p.Length}
+		fields = map[string]any{"protocol": p.Protocol, "direction": p.Direction, "src.ip": p.SourceIP, "dst.ip": p.DestinationIP, "src.port": p.SourcePort, "dst.port": p.DestinationPort, "length": p.Length}
 	case event.Disk != nil:
-		return map[string]any{"device": event.Disk.Device, "operation": event.Disk.Operation, "sector": event.Disk.Sector, "sectors": event.Disk.Sectors}
+		fields = map[string]any{"device": event.Disk.Device, "operation": event.Disk.Operation, "sector": event.Disk.Sector, "sectors": event.Disk.Sectors}
 	case event.Tracepoint != nil:
-		fields := make(map[string]any, len(event.Tracepoint.Fields))
+		fields = make(map[string]any, len(event.Tracepoint.Fields))
 		for name, value := range event.Tracepoint.Fields {
 			fields["field."+name] = value
 		}
-		return fields
 	default:
-		return map[string]any{"pid": event.PID, "tid": event.TID, "syscall": event.Syscall}
+		fields = map[string]any{"pid": event.PID, "tid": event.TID, "syscall": event.Syscall}
 	}
+	if event.UserStack != nil {
+		fields["user.stack"] = event.UserStack.key()
+	}
+	if event.KernelStack != nil {
+		fields["kernel.stack"] = event.KernelStack.key()
+	}
+	return fields
 }
 
 type aggregateAccumulator struct {
