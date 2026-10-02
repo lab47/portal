@@ -107,10 +107,20 @@ func newMonitorQueryGrammar() p.Rule {
 		return &AggregationRequest{Function: "percentile", Field: queryField(v.Get("field").(string)), Percentile: percent}
 	})
 	count := p.Transform(keyword("count"), func(string) any { return &AggregationRequest{} })
-	aggregate := p.Action(p.Seq(p.Named("operation", p.Or(percentile, metric, count)), keyword("over"), p.Named("window", word), p.Named("group", p.Maybe(group))), func(v p.Values) any {
+	every := p.Action(p.Seq(keyword("every"), p.Named("interval", word)), func(v p.Values) any {
+		interval, err := time.ParseDuration(v.Get("interval").(string))
+		if err != nil || interval <= 0 {
+			return time.Duration(-1)
+		}
+		return interval
+	})
+	aggregate := p.Action(p.Seq(p.Named("operation", p.Or(percentile, metric, count)), keyword("over"), p.Named("window", word), p.Named("every", p.Maybe(every)), p.Named("group", p.Maybe(group))), func(v p.Values) any {
 		window, _ := time.ParseDuration(v.Get("window").(string)) // Invalid durations become zero and fail validation.
 		a := v.Get("operation").(*AggregationRequest)
 		a.Window = window
+		if interval := v.Get("every"); interval != nil {
+			a.Every = interval.(time.Duration)
+		}
 		if fields := v.Get("group"); fields != nil {
 			a.GroupBy = fields.([]string)
 		}

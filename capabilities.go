@@ -27,18 +27,19 @@ type Capabilities struct {
 }
 
 type SourceCapability struct {
-	Name              string             `json:"name"`
-	Description       string             `json:"description"`
-	Modes             []string           `json:"modes"` // events, snapshot, aggregate
-	PlatformSupported bool               `json:"platform_supported"`
-	Authorized        bool               `json:"authorized"`
-	UnavailableReason string             `json:"unavailable_reason,omitempty"`
-	Requirements      []string           `json:"requirements"`
-	Fields            []FieldCapability  `json:"fields"`
-	Filters           []FilterCapability `json:"filters"`
-	GroupByFields     []string           `json:"group_by_fields"`
-	NumericFields     []string           `json:"numeric_fields"`
-	Examples          []string           `json:"examples"`
+	Name              string              `json:"name"`
+	Description       string              `json:"description"`
+	Modes             []string            `json:"modes"` // events, snapshot, aggregate
+	PlatformSupported bool                `json:"platform_supported"`
+	Authorized        bool                `json:"authorized"`
+	UnavailableReason string              `json:"unavailable_reason,omitempty"`
+	Requirements      []string            `json:"requirements"`
+	Fields            []FieldCapability   `json:"fields"`
+	Filters           []FilterCapability  `json:"filters"`
+	GroupByFields     []string            `json:"group_by_fields"`
+	NumericFields     []string            `json:"numeric_fields"`
+	Examples          []string            `json:"examples"`
+	Sampling          *SamplingCapability `json:"sampling,omitempty"`
 }
 
 // FieldCapability describes an output JSON path, not necessarily a DSL field.
@@ -63,7 +64,7 @@ type FilterCapability struct {
 type AggregateCapability struct {
 	Name        string `json:"name"`
 	Syntax      string `json:"syntax"`
-	FieldType   string `json:"field_type"` // none, scalar, integer
+	FieldType   string `json:"field_type"` // none, scalar, number (event metrics remain integers)
 	Description string `json:"description"`
 }
 
@@ -179,6 +180,26 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 	}
 	for i := range sources {
 		s := &sources[i]
+		if _, ok := sampledSources[s.Name]; ok {
+			groups, numeric := sampledFields(s.Name)
+			s.Sampling = &SamplingCapability{DefaultInterval: DefaultSampleInterval.String(), MinInterval: MinSampleInterval.String(), Fields: snapshotSampleFields(s.Name), GroupByFields: groups, NumericFields: numeric}
+			if !slices.Contains(s.Modes, "aggregate") {
+				s.Modes = append(append([]string{}, s.Modes...), "aggregate")
+			}
+			s.Examples = append(s.Examples, s.Name+" count over 30s every 1s")
+			switch s.Name {
+			case "cpu":
+				s.Examples = append(s.Examples, "cpu avg(utilization_percent) over 30s every 1s by name")
+			case "memory":
+				s.Examples = append(s.Examples, "memory avg(used) over 30s every 1s")
+			case "network":
+				s.Examples = append(s.Examples, "network avg(bytes_recv_per_second) over 30s every 1s by name")
+			case "sensors":
+				s.Examples = append(s.Examples, "sensors max(temperature_celsius) over 30s every 1s by name")
+			case "gpu":
+				s.Examples = append(s.Examples, "gpu avg(utilization_percent) over 30s every 1s by uuid")
+			}
+		}
 		s.PlatformSupported = true
 		if s.Name == "syscalls" || s.Name == "packets" || s.Name == "disk" || s.Name == "tracepoint" || s.Name == "containers" {
 			s.PlatformSupported = runtime.GOOS == "linux"
@@ -194,6 +215,11 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		}
 		if s.Filters == nil {
 			s.Filters = []FilterCapability{}
+		}
+		if sampledAggregation(MonitorRequest{Source: s.Name}) {
+			for j := range s.Filters {
+				s.Filters[j].Modes = []string{"snapshot", "aggregate"}
+			}
 		}
 		if s.Requirements == nil {
 			s.Requirements = []string{}
@@ -245,17 +271,28 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 	}
 	return Capabilities{
 		Version: 1, OS: runtime.GOOS, Arch: runtime.GOARCH,
-		Syntax:  "SOURCE [where FIELD = VALUE [and ...]] [FUNCTION over DURATION [by FIELD, ...]]; count | FUNCTION(FIELD) | percentile(FIELD, PERCENT); syscall in (N, ...) and tracepoint fields in (NAME, ...)",
-		Notes:   []string{"Modes: events uses monitor/monitor-register; snapshot and aggregate use query. process without an aggregate is a snapshot in query and events in monitor.", "Platform support and authorization are reported separately. Runtime dependencies are not probed; queries can still fail due to kernel permissions, unsupported formats, missing tools or hardware.", "All sources require a valid CA-signed certificate with the configured principal. Except capabilities, authorization requires access to the server account; privileged sources additionally require root. Root authorization also permits arbitrary root commands.", "Filters use AND only; no OR, comparisons, regex or interior globs. Source/field keywords are case-insensitive except kernel field names and name values. Quote values containing spaces.", "Aggregation collects a fresh half-open server-ingestion window [start,end), not registered-monitor history. One function per query; no repeating windows. Capture is best-effort; cancellation stops collection and source failures return errors.", "Group/numeric field names are DSL aliases: src.ip/dst.ip map to packet.source_ip/destination_ip; src.port/dst.port map to packet.source_port/destination_port; name/action map to process.name/action; field.NAME maps to tracepoint.fields.NAME.", "Event time is UTC receipt time. tai64n is the resumable registered-monitor cursor. Registered monitors survive disconnects, not server restarts; bounded storage can overwrite old events. Reads reset the idle TTL."},
+		Syntax: "SOURCE [where FIELD = VALUE [and ...]] [FUNCTION over DURATION [every INTERVAL] [by FIELD, ...]]; count | FUNCTION(FIELD) | percentile(FIELD, PERCENT); syscall in (N, ...) and tracepoint fields in (NAME, ...)",
+		Notes: []string{
+			"Modes: events uses monitor/monitor-register; snapshot and aggregate use query. process without an aggregate is a snapshot in query and events in monitor.",
+			"Platform support and authorization are reported separately. Runtime dependencies are not probed; queries can still fail due to kernel permissions, unsupported formats, missing tools or hardware.",
+			"All sources require a valid CA-signed certificate with the configured principal. Except capabilities, authorization requires access to the server account; privileged sources additionally require root. Root authorization also permits arbitrary root commands.",
+			"Filters use AND only; no OR, comparisons, regex or interior globs. Source/field keywords are case-insensitive except kernel field names and name values. Quote values containing spaces.",
+			"Aggregation collects a fresh half-open server-ingestion window [start,end), not registered-monitor history. One function per query; no repeating windows. Capture is best-effort; cancellation stops collection and source failures return errors.",
+			"Sources with sampling metadata support sampled snapshot aggregates. every defaults to 1s for snapshot-only sources; process requires explicit every to select snapshots instead of lifecycle events. Sampling fields are record-relative paths, not event field aliases.",
+			"Samples are collected immediately and on the interval grid before the window ends; slow reads skip ticks without overlap. count counts observed records. avg is an arithmetic sample mean, not time-weighted; sum of a gauge is a sum of observations, not an integral. Missing optional metrics are skipped, not zero.",
+			"Raw counters cannot be summed/averaged/minimized/maximized/percentiled. Use FIELD_per_second for rates, or CPU utilization_percent. Derived values require consecutive observations, so the first observation is only a baseline. Resets, disappearing/reappearing entities, and missing fields start a new baseline; no zero is fabricated. A derived query needs a window longer than its interval.",
+			"Group/numeric field names are DSL aliases: src.ip/dst.ip map to packet.source_ip/destination_ip; src.port/dst.port map to packet.source_port/destination_port; name/action map to process.name/action; field.NAME maps to tracepoint.fields.NAME.",
+			"Event time is UTC receipt time. tai64n is the resumable registered-monitor cursor. Registered monitors survive disconnects, not server restarts; bounded storage can overwrite old events. Reads reset the idle TTL.",
+		},
 		Sources: sources,
 		Aggregates: []AggregateCapability{
-			{"count", "count over DURATION [by FIELD, ...]", "none", "Number of matching events; no field argument."},
-			{"sum", "sum(FIELD) over DURATION [by FIELD, ...]", "integer", "Exact integer sum; empty ungrouped window returns 0."},
-			{"avg", "avg(FIELD) over DURATION [by FIELD, ...]", "integer", "Arithmetic mean rounded to 18 decimal places; empty ungrouped window returns null."},
-			{"min", "min(FIELD) over DURATION [by FIELD, ...]", "integer", "Minimum; empty ungrouped window returns null."},
-			{"max", "max(FIELD) over DURATION [by FIELD, ...]", "integer", "Maximum; empty ungrouped window returns null."},
-			{"count_distinct", "count_distinct(FIELD) over DURATION [by FIELD, ...]", "scalar", "Exact distinct count of any groupable field, including strings; empty ungrouped window returns 0."},
-			{"percentile", "percentile(FIELD, PERCENT) over DURATION [by FIELD, ...]", "integer", "Exact nearest-rank percentile; finite PERCENT from 0 to 100 inclusive; empty ungrouped window returns null."},
+			{"count", "count over DURATION [every INTERVAL] [by FIELD, ...]", "none", "Number of matching events or observed snapshot records; no field argument."},
+			{"sum", "sum(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Sum; integers remain exact, decimal results round to 18 places. Empty ungrouped window returns 0."},
+			{"avg", "avg(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Arithmetic sample mean rounded to 18 decimal places, not time-weighted; empty ungrouped window returns null."},
+			{"min", "min(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Minimum; empty ungrouped window returns null."},
+			{"max", "max(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Maximum; empty ungrouped window returns null."},
+			{"count_distinct", "count_distinct(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "scalar", "Exact distinct count of any groupable field, including strings; empty ungrouped window returns 0."},
+			{"percentile", "percentile(FIELD, PERCENT) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Exact nearest-rank percentile of samples; finite PERCENT from 0 to 100 inclusive; empty ungrouped window returns null."},
 		},
 		Limits:      CapabilityLimits{QueryBytes: 4096, MaxWindow: "1h", GroupByFields: 4, Groups: maxAggregateGroups, RetainedAggregateValues: maxAggregateValues, TracepointFields: 16, SyscallFilters: 256, PacketCaptureBytes: 2048, DefaultMonitorTTL: DefaultMonitorTTL.String(), RegisteredMonitors: maxRegisteredMonitors, MonitorRingEvents: monitorRingSize, MonitorEventBytes: maxMonitorEventSize},
 		EventFields: []FieldCapability{{Path: "time", Type: "timestamp", Description: "UTC receipt time"}, {Path: "tai64n", Type: "string", Description: "TAI64N timestamp/cursor for resuming monitor reads"}},

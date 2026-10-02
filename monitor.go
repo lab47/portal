@@ -285,7 +285,7 @@ func (r MonitorRequest) validate() error {
 		if r.Process != nil && r.Process.Action != "" && r.Process.Action != "start" && r.Process.Action != "exit" {
 			return errors.New("process action must be start or exit")
 		}
-		if r.Mode == "snapshot" && r.Process != nil && r.Process.Action != "" {
+		if (r.Mode == "snapshot" || sampledAggregation(r)) && r.Process != nil && r.Process.Action != "" {
 			return errors.New("process action is not a snapshot filter")
 		}
 	case "packets":
@@ -319,7 +319,7 @@ func (r MonitorRequest) validate() error {
 			return errors.New("disk operation must be read, write, discard or flush")
 		}
 	case "cpu", "memory", "network", "kernel", "sensors", "containers", "gpu", "capabilities":
-		if r.Mode != "snapshot" || r.PID != 0 || len(r.Syscalls) != 0 || r.Packet != nil || r.Process != nil || r.Disk != nil || r.Tracepoint != nil ||
+		if (r.Mode != "snapshot" && !(r.Mode == "aggregate" && sampledAggregation(r))) || r.PID != 0 || len(r.Syscalls) != 0 || r.Packet != nil || r.Process != nil || r.Disk != nil || r.Tracepoint != nil ||
 			(r.Name != "" && r.Source != "network" && r.Source != "sensors" && r.Source != "containers" && r.Source != "gpu") {
 			return errors.New("invalid snapshot source filters")
 		}
@@ -609,7 +609,13 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		close(readDone)
 	}()
 	if req.Mode == "aggregate" {
-		result, err := aggregateEvents(monitorCtx, req.MonitorRequest, source)
+		var result Snapshot
+		var err error
+		if sampledAggregation(req.MonitorRequest) {
+			result, err = aggregateSnapshots(monitorCtx, req.MonitorRequest, querySnapshot)
+		} else {
+			result, err = aggregateEvents(monitorCtx, req.MonitorRequest, source)
+		}
 		if monitorCtx.Err() != nil {
 			return
 		}

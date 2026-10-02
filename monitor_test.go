@@ -225,6 +225,29 @@ func TestMonitorStream(t *testing.T) {
 			t.Fatal("aggregation source was not canceled")
 		}
 	}
+	for _, tc := range []struct {
+		query string
+		every time.Duration
+	}{
+		{"memory avg(total) over 1s", time.Second},
+		{fmt.Sprintf("process where pid = %d count_distinct(pid) over 300ms every 100ms", os.Getpid()), 100 * time.Millisecond},
+	} {
+		request, err := ParseMonitorQuery(tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := monitorRequestRemote(ctx, client, reg, signer, cert, request, nil)
+		if err != nil || got.Aggregation == nil || len(got.Aggregation.Values) != 1 || got.Aggregation.Every != tc.every {
+			t.Fatalf("remote sampled query %s: %+v, %v", tc.query, got.Aggregation, err)
+		}
+		var value float64
+		if err := json.Unmarshal(got.Aggregation.Values[0].Value, &value); err != nil || value <= 0 {
+			t.Fatalf("missing sampled value: %s, %v", got.Aggregation.Values[0].Value, err)
+		}
+		if request.Source == "process" && value != 1 {
+			t.Fatalf("sampled process query lost PID filter: %s", got.Aggregation.Values[0].Value)
+		}
+	}
 	aggregateProof, err := signMonitor(signer, cert, []byte(strings.Repeat("a", 32)), aggregateRequest)
 	if err != nil {
 		t.Fatal(err)

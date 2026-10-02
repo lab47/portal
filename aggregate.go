@@ -17,7 +17,7 @@ import (
 const maxAggregateGroups = 4096
 const maxAggregateValues = 65536
 
-// AggregationRequest reduces matching events received during a new window.
+// AggregationRequest reduces matching events or sampled snapshots during a new window.
 // An omitted Function selects count for compatibility.
 type AggregationRequest struct {
 	Window     time.Duration `json:"window"` // nanoseconds
@@ -25,6 +25,7 @@ type AggregationRequest struct {
 	Function   string        `json:"function,omitempty"` // count, sum, avg, min, max, count_distinct, percentile
 	Field      string        `json:"field,omitempty"`
 	Percentile float64       `json:"percentile,omitempty"` // 0–100, only for percentile
+	Every      time.Duration `json:"every,omitempty"`      // Snapshot sampling interval; zero defaults to 1s for snapshot-only sources.
 }
 
 type AggregateCount struct {
@@ -47,6 +48,7 @@ type AggregationResult struct {
 	Field      string           `json:"field,omitempty"`
 	Percentile float64          `json:"percentile,omitempty"`
 	Values     []AggregateValue `json:"values,omitempty"`
+	Every      time.Duration    `json:"every,omitempty"`
 }
 
 // Keep the selected result collection visible even for an empty grouped window.
@@ -65,6 +67,10 @@ func (a AggregationResult) MarshalJSON() ([]byte, error) {
 }
 
 func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
+	if sampledAggregation(r) {
+		fields, numeric = sampledFields(r.Source)
+		return
+	}
 	switch r.Source {
 	case "syscalls":
 		fields = []string{"pid", "tid", "syscall"}
@@ -98,6 +104,22 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 	if len(a.GroupBy) > 4 {
 		return errors.New("aggregation supports at most 4 grouping fields")
 	}
+	if sampledAggregation(r) {
+		interval := a.Every
+		if interval == 0 {
+			interval = DefaultSampleInterval
+		}
+		if interval < MinSampleInterval || interval > a.Window {
+			return errors.New("sampling interval must be at least 100ms and no greater than the window")
+		}
+		for _, field := range snapshotSampleFields(r.Source) {
+			if (field.Path == a.Field || slices.Contains(a.GroupBy, field.Path)) && (field.Semantics == "rate" || field.Semantics == "utilization") && interval >= a.Window {
+				return errors.New("derived metrics require a window longer than the sampling interval")
+			}
+		}
+	} else if a.Every != 0 {
+		return errors.New("every requires a snapshot source")
+	}
 	fields, numeric, err := aggregateFields(r)
 	if err != nil {
 		return err
@@ -113,7 +135,7 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 		}
 	case "sum", "avg", "min", "max", "percentile":
 		if !slices.Contains(numeric, a.Field) {
-			return fmt.Errorf("aggregation requires a numeric field, got %q", a.Field)
+			return fmt.Errorf("aggregation requires a numeric gauge or derived field, got %q", a.Field)
 		}
 	default:
 		return fmt.Errorf("unsupported aggregation function %q", a.Function)
@@ -153,10 +175,10 @@ func eventGroupFields(event Event) map[string]any {
 
 type aggregateAccumulator struct {
 	AggregateCount
-	sum      big.Int
-	min, max *big.Int
+	sum      big.Rat
+	min, max *big.Rat
 	distinct map[string]struct{}
-	samples  []*big.Int
+	samples  []*big.Rat
 }
 
 func (e *aggregateAccumulator) add(a AggregationRequest, value any, retained *int) error {
@@ -181,9 +203,9 @@ func (e *aggregateAccumulator) add(a AggregationRequest, value any, retained *in
 			*retained += 1
 		}
 	} else {
-		n, ok := new(big.Int).SetString(string(data), 10)
+		n, ok := new(big.Rat).SetString(string(data))
 		if !ok {
-			return fmt.Errorf("aggregation field %q is not an integer", a.Field)
+			return fmt.Errorf("aggregation field %q is not numeric", a.Field)
 		}
 		switch a.Function {
 		case "sum", "avg":
@@ -208,10 +230,16 @@ func (e *aggregateAccumulator) add(a AggregationRequest, value any, retained *in
 }
 
 func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
+	number := func(n *big.Rat) string {
+		if n.IsInt() {
+			return n.Num().String()
+		}
+		return n.FloatString(18)
+	}
 	var value string
 	switch a.Function {
 	case "sum":
-		value = e.sum.String()
+		value = number(&e.sum)
 	case "count_distinct":
 		value = fmt.Sprint(len(e.distinct))
 	default:
@@ -220,14 +248,14 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 		}
 		switch a.Function {
 		case "avg":
-			mean := new(big.Rat).SetFrac(&e.sum, new(big.Int).SetUint64(e.Count))
+			mean := new(big.Rat).Quo(&e.sum, new(big.Rat).SetInt(new(big.Int).SetUint64(e.Count)))
 			value = mean.FloatString(18)
 		case "min":
-			value = e.min.String()
+			value = number(e.min)
 		case "max":
-			value = e.max.String()
+			value = number(e.max)
 		case "percentile":
-			slices.SortFunc(e.samples, func(a, b *big.Int) int { return a.Cmp(b) })
+			slices.SortFunc(e.samples, func(a, b *big.Rat) int { return a.Cmp(b) })
 			// Use a decimal rational to avoid floating-point rank errors at boundaries.
 			p, _ := new(big.Rat).SetString(fmt.Sprint(a.Percentile))
 			p.Mul(p, big.NewRat(int64(len(e.samples)), 100))
@@ -237,10 +265,82 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 				rank.Add(rank, big.NewInt(1))
 			}
 			index := max(0, int(rank.Int64())-1)
-			value = e.samples[index].String()
+			value = number(e.samples[index])
 		}
 	}
 	return json.RawMessage(value)
+}
+
+// aggregateReduction is shared by event windows and sampled snapshots.
+type aggregateReduction struct {
+	request  AggregationRequest
+	groups   map[string]*aggregateAccumulator
+	retained int
+}
+
+func newAggregateReduction(a AggregationRequest) *aggregateReduction {
+	r := &aggregateReduction{request: a, groups: make(map[string]*aggregateAccumulator)}
+	if len(a.GroupBy) == 0 {
+		r.groups[""] = &aggregateAccumulator{AggregateCount: AggregateCount{Group: map[string]json.RawMessage{}}}
+	}
+	return r
+}
+
+func (r *aggregateReduction) add(fields map[string]any) error {
+	group := make(map[string]json.RawMessage, len(r.request.GroupBy))
+	var key strings.Builder
+	for _, field := range r.request.GroupBy {
+		value, ok := fields[field]
+		if !ok {
+			return fmt.Errorf("record missing aggregation field %q", field)
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		group[field] = data
+		fmt.Fprintf(&key, "%d:%s", len(data), data)
+	}
+	entry := r.groups[key.String()]
+	if entry == nil {
+		if len(r.groups) >= maxAggregateGroups {
+			return errors.New("aggregation exceeds 4096 groups")
+		}
+		entry = &aggregateAccumulator{AggregateCount: AggregateCount{Group: group}}
+		r.groups[key.String()] = entry
+	}
+	var value any
+	if r.request.Field != "" {
+		var ok bool
+		value, ok = fields[r.request.Field]
+		if !ok {
+			return fmt.Errorf("record missing aggregation field %q", r.request.Field)
+		}
+	}
+	return entry.add(r.request, value, &r.retained)
+}
+
+func (r *aggregateReduction) result(source string, start, end time.Time) Snapshot {
+	keys := make([]string, 0, len(r.groups))
+	for key := range r.groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	a := r.request
+	result := &AggregationResult{Start: start.UTC(), End: end.UTC(), GroupBy: append([]string{}, a.GroupBy...), Function: a.Function, Field: a.Field, Percentile: a.Percentile}
+	if a.Function == "" || a.Function == "count" {
+		result.Counts = make([]AggregateCount, 0, len(keys))
+	} else {
+		result.Values = make([]AggregateValue, 0, len(keys))
+	}
+	for _, key := range keys {
+		if a.Function == "" || a.Function == "count" {
+			result.Counts = append(result.Counts, r.groups[key].AggregateCount)
+		} else {
+			result.Values = append(result.Values, AggregateValue{Group: r.groups[key].Group, Value: r.groups[key].value(a)})
+		}
+	}
+	return Snapshot{Source: source, Time: end.UTC(), Aggregation: result}
 }
 
 func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSource) (Snapshot, error) {
@@ -254,11 +354,7 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 	end := start.Add(request.Aggregation.Window)
 	windowCtx, cancel := context.WithDeadline(ctx, end)
 	defer cancel()
-	counts := make(map[string]*aggregateAccumulator)
-	if len(request.Aggregation.GroupBy) == 0 {
-		counts[""] = &aggregateAccumulator{AggregateCount: AggregateCount{Group: map[string]json.RawMessage{}}}
-	}
-	retained := 0
+	reduction := newAggregateReduction(*request.Aggregation)
 	var mu sync.Mutex
 	// Sources receive only the event selection, not the query mode.
 	selection := request
@@ -269,38 +365,7 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 		if !time.Now().Before(end) || windowCtx.Err() != nil || !selection.matches(event) {
 			return nil
 		}
-		fields := eventGroupFields(event)
-		group := make(map[string]json.RawMessage, len(request.Aggregation.GroupBy))
-		var key strings.Builder
-		for _, field := range request.Aggregation.GroupBy {
-			value, ok := fields[field]
-			if !ok {
-				return fmt.Errorf("event missing aggregation field %q", field)
-			}
-			data, err := json.Marshal(value)
-			if err != nil {
-				return err
-			}
-			group[field] = data
-			fmt.Fprintf(&key, "%d:%s", len(data), data) // Length framing prevents compound-key collisions.
-		}
-		entry := counts[key.String()]
-		if entry == nil {
-			if len(counts) >= maxAggregateGroups {
-				return errors.New("aggregation exceeds 4096 groups")
-			}
-			entry = &aggregateAccumulator{AggregateCount: AggregateCount{Group: group}}
-			counts[key.String()] = entry
-		}
-		var value any
-		if request.Aggregation.Field != "" {
-			var ok bool
-			value, ok = fields[request.Aggregation.Field]
-			if !ok {
-				return fmt.Errorf("event missing aggregation field %q", request.Aggregation.Field)
-			}
-		}
-		return entry.add(*request.Aggregation, value, &retained)
+		return reduction.add(eventGroupFields(event))
 	})
 	if ctx.Err() != nil {
 		return Snapshot{}, ctx.Err()
@@ -314,24 +379,5 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 		}
 		return Snapshot{}, errors.New("event source stopped before aggregation window completed")
 	}
-	keys := make([]string, 0, len(counts))
-	for key := range counts {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	a := request.Aggregation
-	result := &AggregationResult{Start: start.UTC(), End: end.UTC(), GroupBy: append([]string{}, a.GroupBy...), Function: a.Function, Field: a.Field, Percentile: a.Percentile}
-	if a.Function == "" || a.Function == "count" {
-		result.Counts = make([]AggregateCount, 0, len(keys))
-	} else {
-		result.Values = make([]AggregateValue, 0, len(keys))
-	}
-	for _, key := range keys {
-		if a.Function == "" || a.Function == "count" {
-			result.Counts = append(result.Counts, counts[key].AggregateCount)
-		} else {
-			result.Values = append(result.Values, AggregateValue{Group: counts[key].Group, Value: counts[key].value(*a)})
-		}
-	}
-	return Snapshot{Source: request.Source, Time: end.UTC(), Aggregation: result}, nil
+	return reduction.result(request.Source, start, end), nil
 }

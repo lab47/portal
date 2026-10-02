@@ -45,13 +45,25 @@ func TestCapabilityReference(t *testing.T) {
 				r.Tracepoint = &TracepointFilter{Event: "custom:sample", Fields: []string{"NAME"}}
 			}
 			for _, f := range source.GroupByFields {
-				if err := (AggregationRequest{Window: time.Second, GroupBy: []string{f}}).validate(r); err != nil {
+				if err := (AggregationRequest{Window: 2 * time.Second, GroupBy: []string{f}}).validate(r); err != nil {
 					t.Fatalf("documented group field %s.%s is rejected: %v", source.Name, f, err)
 				}
 			}
 			for _, f := range source.NumericFields {
-				if err := (AggregationRequest{Window: time.Second, Function: "sum", Field: f}).validate(r); err != nil {
+				if err := (AggregationRequest{Window: 2 * time.Second, Function: "sum", Field: f}).validate(r); err != nil {
 					t.Fatalf("documented numeric field %s.%s is rejected: %v", source.Name, f, err)
+				}
+			}
+		}
+		if source.Sampling != nil {
+			for _, field := range source.Sampling.GroupByFields {
+				if _, err := ParseMonitorQuery(source.Name + " count over 2s every 100ms by " + field); err != nil {
+					t.Fatalf("documented sampled group field %s.%s is rejected: %v", source.Name, field, err)
+				}
+			}
+			for _, field := range source.Sampling.NumericFields {
+				if _, err := ParseMonitorQuery(source.Name + " avg(" + field + ") over 2s every 100ms"); err != nil {
+					t.Fatalf("documented sampled numeric field %s.%s is rejected: %v", source.Name, field, err)
 				}
 			}
 		}
@@ -71,12 +83,13 @@ func TestCapabilityReference(t *testing.T) {
 				}
 			}
 		case "cpu":
-			if !slices.Contains(source.Fields, FieldCapability{Path: "cpu[].name", Type: "string"}) ||
-				!slices.Contains(source.Fields, FieldCapability{Path: "cpu[].idle", Type: "number", Unit: "seconds"}) {
-				t.Fatal("CPU name is not filterable; idle is cumulative seconds")
+			if !slices.Contains(source.Fields, FieldCapability{Path: "cpu[].name", Type: "string", QueryField: "name"}) ||
+				!slices.Contains(source.Fields, FieldCapability{Path: "cpu[].idle", Type: "number", QueryField: "idle", Unit: "seconds"}) || source.Sampling == nil ||
+				slices.Contains(source.Sampling.NumericFields, "idle") || !slices.Contains(source.Sampling.NumericFields, "utilization_percent") {
+				t.Fatal("CPU raw counters must be separate from derived utilization")
 			}
 		case "gpu":
-			if !slices.Contains(source.Fields, FieldCapability{Path: "gpus[].memory_used_mib", Type: "integer", Optional: true, Unit: "MiB"}) {
+			if !slices.Contains(source.Fields, FieldCapability{Path: "gpus[].memory_used_mib", Type: "integer", QueryField: "memory_used_mib", Optional: true, Unit: "MiB"}) {
 				t.Fatal("missing optional GPU metric units/type")
 			}
 		case "kernel":

@@ -23,6 +23,7 @@ type CPUInfo struct {
 	Idle   float64 `json:"idle"`
 	IOWait float64 `json:"iowait"`
 	Steal  float64 `json:"steal"`
+	Total  float64 `json:"total"` // Includes nice/IRQ/softIRQ accounting, without double-counting guest time.
 }
 
 type MemoryInfo struct {
@@ -99,7 +100,7 @@ func querySnapshot(ctx context.Context, request MonitorRequest) (Snapshot, error
 		}
 		snapshot.CPU = make([]CPUInfo, 0, len(times))
 		for _, t := range times {
-			snapshot.CPU = append(snapshot.CPU, CPUInfo{Name: t.CPU, User: t.User, System: t.System, Idle: t.Idle, IOWait: t.Iowait, Steal: t.Steal})
+			snapshot.CPU = append(snapshot.CPU, CPUInfo{Name: t.CPU, User: t.User, System: t.System, Idle: t.Idle, IOWait: t.Iowait, Steal: t.Steal, Total: t.Total() - t.Guest - t.GuestNice})
 		}
 	case "memory":
 		ram, err := mem.VirtualMemoryWithContext(ctx)

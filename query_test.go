@@ -95,7 +95,7 @@ func TestParseMonitorQueryRejectsAmbiguity(t *testing.T) {
 		"syscalls count over 0s", "syscalls count over -1s", "syscalls count over 2h", "syscalls count over nope",
 		"syscalls count over 999999999999999999999s", "syscalls count over 30s by", "syscalls count over 30s by pid,",
 		"syscalls count over 30s by pid,pid", "syscalls count over 30s by name", "syscalls count over 30s by pid tid",
-		"syscalls count over 30s where syscall = 2", "syscalls sum over 30s", "memory count over 30s",
+		"syscalls count over 30s where syscall = 2", "syscalls sum over 30s", "capabilities count over 30s",
 		"packets count over 30s by pid", "disk count over 30s by pid", "process count over 30s by syscall",
 		"tracepoint where event = custom:sample and fields in (pid) count over 30s by field.unselected",
 		"packets count over 30s by protocol,direction,src.ip,dst.ip,src.port",
