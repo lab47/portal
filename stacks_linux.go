@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	stackMapEntries = 1024
+	stackMapEntries = 16384
 	stackFlagUser   = 1 << 8
 )
 
 type stackCaptureState struct {
+	collection *collectionState
 	spec       StackCapture
 	stackMap   *ebpf.Map
 	kernelSyms []inspectedSymbol
@@ -71,6 +72,14 @@ func appendStackCapture(insns asm.Instructions, ctxReg asm.Register, stackOffset
 				asm.FnGetStackid.Call(),
 				asm.StoreMem(asm.RFP, off, asm.R0, asm.DWord),
 			)
+			if s.collection != nil {
+				label := fmt.Sprintf("stack_%d_done", off)
+				collision := fmt.Sprintf("stack_%d_collision_done", off)
+				// Preserve the signed helper result in the event before counters call helpers.
+				insns = append(insns, asm.JSGE.Imm(asm.R0, 0, label), asm.JNE.Imm(asm.R0, -17, collision))
+				insns = appendCollectionCounter(insns, s.collection, collectionStackCollision, collision)
+				insns = appendCollectionCounter(insns, s.collection, collectionStackFailed, label)
+			}
 			off += 8
 		}
 	}

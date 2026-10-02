@@ -35,13 +35,16 @@ func TestDiskTracepointFormatAndRecord(t *testing.T) {
 	if len(insns) < 10 || insns[1].OpCode != asm.LoadMem(asm.R7, asm.R6, 8, asm.Word).OpCode || insns[1].Offset != 8 {
 		t.Fatal("device offset not loaded from format")
 	}
-	raw := make([]byte, 24)
-	binary.NativeEndian.PutUint32(raw[:4], 17)
-	binary.NativeEndian.PutUint32(raw[4:8], 8)
-	binary.NativeEndian.PutUint64(raw[8:16], 12345)
-	raw[16] = 'W'
+	raw := make([]byte, taskIdentitySize+24)
+	binary.NativeEndian.PutUint64(raw[:8], uint64(123)<<32|456)
+	copy(raw[8:24], "disk-worker")
+	payload := raw[taskIdentitySize:]
+	binary.NativeEndian.PutUint32(payload[:4], 17)
+	binary.NativeEndian.PutUint32(payload[4:8], 8)
+	binary.NativeEndian.PutUint64(payload[8:16], 12345)
+	payload[16] = 'W'
 	event, err := decodeDiskRecord(raw)
-	if err != nil || event.Disk.Device != 17 || event.Disk.Sector != 12345 || event.Disk.Sectors != 8 || event.Disk.Operation != "write" || event.Time.IsZero() {
+	if err != nil || event.PID != 123 || event.TID != 456 || event.Name != "disk-worker" || event.Disk.Device != 17 || event.Disk.Sector != 12345 || event.Disk.Sectors != 8 || event.Disk.Operation != "write" || event.Time.IsZero() {
 		t.Fatalf("decoded %+v, %v", event, err)
 	}
 	if !(&MonitorRequest{Source: "disk", Disk: &DiskFilter{Device: 17, Operation: "write"}}).matches(event) {

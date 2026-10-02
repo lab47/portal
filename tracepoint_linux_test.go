@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,12 +45,12 @@ func TestGenericTracepointFormatAndRecord(t *testing.T) {
 	if fields[0].offset != 32 || fields[1].offset != 24 || fields[2].offset != 40 || !fields[3].signed {
 		t.Fatalf("fields not ordered by request: %+v", fields)
 	}
-	insns := tracepointInstructions(fields, 42)
+	insns := tracepointInstructions(fields, 42, nil)
 	if err := insns.Marshal(&bytes.Buffer{}, binary.LittleEndian); err != nil {
 		t.Fatalf("invalid eBPF instructions: %v", err)
 	}
 	for i, field := range fields {
-		start := 1 + i*9
+		start := 10 + i*9
 		if insns[start] != asm.Mov.Imm(asm.R7, 0) || insns[start+1] != asm.StoreMem(asm.RFP, int16(-8*(len(fields)-i)), asm.R7, asm.DWord) ||
 			insns[start+4] != asm.Mov.Imm(asm.R2, int32(field.size)) ||
 			insns[start+6] != asm.Add.Imm(asm.R3, int32(field.offset)) ||
@@ -105,7 +106,7 @@ func TestGenericTracepointKernelCommonFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer events.Close()
-	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD())})
+	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD(), nil)})
 	if err != nil {
 		t.Fatalf("load tracepoint with common_pid at offset 4: %+v", err)
 	}
@@ -120,8 +121,8 @@ func TestGenericTracepointCommonPIDHelper(t *testing.T) {
 	if !fields[1].commonPID || fields[0].commonPID || fields[2].commonPID {
 		t.Fatalf("incorrect current-task field selection: %+v", fields)
 	}
-	insns := tracepointInstructions(fields, 42)
-	if insns[10] != asm.FnGetCurrentPidTgid.Call() || insns[11] != asm.Mov.Reg32(asm.R7, asm.R0) || insns[12] != asm.StoreMem(asm.RFP, -16, asm.R7, asm.DWord) {
+	insns := tracepointInstructions(fields, 42, nil)
+	if insns[19] != asm.FnGetCurrentPidTgid.Call() || insns[20] != asm.Mov.Reg32(asm.R7, asm.R0) || insns[21] != asm.StoreMem(asm.RFP, -16, asm.R7, asm.DWord) {
 		t.Fatalf("common_pid must store the helper's low 32-bit TID in its selected slot: %v", insns)
 	}
 	if err := insns.Marshal(&bytes.Buffer{}, binary.LittleEndian); err != nil {
@@ -148,6 +149,12 @@ func TestGenericTracepointKernelCommonPIDValues(t *testing.T) {
 			fields := event.Tracepoint.Fields
 			if fields["common_pid"] != fields["prev_pid"] {
 				return fmt.Errorf("common_pid %s != outgoing task prev_pid %s", fields["common_pid"], fields["prev_pid"])
+			}
+			if fields["common_pid"] != json.Number(strconv.FormatUint(uint64(event.TID), 10)) {
+				return fmt.Errorf("common_pid %s != identity TID %d", fields["common_pid"], event.TID)
+			}
+			if fields["prev_pid"] != "0" && (event.PID == 0 || event.Name == "") {
+				return fmt.Errorf("missing task identity: pid=%d name=%q", event.PID, event.Name)
 			}
 			if fields["prev_pid"] != "0" {
 				seen[fields["prev_pid"]] = true

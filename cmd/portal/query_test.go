@@ -96,3 +96,18 @@ func TestQueryResultTopProcesses(t *testing.T) {
 		t.Fatalf("top process ordering/projection: %s, %v", out.String(), err)
 	}
 }
+
+func TestQueryResultMultipleMetrics(t *testing.T) {
+	snapshot := portal.Snapshot{Source: "disk", Aggregation: &portal.AggregationResult{Metrics: []*portal.AggregationResult{
+		{Function: "count", Counts: []portal.AggregateCount{{Group: map[string]json.RawMessage{"pid": json.RawMessage("42")}, Count: 3}}},
+		{Function: "sum", Field: "sectors", Values: []portal.AggregateValue{{Group: map[string]json.RawMessage{"pid": json.RawMessage("42")}, Value: json.RawMessage("18446744073709551615")}}},
+	}}}
+	request, code, err := parseClientQuery(`disk count, sum(sectors) over 30s by pid | .aggregation.metrics[] | select(.function == "sum") | .values[0].value`)
+	if err != nil || len(request.Aggregation.Metrics) != 2 {
+		t.Fatalf("multi-metric pipeline: %+v, %v", request, err)
+	}
+	var out bytes.Buffer
+	if err := writeQueryResult(context.Background(), &out, snapshot, code); err != nil || out.String() != "18446744073709551615\n" {
+		t.Fatalf("multi-metric selection or precision: %s, %v", out.String(), err)
+	}
+}

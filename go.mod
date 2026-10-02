@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/cilium/ebpf v0.19.0
+	github.com/elastic/go-seccomp-bpf v1.6.0
 	github.com/go-webauthn/webauthn v0.17.0
 	github.com/itchyny/gojq v0.12.19
 	github.com/lab47/peggysue v0.0.0-20250702204832-6234b23da0a5

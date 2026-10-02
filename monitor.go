@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/netip"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,19 +24,22 @@ import (
 // "syscalls", "packets", "process", "disk", "tracepoint", or a snapshot-only source;
 // unrelated filters must be omitted.
 type MonitorRequest struct {
-	Source      string              `json:"source"`
-	Mode        string              `json:"mode,omitempty"` // empty for events, "snapshot" or "aggregate" for queries
-	Aggregation *AggregationRequest `json:"aggregation,omitempty"`
-	PID         uint32              `json:"pid,omitempty"`
-	Syscalls    []int               `json:"syscalls,omitempty"`
-	Packet      *PacketFilter       `json:"packet,omitempty"`
-	Process     *ProcessFilter      `json:"process,omitempty"`
-	Disk        *DiskFilter         `json:"disk,omitempty"`
-	Tracepoint  *TracepointFilter   `json:"tracepoint,omitempty"`
-	Symbols     *SymbolRequest      `json:"symbols,omitempty"`
-	Stacks      *StackCapture       `json:"stacks,omitempty"`
-	Name        string              `json:"name,omitempty"` // network interface or sensor key (exact or edge glob)
-	Path        string              `json:"path,omitempty"` // cgroup path relative to the visible v2 mount (exact or edge glob)
+	Source       string              `json:"source"`
+	Mode         string              `json:"mode,omitempty"` // empty for events, "snapshot" or "aggregate" for queries
+	Aggregation  *AggregationRequest `json:"aggregation,omitempty"`
+	PID          uint32              `json:"pid,omitempty"`
+	Syscalls     []int               `json:"syscalls,omitempty"`
+	SyscallNames []string            `json:"syscall_names,omitempty"` // resolved against the server's native Linux ABI
+	Phase        string              `json:"phase,omitempty"`         // syscalls/disk: entry (default) or completion
+	Paths        bool                `json:"paths,omitempty"`         // best-effort syscall FD path resolution
+	Packet       *PacketFilter       `json:"packet,omitempty"`
+	Process      *ProcessFilter      `json:"process,omitempty"`
+	Disk         *DiskFilter         `json:"disk,omitempty"`
+	Tracepoint   *TracepointFilter   `json:"tracepoint,omitempty"`
+	Symbols      *SymbolRequest      `json:"symbols,omitempty"`
+	Stacks       *StackCapture       `json:"stacks,omitempty"`
+	Name         string              `json:"name,omitempty"` // network interface or sensor key (exact or edge glob)
+	Path         string              `json:"path,omitempty"` // cgroup path relative to the visible v2 mount (exact or edge glob)
 }
 
 // TracepointFilter selects scalar fields from a Linux tracepoint. Equals values
@@ -101,10 +105,20 @@ type DiskFilter struct {
 
 // DiskEvent describes a block request issued to a device. Sector units are 512 bytes.
 type DiskEvent struct {
-	Device    uint32 `json:"device"`
-	Sector    uint64 `json:"sector"`
-	Sectors   uint32 `json:"sectors"`
-	Operation string `json:"operation"`
+	Device     uint32  `json:"device"`
+	Sector     uint64  `json:"sector"`
+	Sectors    uint32  `json:"sectors"`
+	Operation  string  `json:"operation"`
+	DurationNS *uint64 `json:"duration_ns,omitempty"`
+	Status     *uint32 `json:"status,omitempty"` // completion blk_status_t; zero is success, not errno
+}
+
+// SyscallFile is a best-effort snapshot of the captured descriptor. Path is
+// resolved in /proc after receipt, not atomically with syscall execution.
+type SyscallFile struct {
+	FD    int32  `json:"fd"`
+	Path  string `json:"path,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // ProcessFilter selects process lifecycle events. Empty fields match all.
@@ -217,13 +231,29 @@ type PacketEvent struct {
 	Data            []byte `json:"data"`
 }
 
-// Event is a syscall entry, captured packet, process transition, disk request,
-// or selected tracepoint record.
+// CollectionStats are cumulative subscription counters, not per-event deltas.
+// StackCaptureFailures includes StackCollisions. Kernel drops are not per-group.
+type CollectionStats struct {
+	RingBufferDropped    uint64 `json:"ring_buffer_dropped"`
+	StackCaptureFailures uint64 `json:"stack_capture_failures"`
+	StackCollisions      uint64 `json:"stack_collisions"`
+	PairingFailures      uint64 `json:"pairing_failures"`
+	UnmatchedExits       uint64 `json:"unmatched_exits"`
+}
+
+// Event is a source data record or a collection_stats diagnostic.
 type Event struct {
 	Time        time.Time        `json:"time"`
 	TAI64N      string           `json:"tai64n"`
 	PID         uint32           `json:"pid,omitempty"`
 	TID         uint32           `json:"tid,omitempty"`
+	Name        string           `json:"name,omitempty"` // current task comm, up to 15 bytes; may differ between threads
+	Phase       string           `json:"phase,omitempty"`
+	DurationNS  *uint64          `json:"duration_ns,omitempty"`
+	ReturnValue *int64           `json:"return_value,omitempty"`
+	File        *SyscallFile     `json:"file,omitempty"`
+	Collection  *CollectionStats `json:"collection,omitempty"` // cumulative subscription counters; not additive
+	Kind        string           `json:"kind,omitempty"`       // collection_stats for diagnostic-only records
 	Syscall     int              `json:"syscall,omitempty"`
 	Packet      *PacketEvent     `json:"packet,omitempty"`
 	Process     *ProcessEvent    `json:"process,omitempty"`
@@ -237,18 +267,32 @@ type Event struct {
 // syscall field on non-syscall events.
 func (e Event) MarshalJSON() ([]byte, error) {
 	type fields Event
-	if e.Packet != nil || e.Process != nil || e.Disk != nil || e.Tracepoint != nil {
+	if e.Disk != nil || e.Tracepoint != nil {
+		return json.Marshal(struct {
+			fields
+			PID  uint32 `json:"pid"`
+			TID  uint32 `json:"tid"`
+			Name string `json:"name"`
+		}{fields(e), e.PID, e.TID, e.Name})
+	}
+	if e.Packet != nil || e.Process != nil || e.Kind == "collection_stats" {
 		return json.Marshal(fields(e))
 	}
 	return json.Marshal(struct {
-		Time        time.Time      `json:"time"`
-		TAI64N      string         `json:"tai64n"`
-		PID         uint32         `json:"pid"`
-		TID         uint32         `json:"tid"`
-		Syscall     int            `json:"syscall"`
-		UserStack   *CapturedStack `json:"user_stack,omitempty"`
-		KernelStack *CapturedStack `json:"kernel_stack,omitempty"`
-	}{e.Time, e.TAI64N, e.PID, e.TID, e.Syscall, e.UserStack, e.KernelStack})
+		Time        time.Time        `json:"time"`
+		TAI64N      string           `json:"tai64n"`
+		PID         uint32           `json:"pid"`
+		TID         uint32           `json:"tid"`
+		Syscall     int              `json:"syscall"`
+		Name        string           `json:"name,omitempty"`
+		Phase       string           `json:"phase,omitempty"`
+		DurationNS  *uint64          `json:"duration_ns,omitempty"`
+		ReturnValue *int64           `json:"return_value,omitempty"`
+		File        *SyscallFile     `json:"file,omitempty"`
+		Collection  *CollectionStats `json:"collection,omitempty"`
+		UserStack   *CapturedStack   `json:"user_stack,omitempty"`
+		KernelStack *CapturedStack   `json:"kernel_stack,omitempty"`
+	}{e.Time, e.TAI64N, e.PID, e.TID, e.Syscall, e.Name, e.Phase, e.DurationNS, e.ReturnValue, e.File, e.Collection, e.UserStack, e.KernelStack})
 }
 
 type monitorRequest struct {
@@ -264,6 +308,20 @@ type monitorFrame struct {
 }
 
 func (r MonitorRequest) validate() error {
+	if len(r.SyscallNames) != 0 && r.Source != "syscalls" {
+		return errors.New("syscall names require syscalls source")
+	}
+	for _, name := range r.SyscallNames {
+		if !validSyscallName(name) {
+			return fmt.Errorf("invalid syscall name %q", name)
+		}
+	}
+	if r.Phase != "" && ((r.Source != "syscalls" && r.Source != "disk") || (r.Phase != "entry" && r.Phase != "completion")) {
+		return errors.New("phase is only for syscalls/disk: entry or completion")
+	}
+	if r.Paths && r.Source != "syscalls" {
+		return errors.New("paths requires syscalls source")
+	}
 	if r.Symbols != nil && r.Source != "symbols" {
 		return errors.New("symbols spec requires symbols source")
 	}
@@ -273,6 +331,9 @@ func (r MonitorRequest) validate() error {
 		}
 		if err := r.Stacks.Validate(); err != nil {
 			return err
+		}
+		if r.Mode != "aggregate" && (r.Stacks.UserShape != nil || r.Stacks.KernelShape != nil) {
+			return errors.New("stack shaping requires aggregate mode")
 		}
 	}
 	if r.Mode != "" && r.Mode != "snapshot" && r.Mode != "aggregate" {
@@ -363,7 +424,7 @@ func (r MonitorRequest) validate() error {
 	default:
 		return errors.New("unsupported monitor source")
 	}
-	if len(r.Syscalls) > 256 {
+	if len(r.Syscalls)+len(r.SyscallNames) > 256 {
 		return errors.New("too many syscall filters")
 	}
 	for _, id := range r.Syscalls {
@@ -375,6 +436,9 @@ func (r MonitorRequest) validate() error {
 }
 
 func (r MonitorRequest) matches(event Event) bool {
+	if event.Kind == "collection_stats" {
+		return true
+	}
 	if r.Source == "tracepoint" {
 		if event.Tracepoint == nil || r.Tracepoint == nil || event.Tracepoint.Event != r.Tracepoint.Event {
 			return false
@@ -612,6 +676,11 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		return
 	}
 	if err := req.MonitorRequest.validate(); err != nil {
+		writeMonitorError(stream, err.Error())
+		return
+	}
+	req.MonitorRequest, err = resolveSyscallNames(req.MonitorRequest, runtime.GOARCH)
+	if err != nil {
 		writeMonitorError(stream, err.Error())
 		return
 	}

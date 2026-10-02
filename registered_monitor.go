@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -197,6 +198,10 @@ func (s *monitorStore) create(owner string, request MonitorRequest, ttl ...time.
 	}
 	if request.Mode != "" {
 		return "", errors.New("registered monitors require event mode")
+	}
+	request, err = resolveSyscallNames(request, runtime.GOARCH)
+	if err != nil {
+		return "", err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

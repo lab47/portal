@@ -107,6 +107,19 @@ func newMonitorQueryGrammar() p.Rule {
 		return &AggregationRequest{Function: "percentile", Field: queryField(v.Get("field").(string)), Percentile: percent}
 	})
 	count := p.Transform(keyword("count"), func(string) any { return &AggregationRequest{} })
+	operation := p.Or(percentile, metric, count)
+	additionalMetrics := p.Many(p.Seq(token(p.S(",")), operation), 0, -1, func(values []any) any {
+		metrics := make([]AggregateMetric, 0, len(values))
+		for _, value := range values {
+			a := value.(*AggregationRequest)
+			function := a.Function
+			if function == "" {
+				function = "count"
+			}
+			metrics = append(metrics, AggregateMetric{Function: function, Field: a.Field, Percentile: a.Percentile})
+		}
+		return metrics
+	})
 	every := p.Action(p.Seq(keyword("every"), p.Named("interval", word)), func(v p.Values) any {
 		interval, err := time.ParseDuration(v.Get("interval").(string))
 		if err != nil || interval <= 0 {
@@ -114,9 +127,17 @@ func newMonitorQueryGrammar() p.Rule {
 		}
 		return interval
 	})
-	aggregate := p.Action(p.Seq(p.Named("operation", p.Or(percentile, metric, count)), keyword("over"), p.Named("window", word), p.Named("every", p.Maybe(every)), p.Named("group", p.Maybe(group))), func(v p.Values) any {
+	aggregate := p.Action(p.Seq(p.Named("operation", operation), p.Named("metrics", additionalMetrics), keyword("over"), p.Named("window", word), p.Named("every", p.Maybe(every)), p.Named("group", p.Maybe(group))), func(v p.Values) any {
 		window, _ := time.ParseDuration(v.Get("window").(string)) // Invalid durations become zero and fail validation.
 		a := v.Get("operation").(*AggregationRequest)
+		if rest := v.Get("metrics").([]AggregateMetric); len(rest) != 0 {
+			function := a.Function
+			if function == "" {
+				function = "count"
+			}
+			a.Metrics = append([]AggregateMetric{{Function: function, Field: a.Field, Percentile: a.Percentile}}, rest...)
+			a.Function, a.Field, a.Percentile = "", "", 0
+		}
 		a.Window = window
 		if interval := v.Get("every"); interval != nil {
 			a.Every = interval.(time.Duration)
@@ -140,10 +161,11 @@ func newMonitorQueryGrammar() p.Rule {
 
 // ParseMonitorQuery compiles the text DSL into the validated, signed request
 // used by Client.Monitor or Client.Query. The syntax is SOURCE [where FIELD = VALUE [and ...]],
-// plus "syscall in (NUMBER, ...)" and "tracepoint where event = CATEGORY:NAME
+// plus "syscall in (NUMBER, :NAME, ...)" and "tracepoint where event = CATEGORY:NAME
 // and fields in (NAME, ...) [and field.NAME = NUMBER]". Append
 // "count over DURATION [by FIELD, ...]", "FUNCTION(FIELD) over ...", or
 // "percentile(FIELD, PERCENT) over ..." for a one-shot aggregation query.
+// Comma-separated functions share one window, sampling interval and grouping.
 func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	if len(query) > 4096 {
 		return MonitorRequest{}, errors.New("monitor query exceeds 4096 bytes")
@@ -199,11 +221,9 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 				return MonitorRequest{}, fmt.Errorf("in is not supported for %s", condition.field)
 			}
 			for _, text := range condition.values {
-				id, err := strconv.ParseUint(text, 10, 16)
-				if err != nil {
-					return MonitorRequest{}, fmt.Errorf("invalid syscall number %q", text)
+				if err := addSyscallFilter(&r, text); err != nil {
+					return MonitorRequest{}, err
 				}
-				r.Syscalls = append(r.Syscalls, int(id))
 			}
 			continue
 		}
@@ -222,7 +242,59 @@ func setQueryFilter(r *MonitorRequest, field, value string) error {
 		if value != "user" && value != "kernel" && value != "both" {
 			return errors.New("stacks must be user, kernel or both")
 		}
-		r.Stacks = &StackCapture{User: value == "user" || value == "both", Kernel: value == "kernel" || value == "both", Symbolize: true}
+		if r.Stacks == nil {
+			r.Stacks = &StackCapture{}
+		}
+		r.Stacks.User, r.Stacks.Kernel, r.Stacks.Symbolize = value == "user" || value == "both", value == "kernel" || value == "both", true
+		return nil
+	}
+	if field == "stack.depth" {
+		depth, err := strconv.Atoi(value)
+		if err != nil || depth < 0 || depth > 64 {
+			return errors.New("stack.depth must be between 0 and 64")
+		}
+		if r.Stacks == nil {
+			r.Stacks = &StackCapture{}
+		}
+		r.Stacks.Depth = depth
+		return nil
+	}
+	if strings.HasPrefix(field, "user.stack.") || strings.HasPrefix(field, "kernel.stack.") {
+		if r.Stacks == nil {
+			r.Stacks = &StackCapture{}
+		}
+		shape := &r.Stacks.UserShape
+		if strings.HasPrefix(field, "kernel.") {
+			shape = &r.Stacks.KernelShape
+		}
+		if *shape == nil {
+			*shape = &StackShape{}
+		}
+		_, option, _ := strings.Cut(field, ".stack.")
+		switch option {
+		case "offsets":
+			if value != "true" && value != "false" {
+				return errors.New("stack.offsets must be true or false")
+			}
+			(*shape).DropOffsets = value == "false"
+		case "top", "drop_bottom":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 || n > 64 {
+				return errors.New("stack top/drop_bottom must be between 0 and 64")
+			}
+			if option == "top" {
+				(*shape).Top = n
+			} else {
+				(*shape).DropBottom = n
+			}
+		case "until":
+			if value == "" {
+				return errors.New("stack.until cannot be empty")
+			}
+			(*shape).Until = value
+		default:
+			return fmt.Errorf("unknown stack option %q", field)
+		}
 		return nil
 	}
 	if r.Source == "symbols" {
@@ -289,6 +361,8 @@ func setQueryFilter(r *MonitorRequest, field, value string) error {
 			r.Disk = &DiskFilter{}
 		}
 		switch field {
+		case "phase":
+			r.Phase = value
 		case "device":
 			id, err := strconv.ParseUint(value, 0, 32)
 			if err != nil || id == 0 {
@@ -329,6 +403,13 @@ func setQueryFilter(r *MonitorRequest, field, value string) error {
 	}
 	if r.Source == "syscalls" {
 		switch field {
+		case "paths":
+			if value != "true" && value != "false" {
+				return errors.New("paths must be true or false")
+			}
+			r.Paths = value == "true"
+		case "phase":
+			r.Phase = value
 		case "pid":
 			id, err := strconv.ParseUint(value, 10, 32)
 			if err != nil || id == 0 {
@@ -336,11 +417,7 @@ func setQueryFilter(r *MonitorRequest, field, value string) error {
 			}
 			r.PID = uint32(id)
 		case "syscall":
-			id, err := strconv.ParseUint(value, 10, 16)
-			if err != nil {
-				return fmt.Errorf("invalid syscall number %q", value)
-			}
-			r.Syscalls = []int{int(id)}
+			return addSyscallFilter(r, value)
 		default:
 			return fmt.Errorf("unknown syscalls field %q", field)
 		}

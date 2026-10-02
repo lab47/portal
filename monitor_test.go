@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -225,6 +226,53 @@ func TestMonitorStream(t *testing.T) {
 			t.Fatal("aggregation source was not canceled")
 		}
 	}
+	if runtime.GOARCH == "amd64" {
+		request, err := ParseMonitorQuery("syscalls where syscall in (:close,8) count over 50ms")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := monitorRequestRemote(ctx, client, reg, signer, cert, request, nil)
+		if err != nil || got.Aggregation == nil || len(got.Aggregation.Counts) != 1 || got.Aggregation.Counts[0].Count != 4 {
+			t.Fatalf("remote symbolic filter lost named or numeric calls: %+v, %v", got.Aggregation, err)
+		}
+		select {
+		case <-stopped:
+		case <-ctx.Done():
+			t.Fatal("symbolic aggregation source was not canceled")
+		}
+		request.SyscallNames = []string{"not_a_syscall"}
+		if _, err := monitorRequestRemote(ctx, client, reg, signer, cert, request, nil); err == nil || !strings.Contains(err.Error(), "unknown syscall") {
+			t.Fatalf("remote unknown syscall: %v", err)
+		}
+	}
+	multiRequest, err := ParseMonitorQuery("syscalls where syscall = 3 count, sum(syscall), max(pid) over 50ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi, err := monitorRequestRemote(ctx, client, reg, signer, cert, multiRequest, nil)
+	if err != nil || multi.Aggregation == nil || len(multi.Aggregation.Metrics) != 3 {
+		t.Fatalf("remote multi aggregation: %+v, %v", multi.Aggregation, err)
+	}
+	metrics := multi.Aggregation.Metrics
+	if metrics[0].Counts[0].Count != 3 || string(metrics[1].Values[0].Value) != "9" || string(metrics[2].Values[0].Value) != "72" {
+		t.Fatalf("remote multi metrics lost selection: %+v", metrics)
+	}
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("multi aggregate source was not canceled")
+	}
+	sampledRequest, err := ParseMonitorQuery("memory count, avg(used) over 300ms every 100ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sampled, err := monitorRequestRemote(ctx, client, reg, signer, cert, sampledRequest, nil)
+	if err != nil || sampled.Aggregation == nil || len(sampled.Aggregation.Metrics) != 2 {
+		t.Fatalf("remote sampled multi aggregation: %+v, %v", sampled.Aggregation, err)
+	}
+	if len(sampled.Aggregation.Metrics[0].Counts) != 1 || sampled.Aggregation.Metrics[0].Counts[0].Count == 0 || len(sampled.Aggregation.Metrics[1].Values) != 1 || string(sampled.Aggregation.Metrics[1].Values[0].Value) == "null" {
+		t.Fatalf("remote sampled multi metrics missing: %+v", sampled.Aggregation)
+	}
 	for _, tc := range []struct {
 		query string
 		every time.Duration
@@ -423,5 +471,33 @@ func TestMonitorStream(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCompletionEventJSON(t *testing.T) {
+	duration, ret := uint64(0), int64(0)
+	for _, event := range []Event{
+		{Syscall: 0, Phase: "completion", DurationNS: &duration, ReturnValue: &ret, Name: "writer", Collection: &CollectionStats{StackCollisions: 3}},
+		{Tracepoint: &TracepointEvent{Event: "sched:sched_switch"}, Name: "swapper"},
+		{Disk: &DiskEvent{}, Name: "swapper"},
+	} {
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var values map[string]json.RawMessage
+		if err := json.Unmarshal(data, &values); err != nil {
+			t.Fatal(err)
+		}
+		if string(values["pid"]) != "0" || string(values["tid"]) != "0" || len(values["name"]) == 0 {
+			t.Fatalf("lost zero identity: %s", data)
+		}
+		if event.Phase != "" && (string(values["duration_ns"]) != "0" || string(values["return_value"]) != "0" || string(values["syscall"]) != "0") {
+			t.Fatalf("lost zero completion: %s", data)
+		}
+	}
+	data, err := json.Marshal(Event{Kind: "collection_stats", Collection: &CollectionStats{RingBufferDropped: 5}})
+	if err != nil || strings.Contains(string(data), `"syscall"`) {
+		t.Fatalf("diagnostic became syscall: %s, %v", data, err)
 	}
 }

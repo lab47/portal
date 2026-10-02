@@ -134,13 +134,36 @@ to use discovery; the coordinator and CA need no changes.
 
 ## Event monitors
 
-Clients can attach a long-lived, authenticated monitor to a server. The `syscalls` source uses an eBPF raw tracepoint on Linux to stream syscall-entry events (UTC receipt time, PID, TID, and numeric syscall ID) as JSON lines:
+Clients can attach a long-lived, authenticated monitor to a server. The `syscalls` source uses eBPF on Linux to stream syscall-entry events by default (UTC receipt time, PID, TID, task name, phase, and numeric syscall ID) as JSON lines:
 
 ```sh
 ./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
   --key operator --cert operator-cert.pub --source syscalls \
   --pid 1234 --syscall 0 --syscall 1
 ```
+
+Select `phase = completion` to pair syscall entry/exit by thread and measure elapsed monotonic time:
+
+```sh
+portal query --name node-a --query 'syscalls where phase = completion and syscall in (:fsync,:fdatasync) and stacks = user sum(duration_ns) over 30s by pid, name, user.stack'
+portal query --name node-a --query 'syscalls where phase = completion and syscall in (:fsync,:fdatasync) percentile(duration_ns,95) over 30s by pid, name'
+```
+
+Syscall filters accept case-sensitive Linux names prefixed with `:`, such as `syscall = :openat`, or mixed lists like `syscall in (:fsync, :fdatasync, 0)`. Numeric IDs remain architecture-specific. Names are sent unchanged to the server and resolved using its native Linux ABI (tables for amd64, arm64, 386 and arm), independent of the client's platform. Unknown names or unsupported name-table architectures return an error before collection starts; numeric-only filters still work without a name table. Compatibility ABIs (such as 32-bit tasks on a 64-bit server) are not translated. API callers can set `syscall_names: ["fsync", "fdatasync"]` alongside numeric `syscalls`; event `syscall` output remains numeric. Update both client and server before using symbolic filters.
+
+Completion events include `duration_ns` and signed `return_value` (negative kernel errno on failure), retaining the task name and optional stacks from **entry**, not exit. Duration includes scheduling, locks and storage waits; it is caller-observed time, not pure device or journal-commit time. Summing concurrent calls yields accumulated task time, which can exceed wall time. Duration/return-value aggregates require completion mode. Only calls whose entry and exit were both observed produce completion data; non-returning calls and unfinished calls at the window boundary are excluded. Kernel restart attempts can appear separately. Pairing uses a 16,384-entry bounded hash (no silent eviction) with thread-exit cleanup. Completion requires readable `raw_syscalls:sys_exit` tracefs metadata and the `sched_process_exit` hook. Existing syscall account scoping and stack root-policy requirements still apply.
+
+Add `paths = true` to capture the first FD argument for `fsync`, `fdatasync`, `read`, `write`, their positional/vectored variants, `ftruncate`, and `fallocate`. Both entry and completion modes support this:
+
+```sh
+portal query --name node-a --query 'syscalls where phase = completion and paths = true and syscall in (:fsync,:fdatasync) count, sum(duration_ns), percentile(duration_ns,95) over 30s by pid, file.path'
+```
+
+Events include `file.fd` and either `file.path` or `file.error`; unrelated syscalls omit `file`. These fields can be grouped (FD is also numeric) only when paths are enabled. Paths are **best-effort**, resolved through the server's `/proc/TID/fd/FD` after event receipt—after the syscall returns in completion mode, not atomically at entry. Shared descriptors may close or be reused before resolution, so a returned path is not definitive syscall-time attribution. Missing descriptors, permission errors and unverifiable PID namespaces return a per-event error; unresolved paths group under null. Resolution adds per-event overhead, requires visible matching host task IDs and readable procfs, and preserves symlink targets (including ` (deleted)`, pipes and sockets). Native 64-bit syscall ABI and readable `raw_syscalls:sys_enter` metadata are required. Open/openat pathname arguments and file contents are not captured. API callers use `paths: true`; existing account scoping still applies.
+
+Syscall, disk and generic tracepoint events always capture `pid` (thread-group ID), `tid` and `name` (current task's kernel `comm`, up to 15 bytes, potentially different between threads). Disk identity describes the issuing task, not necessarily the application that caused asynchronous writeback. Packet capture does not infer a process owner.
+
+These eBPF sources attach cumulative `collection` counters to streamed events, and aggregates include a final `.aggregation.collection` snapshot. Counters include `ring_buffer_dropped`, `stack_capture_failures`, `stack_collisions` (a subset of capture failures), `pairing_failures`, and `unmatched_exits`. They are subscription-wide, before generic tracepoint user-space filtering: **do not sum cumulative counters across events**, or treat them as exact per-group loss. Unmatched exits include attachment-boundary calls without a captured entry. Streaming collectors can emit `kind = collection_stats` diagnostic-only records on shutdown; these are not syscall/data events. Registered-monitor overwrite remains a separate cursor/history error. A zero kernel-drop count does not guarantee that every in-flight call or queued boundary event was included in an aggregation window.
 
 To keep collecting while the client is disconnected, register a server-owned monitor instead. The same event queries and authorization rules apply:
 
@@ -207,7 +230,7 @@ Other one-shot sources use the same `portal query --query 'SOURCE [where name = 
 | `kernel` | `kernel` | Boot time, uptime seconds, 1/5/15-minute load averages, and context-switch/running/blocked counters where available |
 | `sensors` | `sensors` | Available temperature readings in Celsius, including high/critical thresholds when reported |
 | `containers` | `containers` | Docker ID, name, image, and state, including stopped containers |
-| `cgroups` | `cgroups` | Linux cgroup v2 paths, identities, CPU accounting/quota, memory accounting/limit, and task counts |
+| `cgroups` | `cgroups` | Linux cgroup v2 paths, identities, CPU accounting/quota, memory accounting/limit, task counts, and per-device I/O accounting |
 | `gpu` | `gpus` | Nvidia GPU index, UUID, name, and available temperature, utilization, memory, and power readings |
 
 `network`, `sensors`, `containers`, and `gpu` support `where name = ...` with exact names or one leading/trailing `*` glob, for example `network where name = eth*`. `cgroups` instead supports `where path = ...` with the same edge-glob rules. Other sources do not take filters. An empty collection is returned as `[]`; metric fields unavailable from `nvidia-smi` are omitted. Docker requires Linux, a readable `/var/run/docker.sock`, a root server and **explicit `root` policy authorization**, because it exposes other workloads' metadata. GPU queries require `nvidia-smi` installed on the server and an Nvidia driver. Missing dependencies and unsupported platforms return errors, not fabricated empty results. Sensors depend on the host's exposed sensors and may legitimately be empty. Packet, syscall, disk, and tracepoint sources represent transient events rather than retained current state, so snapshot mode rejects them.
@@ -225,15 +248,23 @@ Other one-shot sources use the same `portal query --query 'SOURCE [where name = 
 | `memory_limit_bytes` | Locally configured finite `memory.max` limit |
 | `memory_anon_bytes`, `memory_file_bytes` | Anonymous memory and file cache from `memory.stat` |
 | `pids_current` | Current tasks, including threads |
+| `io.read_bytes`, `io.write_bytes`, `io.discard_bytes` | Cumulative `io.stat` bytes summed across devices |
+| `io.read_ios`, `io.write_ios`, `io.discard_ios` | Cumulative `io.stat` operation counts summed across devices |
+| `io.devices[]` | Device `major:minor` and raw `counters` (`rbytes`, `wbytes`, `rios`, `wios`, `dbytes`, `dios`, plus future kernel keys) |
 
 Controller files may be absent, especially on the hierarchy root or when controllers are disabled; unavailable fields are omitted, and unlimited limits (`max`) are omitted rather than encoded as zero. Present zero usage remains zero. Permission/read failures and malformed metrics fail the query. Snapshots are best-effort observations, not atomic reads across controller files. Up to 4,096 matching groups are returned; exceeding that bound fails explicitly, so narrow the path filter on large systems.
 
+Missing `io.stat` omits `io`; an existing empty file yields zero totals and `devices: []`. A total is omitted if any listed device lacks that counter, rather than reporting an incomplete sum. Up to 4,096 devices per group are supported. Device rows retain all counters; malformed/duplicate rows, values, and total overflow fail explicitly. I/O usage includes descendants: do not sum a parent and its children as independent workloads. Attribution follows the kernel's cgroup I/O/writeback accounting and filesystem support; it does not guarantee that journal/shared writeback costs are charged to the originating application, and operation counts are not fsync or flush counts.
+
 Sampled aggregates add `cpu_percent` and `cpu_seconds_per_second` through the generic sampler. **100% means one busy core**, so usage can exceed 100%; it is not normalized to quota. Limits describe the group's own configuration, not effective restrictions from ancestors or cpusets. Directory identity is part of the CPU baseline, so recreating a group at the same path starts a new baseline even when its new counter is larger.
+
+I/O totals are counters, not gauges. Sampled aggregates derive `io.read_bytes_per_second`, `io.write_bytes_per_second`, `io.discard_bytes_per_second` (bytes/s) and `io.read_ios_per_second`, `io.write_ios_per_second`, `io.discard_ios_per_second` (operations/s). These use actual elapsed time and skip the initial baseline, missing values, cgroup recreation, device-set changes and per-device resets—even when a reset is hidden by another device's increasing counter. Sampling aggregates cgroup totals; individual device rows are available in snapshots, not exploded into separate sampled records.
 
 ```sh
 portal query --name node-a --query 'cgroups where path = /system.slice/*'
 portal query --name node-a --query 'cgroups avg(cpu_percent) over 30s every 1s by path'
 portal query --name node-a --query 'cgroups max(memory_bytes) over 30s every 1s by path | .aggregation.values | sort_by(.value) | reverse | .[:10]'
+portal query --name node-a --query 'cgroups avg(io.read_bytes_per_second), avg(io.write_bytes_per_second), max(io.write_ios_per_second) over 30s every 1s by path'
 ```
 
 Usage includes descendants: **do not sum overlapping parent and child groups**, which would double-count usage. Prefix globs match all descendant depths; `/system.slice/*` is a literal prefix filter, not a shell glob restricted to one level. Omit `where` to enumerate all visible groups, including `/`. Add `id` to grouping (`by path,id`) to return different lifetimes separately. The source supports snapshots and sampled aggregates, not event monitors; capability discovery describes its fields, units, filters, and requirements.
@@ -246,7 +277,18 @@ To observe block requests issued to a device on Linux, use the eBPF `disk` sourc
   --query 'disk where operation = write and device = 0x800'
 ```
 
-Each disk event includes the kernel device ID, start sector, sector count (512-byte sectors), and operation (`read`, `write`, `discard`, `flush`, or `other`). Filters `device` (decimal or `0x` hex ID) and `operation` (`read`, `write`, `discard`, `flush`) may be combined or omitted; the equivalent flags are `--source disk --device 0x800 --operation write`. This traces `block:block_rq_issue`, not filesystem paths, application PIDs, completed requests, or file contents. Operation and device filters are applied inside eBPF before records reach user space, then checked again before streaming. The source needs a readable tracepoint `format` under tracefs and permission to attach eBPF tracepoints. Its layout is discovered at attachment time; unsupported kernel formats fail explicitly. Capture is best-effort under load.
+Each disk event includes the kernel device ID, start sector, sector count (512-byte sectors), and operation (`read`, `write`, `discard`, `flush`, or `other`). Filters `device` (decimal or `0x` hex ID) and `operation` (`read`, `write`, `discard`, `flush`) may be combined or omitted; the equivalent flags are `--source disk --device 0x800 --operation write`. By default this traces `block:block_rq_issue`, with issuing PID/TID/name but no filesystem paths or file contents. Operation and device filters in entry mode run inside eBPF before records reach user space, then are checked again before streaming. The source needs a readable tracepoint `format` under tracefs and permission to attach eBPF tracepoints. Its layout is discovered at attachment time; unsupported kernel formats fail explicitly. Capture is best-effort under load.
+
+Select `phase = completion` for block request latency:
+
+```sh
+portal query --name node-a --query 'disk where phase = completion count, avg(duration_ns), percentile(duration_ns,95) over 30s by device, pid, name'
+portal query --name node-a --query 'disk where phase = completion and operation = write percentile(duration_ns,99) over 30s by device, status'
+```
+
+Completions pair by **kernel request pointer**, not device/sector, preserving identity and request metadata from issue. `disk.duration_ns` (aggregate field `duration_ns`) is monotonic time from the **latest issue** to completion of all bytes; it excludes pre-issue scheduler queueing. Partial completions produce a single final event, including for zero-byte flushes. `disk.status` (aggregate field `status`) is zero on success or the last nonzero kernel `blk_status_t` seen across completions—not a negative errno. Reissues reset identity, byte accounting and timestamp, so this is not total latency across retries. Only requests observed issuing and completing within collection contribute. Issuing PID is not definitive application attribution for asynchronous writeback; use cgroup I/O accounting for workload totals.
+
+Completion mode requires a native 64-bit server/kernel ABI, kernel BTF plus supported `request`, `request_queue`, `gendisk` and raw block tracepoint layouts; unsupported kernels fail explicitly without guessing offsets. Pending requests occupy a bounded 16,384-entry hash; requests without final completion remain until collector teardown. `pairing_failures`, `unmatched_exits` (unmatched block completions here), and ring-buffer drops are reported through collection counters. Completion operation/device filters run after pairing in server user space, so counters cover all captured requests, not just filtered groups. Both phases require a root server and explicit root policy authorization. Upgrade client and server together before using these new fields.
 
 For probes not covered by a built-in event type, `tracepoint` attaches to a named Linux tracepoint and streams selected scalar integer fields from the **server's** kernel format. For example, to observe processes waking on CPU 2:
 
@@ -308,6 +350,18 @@ Syscall numbers depend on the **server architecture**. These count syscall **ent
 Results retain `source` and `time` (window end) and add `aggregation` with UTC `start`, `end`, `group_by`, and `counts`. For example, the counts might be `[{"group":{"pid":123},"count":7},{"group":{"pid":456},"count":2}]`. Group values retain their JSON scalar types and full-width integer precision. Omitting `by` returns one total count, including zero if nothing matches; an empty grouped window returns `counts: []`.
 
 Other functions return `function`, `field`, and `values` instead of `counts`, with entries such as `{"group":{"device":2048},"value":1234}`; percentiles also carry `percentile` (omitted zero means the minimum). In Go, `AggregationResult.Values` contains `AggregateValue` entries whose `Value` is `json.RawMessage`, preserving numeric precision. For an empty ungrouped window, `sum` and `count_distinct` return zero; `avg`, `min`, `max`, and `percentile` return `null`. An empty grouped window returns `values: []`. Reductions use exact rational arithmetic: integer results do not wrap at 64 bits, and decimal results round to 18 places. Use a precision-preserving JSON decoder if consuming large values outside the Go API.
+
+Use comma-separated functions for **multiple aggregates over the same window**:
+
+```sh
+portal query --name node-a --query 'disk count, sum(sectors), percentile(sectors,95) over 30s by pid, name, device'
+portal query --name node-a --query 'tracepoint where event = block:block_rq_issue and fields in (nr_sector) and stacks = kernel count, sum(field.nr_sector) over 30s by kernel.stack'
+portal query --name node-a --query 'syscalls where phase = completion and syscall in (:fsync,:fdatasync) and stacks = user count, sum(duration_ns), percentile(duration_ns,95) over 30s by pid, user.stack'
+```
+
+All functions receive the same matching events from **one subscription**, or the same snapshots from **one sampler**; they share filters, window, sampling interval and grouping. This is not multiple queries run consecutively, or a cross-source join. Multi-function output has `aggregation.metrics` in request order, with each entry using the existing `function`/`field`/`percentile` and `counts` or `values` format plus the same window/grouping. Single-function queries keep their existing result format. Collection-loss counters describe the entire shared capture and appear once at `aggregation.collection`. For example, `| .aggregation.metrics[] | select(.function == "sum") | .values` selects a sum's values (also filter by `.field` if selecting several sums).
+
+At most eight distinct metrics are allowed; duplicate function/field/percentile combinations are rejected. All metrics share the query-wide 65,536 retained-value budget; each supports up to 4,096 groups. For sampled snapshots, unavailable fields are skipped **independently per metric**: a rate can skip its baseline while `count` or a memory gauge still uses that observation. Thus metrics may legitimately have different numbers of usable samples. API callers set `AggregationRequest.Metrics: []AggregateMetric{{Function: "count"}, {Function: "sum", Field: "sectors"}}` alongside the common `Window`, `Every` and `GroupBy`, instead of setting the top-level `Function`, `Field` or `Percentile`. Both client and server must support the extension.
 
 Percentiles sort numeric observations and select the nearest rank: for a nonempty group, rank is the ceiling of percentage × sample count / 100, clamped to at least one. Thus 0 returns the minimum, 100 the maximum, and 50 selects the lower middle sample for an even-sized group; there is no interpolation or approximate reduction. Percentile storage is capped at 65,536 samples **across the entire query**, and distinct counting at 65,536 retained `(group, value)` pairs. Duplicates within a distinct group consume no additional capacity. Exceeding a cap fails explicitly rather than returning a partial or approximate result. Sum, mean, and extrema do not retain individual samples.
 
@@ -491,9 +545,36 @@ portal query --name node-a --query 'syscalls where pid = 1234 and stacks = both 
 portal query --name node-a --query 'tracepoint where event = block:block_rq_issue and fields in (common_pid, dev) and stacks = kernel count over 30s by field.dev, kernel.stack'
 ```
 
-Events gain `user_stack`/`kernel_stack`, each with frames containing raw addresses and best-effort names/modules/offsets. Capture or symbolization failures remain explicit without discarding the ordinary event. Aggregation groups by semicolon-separated full call paths (`module:function+offset`, with unresolved addresses and capture errors retained), not just the first function. Stack capture defaults to 32 frames; the Go API can request up to 64 or disable symbolization. Stack maps hold 1024 entries; collisions/full maps report capture errors rather than reusing IDs and silently misattributing buffered events. Ring-buffer loss, missing frame pointers/unwind support, stripped non-Go objects, process exit/exec/PID reuse before resolution, namespaces, and kallsyms restrictions can limit results. Kernel symbols are cached for the monitor lifetime; restart a monitor after module changes. Stacks are resolved after capture, not an atomic historical mapping snapshot. A block-event kernel stack describes the issuing path, not the originating application's stack after asynchronous writeback.
+Events gain `user_stack`/`kernel_stack`, each with frames containing raw addresses and best-effort names/modules/offsets. Capture or symbolization failures remain explicit without discarding the ordinary event. Aggregation groups by semicolon-separated full call paths (`module:function+offset`, with unresolved addresses and capture errors retained), not just the first function. Stack capture defaults to 32 frames; the Go API can request up to 64 or disable symbolization. Stack maps hold 16,384 entries; collisions/full maps report capture errors and collection counters rather than reusing IDs and silently misattributing buffered events. Larger maps reduce collisions but cannot eliminate them. Ring-buffer loss, missing frame pointers/unwind support, stripped non-Go objects, process exit/exec/PID reuse before resolution, namespaces, and kallsyms restrictions can limit results. Kernel symbols are cached for the monitor lifetime; restart a monitor after module changes. Stacks are resolved after capture, not an atomic historical mapping snapshot. A block-event kernel stack describes the issuing path, not the originating application's stack after asynchronous writeback.
 
-These queries work through the existing MCP `query` and persistent-monitor tools. `capabilities` advertises the symbols source, stack filter, and requirements.
+### Stack shaping and folded output
+
+Stack grouping can be shaped on the server before any aggregate is reduced. User and kernel shapes are independent; raw event frames/addresses are unchanged and capture-error markers are always retained. Shaping applies to aggregate queries, not event monitors:
+
+| Filter | Meaning |
+| --- | --- |
+| `stack.depth = 64` | Capture up to 64 frames (0 defaults to 32); usable with event monitors too |
+| `user.stack.offsets = false` | Merge symbolized frames differing only by instruction offset; unresolved addresses stay distinct |
+| `user.stack.drop_bottom = 3` | Remove three root-side **captured** frames |
+| `user.stack.until = logstorage.*` | Keep leaf-side frames through the first matching function, inclusive; no match leaves the stack unchanged |
+| `user.stack.top = 8` | Keep at most eight leaf-side frames; zero keeps all remaining frames |
+
+Use the same options with `kernel.stack`. Processing order is `drop_bottom`, then `until`, then `top`, then optional offset removal. `until` matches the full symbol function name (not module or address), case-sensitively, with an exact name or a single prefix/suffix glob. Use the full package prefix for fully qualified Go symbols. Top/drop counts range from 0 to 64. Trimming only affects captured frames, so increasing depth may be necessary to reach a common caller. API callers set `StackCapture.UserShape`/`KernelShape` to `StackShape{DropOffsets: true, DropBottom: 3, Top: 8, Until: "logstorage.*"}`; `until` requires symbolization. Controls are signed and checked server-side.
+
+```sh
+portal query --name node-a --query 'syscalls where phase = completion and syscall in (:fsync,:fdatasync) and stacks = user and user.stack.offsets = false and user.stack.until = logstorage.* count, sum(duration_ns) over 30s by pid, user.stack'
+```
+
+JSON remains the default. Export a selected aggregate as flame-graph folded stacks with `--format folded`; `--folded-stack` defaults to `user.stack` (or select `kernel.stack`), and `--folded-metric` defaults to zero (the first function):
+
+```sh
+# Metric 1 is sum(duration_ns), so each path is weighted by elapsed nanoseconds.
+portal query --name node-a --format folded --folded-metric 1 --query 'syscalls where phase = completion and syscall in (:fsync,:fdatasync) and stacks = user and user.stack.offsets = false and user.stack.top = 8 count, sum(duration_ns) over 30s by pid, user.stack' > fsync.folded
+```
+
+Folded output is `root;caller;leaf WEIGHT`, one line per path. Other group fields become prefix frames, e.g. `pid=123;root;caller;leaf 7000000`, so different processes/devices do not accidentally merge. Duplicate rendered paths sum their weights exactly; decimal weights use 18 places. Stack keys escape `;`, `%`, newline, carriage return and tab to prevent ambiguous frames or forged rows. Empty stacks appear as `[empty stack]`; empty grouped results produce no lines. Nonzero collection-loss counters are printed to stderr, not mixed into the folded file. Negative/null/non-numeric weights are rejected before output; folded format cannot be combined with `| jq`. This exports captured syscall/event cost or frequency—not a time-sampling CPU profile or exact device latency.
+
+These queries work through the existing MCP `query` and persistent-monitor tools (shaping uses aggregate `query` only). `capabilities` advertises the symbols source, stack filters, and requirements. Upgrade client and server together for shaping controls.
 
 ## MCP tool
 

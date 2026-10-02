@@ -29,6 +29,9 @@ func TestCapabilityReference(t *testing.T) {
 	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 14 || len(docs.Aggregates) != 7 {
 		t.Fatalf("incomplete capability reference: %+v", docs)
 	}
+	if docs.Limits.AggregateMetrics != 8 {
+		t.Fatal("multi-metric limit missing from capabilities")
+	}
 	for _, source := range docs.Sources {
 		if source.Authorized || source.UnavailableReason == "" || len(source.Fields) == 0 {
 			t.Errorf("unusable source needs a reason and schema: %+v", source)
@@ -39,8 +42,33 @@ func TestCapabilityReference(t *testing.T) {
 				t.Fatalf("invalid documented example %q: %+v, %v", example, r, err)
 			}
 		}
+		if source.Name == "syscalls" || source.Name == "tracepoint" {
+			for _, prefix := range []string{"user.stack", "kernel.stack"} {
+				for _, suffix := range []string{"offsets", "top", "drop_bottom", "until"} {
+					if !slices.ContainsFunc(source.Filters, func(f FilterCapability) bool {
+						return f.Field == prefix+"."+suffix && slices.Contains(f.Modes, "aggregate")
+					}) {
+						t.Fatalf("stack shape not discoverable: %s.%s", prefix, suffix)
+					}
+				}
+			}
+		}
+		if source.Name == "cgroups" {
+			for _, field := range []string{"io.read_bytes_per_second", "io.write_bytes_per_second", "io.discard_bytes_per_second", "io.read_ios_per_second", "io.write_ios_per_second", "io.discard_ios_per_second"} {
+				if source.Sampling == nil || !slices.Contains(source.Sampling.NumericFields, field) {
+					t.Fatalf("cgroup I/O rate not discoverable: %s", field)
+				}
+			}
+			if slices.Contains(source.Sampling.NumericFields, "io.write_bytes") {
+				t.Fatal("raw cgroup I/O counter advertised as a gauge")
+			}
+		}
 		if slices.Contains(source.Modes, "aggregate") {
 			r := MonitorRequest{Source: source.Name}
+			if source.Name == "syscalls" || source.Name == "disk" {
+				r.Phase = "completion"
+			}
+			r.Paths = source.Name == "syscalls"
 			if source.Name == "syscalls" || source.Name == "tracepoint" {
 				r.Stacks = &StackCapture{User: true, Kernel: true}
 			}

@@ -35,7 +35,7 @@ func TestSymbolAndStackQueries(t *testing.T) {
 	}
 	frames := &CapturedStack{Frames: []SymbolFrame{{Address: "0x123", Name: "run", Module: "app", Offset: 7}, {Address: "0x456", Error: "unresolved"}}}
 	event := Event{PID: 123, UserStack: frames}
-	if got := eventGroupFields(event)["user.stack"]; got != "app:run+0x7;0x456" {
+	if got := eventGroupFields(event, nil)["user.stack"]; got != "app:run+0x7;0x456" {
 		t.Fatalf("wrong collapsed stack: %v", got)
 	}
 	data, err := json.Marshal(event)

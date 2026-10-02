@@ -187,5 +187,97 @@ func readCgroupMetrics(root *os.Root, info *CgroupInfo) error {
 	if value, ok := memory["file"]; ok {
 		info.MemoryFileBytes = &value
 	}
+	io, err := readCgroupIO(root)
+	if err != nil {
+		return err
+	}
+	info.IO = io
 	return nil
+}
+
+func readCgroupIO(root *os.Root) (*CgroupIO, error) {
+	data, err := root.ReadFile("io.stat")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	io := &CgroupIO{Devices: make([]CgroupIODevice, 0)}
+	seenDevices := make(map[string]struct{})
+	known := []struct {
+		key string
+		out **uint64
+	}{
+		{"rbytes", &io.ReadBytes}, {"wbytes", &io.WriteBytes}, {"dbytes", &io.DiscardBytes},
+		{"rios", &io.ReadIOs}, {"wios", &io.WriteIOs}, {"dios", &io.DiscardIOs},
+	}
+	totals := make(map[string]uint64, len(known))
+	complete := make(map[string]bool, len(known))
+	for _, counter := range known {
+		complete[counter.key] = true
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			return nil, fmt.Errorf("invalid io.stat row %q", line)
+		}
+		parts := strings.Split(fields[0], ":")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid io.stat device %q", fields[0])
+		}
+		major, majorErr := strconv.ParseUint(parts[0], 10, 32)
+		minor, minorErr := strconv.ParseUint(parts[1], 10, 32)
+		if majorErr != nil || minorErr != nil {
+			return nil, fmt.Errorf("invalid io.stat device %q", fields[0])
+		}
+		device := fmt.Sprintf("%d:%d", major, minor)
+		if _, exists := seenDevices[device]; exists {
+			return nil, fmt.Errorf("duplicate io.stat device %q", device)
+		}
+		seenDevices[device] = struct{}{}
+		if len(seenDevices) > 4096 {
+			return nil, errors.New("io.stat exceeds 4096 devices")
+		}
+
+		counters := make(map[string]uint64, len(fields)-1)
+		for _, field := range fields[1:] {
+			pair := strings.Split(field, "=")
+			if len(pair) != 2 || pair[0] == "" || pair[1] == "" {
+				return nil, fmt.Errorf("invalid io.stat counter %q", field)
+			}
+			if _, exists := counters[pair[0]]; exists {
+				return nil, fmt.Errorf("duplicate io.stat counter %q for device %s", pair[0], device)
+			}
+			value, err := strconv.ParseUint(pair[1], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid io.stat counter %q: %w", field, err)
+			}
+			counters[pair[0]] = value
+		}
+		for _, counter := range known {
+			value, exists := counters[counter.key]
+			if !exists {
+				complete[counter.key] = false
+				continue
+			}
+			if ^uint64(0)-totals[counter.key] < value {
+				return nil, fmt.Errorf("io.stat %s total overflows uint64", counter.key)
+			}
+			totals[counter.key] += value
+		}
+		io.Devices = append(io.Devices, CgroupIODevice{Device: device, Counters: counters})
+	}
+	for _, counter := range known {
+		if complete[counter.key] {
+			value := totals[counter.key]
+			*counter.out = &value
+		}
+	}
+	return io, nil
 }

@@ -79,15 +79,31 @@ type ContainerInfo struct {
 // CgroupInfo describes a visible Linux cgroup v2 directory. Usage includes
 // descendants; limits are configured locally, not effective ancestor limits.
 type CgroupInfo struct {
-	Path             string   `json:"path"`
-	ID               string   `json:"id"` // Filesystem device/inode identity, used to detect recreated groups.
-	CPUSeconds       *float64 `json:"cpu_seconds,omitempty"`
-	CPULimitCores    *float64 `json:"cpu_limit_cores,omitempty"`
-	MemoryBytes      *uint64  `json:"memory_bytes,omitempty"`
-	MemoryLimitBytes *uint64  `json:"memory_limit_bytes,omitempty"`
-	MemoryAnonBytes  *uint64  `json:"memory_anon_bytes,omitempty"`
-	MemoryFileBytes  *uint64  `json:"memory_file_bytes,omitempty"`
-	PIDsCurrent      *uint64  `json:"pids_current,omitempty"` // Counts tasks, including threads.
+	Path             string    `json:"path"`
+	ID               string    `json:"id"` // Filesystem device/inode identity, used to detect recreated groups.
+	CPUSeconds       *float64  `json:"cpu_seconds,omitempty"`
+	CPULimitCores    *float64  `json:"cpu_limit_cores,omitempty"`
+	MemoryBytes      *uint64   `json:"memory_bytes,omitempty"`
+	MemoryLimitBytes *uint64   `json:"memory_limit_bytes,omitempty"`
+	MemoryAnonBytes  *uint64   `json:"memory_anon_bytes,omitempty"`
+	MemoryFileBytes  *uint64   `json:"memory_file_bytes,omitempty"`
+	PIDsCurrent      *uint64   `json:"pids_current,omitempty"` // Counts tasks, including threads.
+	IO               *CgroupIO `json:"io,omitempty"`
+}
+
+type CgroupIO struct {
+	ReadBytes    *uint64          `json:"read_bytes,omitempty"`
+	WriteBytes   *uint64          `json:"write_bytes,omitempty"`
+	DiscardBytes *uint64          `json:"discard_bytes,omitempty"`
+	ReadIOs      *uint64          `json:"read_ios,omitempty"`
+	WriteIOs     *uint64          `json:"write_ios,omitempty"`
+	DiscardIOs   *uint64          `json:"discard_ios,omitempty"`
+	Devices      []CgroupIODevice `json:"devices"`
+}
+
+type CgroupIODevice struct {
+	Device   string            `json:"device"`
+	Counters map[string]uint64 `json:"counters"`
 }
 
 type GPUInfo struct {

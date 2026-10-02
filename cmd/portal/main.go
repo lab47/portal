@@ -249,17 +249,39 @@ func run(args []string) error {
 	queryFlags := mflags.NewFlagSet("query")
 	queryOptions := clientConnectionFlags(queryFlags)
 	queryText := queryFlags.String("query", 0, "", "snapshot or aggregation query, optionally followed by | JQ_EXPRESSION")
+	queryFormat := queryFlags.String("format", 0, "json", "query output: json or folded (flame graph stacks)")
+	foldedStack := queryFlags.String("folded-stack", 0, "user.stack", "stack grouping to export: user.stack or kernel.stack")
+	foldedMetric := queryFlags.Int("folded-metric", 0, 0, "zero-based aggregate metric index for folded weights")
 	dispatcher.Dispatch("query", mflags.NewCommand(queryFlags, func(_ *mflags.FlagSet, _ []string) error {
 		if *queryText == "" {
 			return errors.New("--query required")
+		}
+		if *queryFormat != "json" && *queryFormat != "folded" {
+			return errors.New("format must be json or folded")
 		}
 		request, filter, err := parseClientQuery(*queryText)
 		if err != nil {
 			return err
 		}
+		if *queryFormat == "folded" {
+			if filter != nil {
+				return errors.New("folded output cannot be combined with a jq pipeline")
+			}
+			if err := validateFoldedQuery(request, *foldedStack, *foldedMetric); err != nil {
+				return err
+			}
+		}
 		snapshot, err := queryOptions().Query(ctx, request)
 		if err != nil {
 			return err
+		}
+		if *queryFormat == "folded" {
+			if snapshot.Aggregation != nil {
+				if stats := snapshot.Aggregation.Collection; stats != nil && *stats != (portal.CollectionStats{}) {
+					fmt.Fprintf(os.Stderr, "portal: collection counters: %+v\n", *stats)
+				}
+			}
+			return writeFoldedResult(os.Stdout, snapshot, *foldedStack, *foldedMetric)
 		}
 		return writeQueryResult(ctx, os.Stdout, snapshot, filter)
 	}, mflags.WithUsage("Query server state or aggregates, with optional client-side jq processing")))

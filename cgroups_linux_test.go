@@ -5,6 +5,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,6 +103,88 @@ func TestCgroupMalformedMetrics(t *testing.T) {
 	}
 	if _, err := cgroupSnapshot(context.Background(), mount, ""); err == nil {
 		t.Fatal("metric symlink escaped directory")
+	}
+}
+
+func TestCgroupIOStat(t *testing.T) {
+	mount := t.TempDir()
+	collect := func() CgroupInfo {
+		t.Helper()
+		got, err := cgroupSnapshot(context.Background(), mount, "")
+		if err != nil || len(got) != 1 {
+			t.Fatalf("collect io.stat: %+v, %v", got, err)
+		}
+		return got[0]
+	}
+
+	if got := collect(); got.IO != nil {
+		t.Fatalf("missing io.stat was present: %+v", got.IO)
+	}
+	if err := os.WriteFile(filepath.Join(mount, "io.stat"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	io := collect().IO
+	if io == nil || len(io.Devices) != 0 || io.ReadBytes == nil || *io.ReadBytes != 0 || io.WriteBytes == nil || *io.WriteBytes != 0 ||
+		io.DiscardBytes == nil || *io.DiscardBytes != 0 || io.ReadIOs == nil || *io.ReadIOs != 0 || io.WriteIOs == nil || *io.WriteIOs != 0 || io.DiscardIOs == nil || *io.DiscardIOs != 0 {
+		t.Fatalf("empty io.stat semantics: %+v", io)
+	}
+
+	data := "8:1 rbytes=10 wbytes=20 rios=1 wios=2 dbytes=3 dios=4 future=9\n8:2 rbytes=30 rios=5 wios=6 dbytes=7 dios=8 future=11\n"
+	if err := os.WriteFile(filepath.Join(mount, "io.stat"), []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	io = collect().IO
+	if io == nil || len(io.Devices) != 2 || io.Devices[0].Device != "8:1" || io.Devices[1].Device != "8:2" ||
+		io.ReadBytes == nil || *io.ReadBytes != 40 || io.WriteBytes != nil || io.ReadIOs == nil || *io.ReadIOs != 6 ||
+		io.WriteIOs == nil || *io.WriteIOs != 8 || io.DiscardBytes == nil || *io.DiscardBytes != 10 || io.DiscardIOs == nil || *io.DiscardIOs != 12 ||
+		io.Devices[0].Counters["future"] != 9 || io.Devices[1].Counters["future"] != 11 {
+		t.Fatalf("incorrect io.stat accounting: %+v", io)
+	}
+
+	if err := os.WriteFile(filepath.Join(mount, "io.stat"), []byte("008:01 rbytes=0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	io = collect().IO
+	if len(io.Devices) != 1 || io.Devices[0].Device != "8:1" || io.ReadBytes == nil || *io.ReadBytes != 0 || io.WriteBytes != nil {
+		t.Fatalf("partial/zero io.stat semantics: %+v", io)
+	}
+}
+
+func TestCgroupIOStatValidation(t *testing.T) {
+	tooMany := strings.Builder{}
+	for i := 0; i <= 4096; i++ {
+		fmt.Fprintf(&tooMany, "%d:0 rbytes=1\n", i)
+	}
+	for name, data := range map[string]string{
+		"bad device": "8 rbytes=1", "negative device": "-1:0 rbytes=1",
+		"overflow device": "4294967296:0 rbytes=1", "bad counter": "8:0 rbytes", "negative counter": "8:0 rbytes=-1",
+		"overflow counter": "8:0 rbytes=18446744073709551616", "duplicate device": "8:0 rbytes=1\n8:0 rbytes=2",
+		"canonical duplicate device": "08:0 rbytes=1\n8:00 rbytes=2", "duplicate counter": "8:0 rbytes=1 rbytes=2",
+		"sum overflow": "8:0 rbytes=18446744073709551615\n8:1 rbytes=1", "too many devices": tooMany.String(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			mount := t.TempDir()
+			if err := os.WriteFile(filepath.Join(mount, "io.stat"), []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cgroupSnapshot(context.Background(), mount, ""); err == nil || !strings.Contains(err.Error(), "io.stat") {
+				t.Fatalf("invalid io.stat accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestCgroupIOStatAnchoredRead(t *testing.T) {
+	mount := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "io.stat")
+	if err := os.WriteFile(outside, []byte("8:0 rbytes=42"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(mount, "io.stat")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cgroupSnapshot(context.Background(), mount, ""); err == nil {
+		t.Fatal("io.stat symlink escaped cgroup directory")
 	}
 }
 

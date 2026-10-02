@@ -333,3 +333,45 @@ func TestAggregatePercentileRanks(t *testing.T) {
 		}
 	})
 }
+
+func TestCompletionAggregatesAndFinalCollectionStats(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, err := ParseMonitorQuery("syscalls where phase = completion and syscall = 74 sum(duration_ns) over 1s by pid, name")
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := func(ctx context.Context, selection MonitorRequest, emit func(Event) error) error {
+			if selection.Phase != "completion" {
+				t.Fatal("lost syscall phase")
+			}
+			for _, duration := range []uint64{7, 19} {
+				if err := emit(Event{PID: 42, TID: 43, Name: "writer", Syscall: 74, Phase: "completion", DurationNS: &duration, Collection: &CollectionStats{StackCollisions: 2, StackCaptureFailures: 2}}); err != nil {
+					return err
+				}
+			}
+			<-ctx.Done()
+			return emit(Event{Kind: "collection_stats", Collection: &CollectionStats{RingBufferDropped: 5, StackCollisions: 3, StackCaptureFailures: 4}})
+		}
+		got, err := aggregateEvents(context.Background(), r, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Aggregation.Values) != 1 || string(got.Aggregation.Values[0].Value) != "26" || string(got.Aggregation.Values[0].Group["name"]) != `"writer"` {
+			t.Fatalf("wrong duration/identity aggregate: %+v", got.Aggregation)
+		}
+		stats := got.Aggregation.Collection
+		if stats == nil || stats.RingBufferDropped != 5 || stats.StackCollisions != 3 || stats.StackCaptureFailures != 4 {
+			t.Fatalf("lost final counters or added cumulative counters: %+v", stats)
+		}
+	})
+	for _, query := range []string{"syscalls sum(duration_ns) over 1s", "syscalls where phase = entry avg(return_value) over 1s", "syscalls where phase = exit", "disk where phase = exit"} {
+		if _, err := ParseMonitorQuery(query); err == nil {
+			t.Fatalf("invalid phase query accepted: %s", query)
+		}
+	}
+	for _, query := range []string{"syscalls count over 1s by name", "disk count over 1s by pid,tid,name", "tracepoint where event = sched:sched_switch and fields in (prev_pid) count over 1s by pid,tid,name"} {
+		if _, err := ParseMonitorQuery(query); err != nil {
+			t.Fatalf("identity query rejected: %s: %v", query, err)
+		}
+	}
+}

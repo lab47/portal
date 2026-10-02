@@ -94,17 +94,19 @@ func readTracepointFormat(category, name string, fields []string) ([]tracepointF
 	return nil, fmt.Errorf("read %s:%s tracepoint format: %w", category, name, err)
 }
 
-func tracepointInstructions(fields []tracepointField, eventsFD int, stacks ...*stackCaptureState) asm.Instructions {
+func tracepointInstructions(fields []tracepointField, eventsFD int, stackState *stackCaptureState, collections ...*collectionState) asm.Instructions {
 	insns := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1)}
-	var stackState *stackCaptureState
-	if len(stacks) != 0 {
-		stackState = stacks[0]
+	var collection *collectionState
+	if len(collections) != 0 {
+		collection = collections[0]
 	}
 	stackSize := 0
 	if stackState != nil {
 		stackSize = stackState.recordSize()
-		insns = appendStackCapture(insns, asm.R6, int16(-8*len(fields)-stackSize), stackState)
+		insns = appendStackCapture(insns, asm.R6, int16(-8*len(fields)-taskIdentitySize-stackSize), stackState)
 	}
+	identityOffset := int16(-8*len(fields) - taskIdentitySize)
+	insns = appendTaskIdentity(insns, identityOffset)
 	for i, field := range fields {
 		offset := int16(-8 * (len(fields) - i))
 		if field.commonPID {
@@ -135,13 +137,13 @@ func tracepointInstructions(fields []tracepointField, eventsFD int, stacks ...*s
 	insns = append(insns,
 		asm.LoadMapPtr(asm.R1, eventsFD),
 		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, int32(-8*len(fields)-stackSize)),
-		asm.Mov.Imm(asm.R3, int32(8*len(fields)+stackSize)),
+		asm.Add.Imm(asm.R2, int32(-8*len(fields)-taskIdentitySize-stackSize)),
+		asm.Mov.Imm(asm.R3, int32(8*len(fields)+taskIdentitySize+stackSize)),
 		asm.Mov.Imm(asm.R4, 0),
 		asm.FnRingbufOutput.Call(),
-		asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"),
-		asm.Return(),
 	)
+	insns = appendRingLoss(insns, collection)
+	insns = append(insns, asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"), asm.Return())
 	return insns
 }
 
@@ -180,12 +182,20 @@ func tracepointEvents(ctx context.Context, request MonitorRequest, emit func(Eve
 		return fmt.Errorf("create eBPF tracepoint ring buffer: %w", err)
 	}
 	defer events.Close()
+	collection, err := newCollectionState()
+	if err != nil {
+		return err
+	}
+	defer collection.close()
 	stacks, err := newStackCaptureState(request.Stacks)
 	if err != nil {
 		return err
 	}
 	defer stacks.close()
-	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_trace", Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD(), stacks)})
+	if stacks != nil {
+		stacks.collection = collection
+	}
+	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_trace", Type: ebpf.TracePoint, License: "GPL", Instructions: tracepointInstructions(fields, events.FD(), stacks, collection)})
 	if err != nil {
 		return fmt.Errorf("load eBPF tracepoint monitor: %w", err)
 	}
@@ -206,7 +216,14 @@ func tracepointEvents(ctx context.Context, request MonitorRequest, emit func(Eve
 		record, err := reader.Read()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, ringbuf.ErrClosed) {
-				return nil
+				if err := attached.Close(); err != nil {
+					return err
+				}
+				final := Event{Kind: "collection_stats", Time: time.Now().UTC()}
+				if err := collection.report(&final); err != nil {
+					return err
+				}
+				return emit(final)
 			}
 			return err
 		}
@@ -214,10 +231,11 @@ func tracepointEvents(ctx context.Context, request MonitorRequest, emit func(Eve
 		if stacks != nil {
 			stackSize = stacks.recordSize()
 		}
-		if len(record.RawSample) < stackSize {
+		if len(record.RawSample) < stackSize+taskIdentitySize {
 			return errors.New("invalid eBPF tracepoint record")
 		}
-		event, err := decodeTracepointRecord(record.RawSample[stackSize:], *spec, fields)
+		decodeOffset := stackSize
+		event, err := decodeTracepointRecord(record.RawSample[decodeOffset+taskIdentitySize:], *spec, fields)
 		if err != nil {
 			return err
 		}
@@ -225,6 +243,10 @@ func tracepointEvents(ctx context.Context, request MonitorRequest, emit func(Eve
 			if err := stacks.decode(ctx, record.RawSample[:stackSize], &event); err != nil {
 				return err
 			}
+		}
+		decodeTaskIdentity(record.RawSample[decodeOffset:decodeOffset+taskIdentitySize], &event)
+		if err := collection.report(&event); err != nil {
+			return err
 		}
 		if request.matches(event) {
 			if err := emit(event); err != nil {

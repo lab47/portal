@@ -61,6 +61,9 @@ func snapshotSampleFields(source string) []SampleField {
 		if field.Type != "integer" && field.Type != "number" && field.Type != "string" && field.Type != "timestamp" {
 			continue
 		}
+		if source == "cgroups" && strings.HasPrefix(field.Path, "io.devices") {
+			continue // Device rows are snapshot detail; sampled metrics use cgroup totals.
+		}
 		field.QueryField = field.Path
 		kind := "identity"
 		if field.Type == "integer" || field.Type == "number" {
@@ -79,6 +82,11 @@ func snapshotSampleFields(source string) []SampleField {
 			kind, field.Unit = "counter", "switches"
 		case (source == "process" || source == "cgroups") && field.Path == "cpu_seconds":
 			kind, field.Unit = "counter", "seconds"
+		case source == "cgroups" && strings.HasPrefix(field.Path, "io."):
+			kind, field.Unit = "counter", "operations"
+			if strings.HasSuffix(field.Path, "_bytes") {
+				field.Unit = "bytes"
+			}
 		case source == "process" && field.Path == "pid" || source == "gpu" && field.Path == "index" || source == "network" && field.Path == "index":
 			kind = "identity"
 		case source == "memory" || field.Path == "mtu" || strings.HasSuffix(field.Path, "_bytes"):
@@ -198,6 +206,9 @@ func deriveSample(fields map[string]any, previous sampleObservation, at time.Tim
 		if field.Semantics != "counter" {
 			continue
 		}
+		if strings.HasPrefix(field.Path, "io.") && !cgroupIODeltaValid(fields, previous.fields, field.Path) {
+			continue
+		}
 		current, before := sampleNumber(fields[field.Path]), sampleNumber(previous.fields[field.Path])
 		if current == nil || before == nil || current.Cmp(before) < 0 {
 			continue
@@ -222,6 +233,58 @@ func deriveSample(fields map[string]any, previous sampleObservation, at time.Tim
 	}
 }
 
+// Totals alone can hide a device counter reset, or count a newly appearing
+// device's lifetime usage as interval I/O. Require matching device sets and
+// monotonic per-device counters before deriving each total's rate.
+func cgroupIODeltaValid(current, previous map[string]any, path string) bool {
+	key := map[string]string{"io.read_bytes": "rbytes", "io.write_bytes": "wbytes", "io.discard_bytes": "dbytes", "io.read_ios": "rios", "io.write_ios": "wios", "io.discard_ios": "dios"}[path]
+	devices, ok := current["io.devices"].([]any)
+	before, beforeOK := previous["io.devices"].([]any)
+	if !ok || !beforeOK || len(devices) != len(before) {
+		return false
+	}
+	old := make(map[string]map[string]any, len(before))
+	for _, value := range before {
+		device := value.(map[string]any)
+		old[device["device"].(string)] = device["counters"].(map[string]any)
+	}
+	for _, value := range devices {
+		device := value.(map[string]any)
+		counters := device["counters"].(map[string]any)
+		prior, exists := old[device["device"].(string)]
+		if !exists {
+			return false
+		}
+		now, then := sampleNumber(counters[key]), sampleNumber(prior[key])
+		if now == nil || then == nil || now.Cmp(then) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// Each sampled metric independently skips unavailable fields. In particular,
+// a rate's first observation is a baseline, but gauges/count can use that sample.
+func (r *aggregateReduction) addSample(fields map[string]any) error {
+	if len(r.metrics) != 0 {
+		for _, metric := range r.metrics {
+			if err := metric.addSample(fields); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if r.request.Field != "" && fields[r.request.Field] == nil {
+		return nil
+	}
+	for _, field := range r.request.GroupBy {
+		if fields[field] == nil {
+			return nil
+		}
+	}
+	return r.add(fields)
+}
+
 // aggregateSnapshots samples immediately and then on the interval grid within
 // [start,end). Slow reads skip ticks, never overlap or generate catch-up bursts.
 func aggregateSnapshots(ctx context.Context, request MonitorRequest, collect func(context.Context, MonitorRequest) (Snapshot, error)) (Snapshot, error) {
@@ -236,6 +299,7 @@ func aggregateSnapshots(ctx context.Context, request MonitorRequest, collect fun
 	if interval == 0 {
 		interval = DefaultSampleInterval
 	}
+	a.Every = interval
 	start := time.Now()
 	end := start.Add(a.Window)
 	windowCtx, cancel := context.WithDeadline(ctx, end)
@@ -297,16 +361,8 @@ func aggregateSnapshots(ctx context.Context, request MonitorRequest, collect fun
 			key, _ := json.Marshal(identity)
 			deriveSample(record, previous[string(key)], at, metadata)
 			current[string(key)] = sampleObservation{record, at}
-			// Optional metrics, initial counter baselines and reset intervals
-			// are unavailable, not zero. Never mix unrelated/missing groups.
-			missing := a.Field != "" && record[a.Field] == nil
-			for _, field := range a.GroupBy {
-				missing = missing || record[field] == nil
-			}
-			if !missing {
-				if err := reduction.add(record); err != nil {
-					return Snapshot{}, err
-				}
+			if err := reduction.addSample(record); err != nil {
+				return Snapshot{}, err
 			}
 		}
 		previous = current

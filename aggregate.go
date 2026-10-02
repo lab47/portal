@@ -16,16 +16,25 @@ import (
 
 const maxAggregateGroups = 4096
 const maxAggregateValues = 65536
+const maxAggregateMetrics = 8
+
+// AggregateMetric selects one reduction in a shared window and grouping.
+type AggregateMetric struct {
+	Function   string  `json:"function"`
+	Field      string  `json:"field,omitempty"`
+	Percentile float64 `json:"percentile,omitempty"`
+}
 
 // AggregationRequest reduces matching events or sampled snapshots during a new window.
 // An omitted Function selects count for compatibility.
 type AggregationRequest struct {
-	Window     time.Duration `json:"window"` // nanoseconds
-	GroupBy    []string      `json:"group_by,omitempty"`
-	Function   string        `json:"function,omitempty"` // count, sum, avg, min, max, count_distinct, percentile
-	Field      string        `json:"field,omitempty"`
-	Percentile float64       `json:"percentile,omitempty"` // 0–100, only for percentile
-	Every      time.Duration `json:"every,omitempty"`      // Snapshot sampling interval; zero defaults to 1s for snapshot-only sources.
+	Window     time.Duration     `json:"window"` // nanoseconds
+	GroupBy    []string          `json:"group_by,omitempty"`
+	Function   string            `json:"function,omitempty"` // count, sum, avg, min, max, count_distinct, percentile
+	Field      string            `json:"field,omitempty"`
+	Percentile float64           `json:"percentile,omitempty"` // 0–100, only for percentile
+	Every      time.Duration     `json:"every,omitempty"`      // Snapshot sampling interval; zero defaults to 1s for snapshot-only sources.
+	Metrics    []AggregateMetric `json:"metrics,omitempty"`    // Alternative to Function/Field/Percentile; all share Window/Every/GroupBy.
 }
 
 type AggregateCount struct {
@@ -40,20 +49,25 @@ type AggregateValue struct {
 
 // AggregationResult describes a half-open server ingestion window [Start, End).
 type AggregationResult struct {
-	Start      time.Time        `json:"start"`
-	End        time.Time        `json:"end"`
-	GroupBy    []string         `json:"group_by"`
-	Counts     []AggregateCount `json:"counts,omitempty"`
-	Function   string           `json:"function,omitempty"`
-	Field      string           `json:"field,omitempty"`
-	Percentile float64          `json:"percentile,omitempty"`
-	Values     []AggregateValue `json:"values,omitempty"`
-	Every      time.Duration    `json:"every,omitempty"`
+	Start      time.Time            `json:"start"`
+	End        time.Time            `json:"end"`
+	GroupBy    []string             `json:"group_by"`
+	Counts     []AggregateCount     `json:"counts,omitempty"`
+	Function   string               `json:"function,omitempty"`
+	Field      string               `json:"field,omitempty"`
+	Percentile float64              `json:"percentile,omitempty"`
+	Values     []AggregateValue     `json:"values,omitempty"`
+	Every      time.Duration        `json:"every,omitempty"`
+	Collection *CollectionStats     `json:"collection,omitempty"`
+	Metrics    []*AggregationResult `json:"metrics,omitempty"` // In request order; each has the same window/grouping. Single queries retain their old shape.
 }
 
 // Keep the selected result collection visible even for an empty grouped window.
 func (a AggregationResult) MarshalJSON() ([]byte, error) {
 	type fields AggregationResult
+	if len(a.Metrics) != 0 {
+		return json.Marshal(fields(a))
+	}
 	if a.Function == "" || a.Function == "count" {
 		return json.Marshal(struct {
 			fields
@@ -74,7 +88,15 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 	switch r.Source {
 	case "syscalls":
 		fields = []string{"pid", "tid", "syscall"}
-		numeric = fields
+		numeric = append([]string{}, fields...)
+		if r.Phase == "completion" {
+			fields = append(fields, "duration_ns", "return_value")
+			numeric = append(numeric, "duration_ns", "return_value")
+		}
+		if r.Paths {
+			fields = append(fields, "file.fd", "file.path", "file.error")
+			numeric = append(numeric, "file.fd")
+		}
 	case "process":
 		fields = []string{"pid", "name", "action"}
 		numeric = []string{"pid"}
@@ -84,6 +106,10 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 	case "disk":
 		fields = []string{"device", "operation", "sector", "sectors"}
 		numeric = []string{"device", "sector", "sectors"}
+		if r.Phase == "completion" {
+			fields = append(fields, "duration_ns", "status")
+			numeric = append(numeric, "duration_ns", "status")
+		}
 	case "tracepoint":
 		if r.Tracepoint != nil {
 			for _, name := range r.Tracepoint.Fields {
@@ -93,6 +119,13 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 		numeric = fields
 	default:
 		err = errors.New("aggregation requires an event source")
+	}
+	if r.Source == "syscalls" || r.Source == "disk" || r.Source == "tracepoint" {
+		if r.Source != "syscalls" {
+			fields = append(fields, "pid", "tid")
+			numeric = append(append([]string{}, numeric...), "pid", "tid")
+		}
+		fields = append(fields, "name")
 	}
 	if r.Stacks != nil {
 		if r.Stacks.User {
@@ -106,6 +139,31 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 }
 
 func (a AggregationRequest) validate(r MonitorRequest) error {
+	if len(a.Metrics) != 0 {
+		if len(a.Metrics) > maxAggregateMetrics {
+			return errors.New("aggregation supports at most 8 metrics")
+		}
+		if a.Function != "" || a.Field != "" || a.Percentile != 0 {
+			return errors.New("metrics cannot be combined with function, field or percentile")
+		}
+		seen := make(map[AggregateMetric]bool)
+		for _, metric := range a.Metrics {
+			if metric.Function == "" {
+				metric.Function = "count"
+			}
+			if seen[metric] {
+				return errors.New("duplicate aggregate metric")
+			}
+			seen[metric] = true
+			one := a
+			one.Metrics = nil
+			one.Function, one.Field, one.Percentile = metric.Function, metric.Field, metric.Percentile
+			if err := one.validate(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if a.Window <= 0 || a.Window > time.Hour {
 		return errors.New("aggregation window must be positive and at most 1h")
 	}
@@ -161,7 +219,7 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 	return nil
 }
 
-func eventGroupFields(event Event) map[string]any {
+func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 	var fields map[string]any
 	switch {
 	case event.Process != nil:
@@ -171,6 +229,12 @@ func eventGroupFields(event Event) map[string]any {
 		fields = map[string]any{"protocol": p.Protocol, "direction": p.Direction, "src.ip": p.SourceIP, "dst.ip": p.DestinationIP, "src.port": p.SourcePort, "dst.port": p.DestinationPort, "length": p.Length}
 	case event.Disk != nil:
 		fields = map[string]any{"device": event.Disk.Device, "operation": event.Disk.Operation, "sector": event.Disk.Sector, "sectors": event.Disk.Sectors}
+		if event.Disk.DurationNS != nil {
+			fields["duration_ns"] = *event.Disk.DurationNS
+		}
+		if event.Disk.Status != nil {
+			fields["status"] = *event.Disk.Status
+		}
 	case event.Tracepoint != nil:
 		fields = make(map[string]any, len(event.Tracepoint.Fields))
 		for name, value := range event.Tracepoint.Fields {
@@ -180,10 +244,36 @@ func eventGroupFields(event Event) map[string]any {
 		fields = map[string]any{"pid": event.PID, "tid": event.TID, "syscall": event.Syscall}
 	}
 	if event.UserStack != nil {
-		fields["user.stack"] = event.UserStack.key()
+		var shape *StackShape
+		if stacks != nil {
+			shape = stacks.UserShape
+		}
+		fields["user.stack"] = event.UserStack.key(shape)
 	}
 	if event.KernelStack != nil {
-		fields["kernel.stack"] = event.KernelStack.key()
+		var shape *StackShape
+		if stacks != nil {
+			shape = stacks.KernelShape
+		}
+		fields["kernel.stack"] = event.KernelStack.key(shape)
+	}
+	if event.Process == nil && event.Packet == nil {
+		fields["pid"], fields["tid"], fields["name"] = event.PID, event.TID, event.Name
+	}
+	if event.DurationNS != nil {
+		fields["duration_ns"] = *event.DurationNS
+	}
+	if event.ReturnValue != nil {
+		fields["return_value"] = *event.ReturnValue
+	}
+	if event.File != nil {
+		fields["file.fd"] = event.File.FD
+		if event.File.Path != "" {
+			fields["file.path"] = event.File.Path
+		}
+		if event.File.Error != "" {
+			fields["file.error"] = event.File.Error
+		}
 	}
 	return fields
 }
@@ -290,11 +380,26 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 type aggregateReduction struct {
 	request  AggregationRequest
 	groups   map[string]*aggregateAccumulator
-	retained int
+	retained *int // Shared across metrics: the storage cap is per query, not per function.
+	metrics  []*aggregateReduction
 }
 
 func newAggregateReduction(a AggregationRequest) *aggregateReduction {
-	r := &aggregateReduction{request: a, groups: make(map[string]*aggregateAccumulator)}
+	r := &aggregateReduction{request: a, groups: make(map[string]*aggregateAccumulator), retained: new(int)}
+	if len(a.Metrics) != 0 {
+		for _, metric := range a.Metrics {
+			one := a
+			one.Metrics = nil
+			one.Function, one.Field, one.Percentile = metric.Function, metric.Field, metric.Percentile
+			if one.Function == "" {
+				one.Function = "count"
+			}
+			child := newAggregateReduction(one)
+			child.retained = r.retained
+			r.metrics = append(r.metrics, child)
+		}
+		return r
+	}
 	if len(a.GroupBy) == 0 {
 		r.groups[""] = &aggregateAccumulator{AggregateCount: AggregateCount{Group: map[string]json.RawMessage{}}}
 	}
@@ -302,6 +407,14 @@ func newAggregateReduction(a AggregationRequest) *aggregateReduction {
 }
 
 func (r *aggregateReduction) add(fields map[string]any) error {
+	if len(r.metrics) != 0 {
+		for _, metric := range r.metrics {
+			if err := metric.add(fields); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	group := make(map[string]json.RawMessage, len(r.request.GroupBy))
 	var key strings.Builder
 	for _, field := range r.request.GroupBy {
@@ -332,17 +445,24 @@ func (r *aggregateReduction) add(fields map[string]any) error {
 			return fmt.Errorf("record missing aggregation field %q", r.request.Field)
 		}
 	}
-	return entry.add(r.request, value, &r.retained)
+	return entry.add(r.request, value, r.retained)
 }
 
 func (r *aggregateReduction) result(source string, start, end time.Time) Snapshot {
+	if len(r.metrics) != 0 {
+		result := &AggregationResult{Start: start.UTC(), End: end.UTC(), GroupBy: append([]string{}, r.request.GroupBy...), Every: r.request.Every}
+		for _, metric := range r.metrics {
+			result.Metrics = append(result.Metrics, metric.result(source, start, end).Aggregation)
+		}
+		return Snapshot{Source: source, Time: end.UTC(), Aggregation: result}
+	}
 	keys := make([]string, 0, len(r.groups))
 	for key := range r.groups {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	a := r.request
-	result := &AggregationResult{Start: start.UTC(), End: end.UTC(), GroupBy: append([]string{}, a.GroupBy...), Function: a.Function, Field: a.Field, Percentile: a.Percentile}
+	result := &AggregationResult{Start: start.UTC(), End: end.UTC(), GroupBy: append([]string{}, a.GroupBy...), Function: a.Function, Field: a.Field, Percentile: a.Percentile, Every: a.Every}
 	if a.Function == "" || a.Function == "count" {
 		result.Counts = make([]AggregateCount, 0, len(keys))
 	} else {
@@ -370,6 +490,7 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 	windowCtx, cancel := context.WithDeadline(ctx, end)
 	defer cancel()
 	reduction := newAggregateReduction(*request.Aggregation)
+	var collection *CollectionStats
 	var mu sync.Mutex
 	// Sources receive only the event selection, not the query mode.
 	selection := request
@@ -377,10 +498,17 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 	err := source(windowCtx, selection, func(event Event) error {
 		mu.Lock()
 		defer mu.Unlock()
+		if event.Collection != nil {
+			stats := *event.Collection
+			collection = &stats
+		}
+		if event.Kind == "collection_stats" {
+			return nil
+		}
 		if !time.Now().Before(end) || windowCtx.Err() != nil || !selection.matches(event) {
 			return nil
 		}
-		return reduction.add(eventGroupFields(event))
+		return reduction.add(eventGroupFields(event, request.Stacks))
 	})
 	if ctx.Err() != nil {
 		return Snapshot{}, ctx.Err()
@@ -394,5 +522,7 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 		}
 		return Snapshot{}, errors.New("event source stopped before aggregation window completed")
 	}
-	return reduction.result(request.Source, start, end), nil
+	result := reduction.result(request.Source, start, end)
+	result.Aggregation.Collection = collection
+	return result, nil
 }

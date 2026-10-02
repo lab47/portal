@@ -72,7 +72,11 @@ func readDiskFormat() (map[string]diskField, error) {
 	return nil, fmt.Errorf("read block_rq_issue tracepoint format: %w", err)
 }
 
-func diskInstructions(fields map[string]diskField, eventsFD int, filter *DiskFilter) asm.Instructions {
+func diskInstructions(fields map[string]diskField, eventsFD int, filter *DiskFilter, collections ...*collectionState) asm.Instructions {
+	var collection *collectionState
+	if len(collections) != 0 {
+		collection = collections[0]
+	}
 	insns := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1),
 		asm.LoadMem(asm.R7, asm.R6, fields["dev"].offset, asm.Word),
 	}
@@ -84,6 +88,8 @@ func diskInstructions(fields map[string]diskField, eventsFD int, filter *DiskFil
 		ops := map[string]int32{"read": 'R', "write": 'W', "discard": 'D', "flush": 'F'}
 		insns = append(insns, asm.JNE.Imm(asm.R8, ops[filter.Operation], "exit"))
 	}
+	// Capture current before R6 is reused for nr_sector below.
+	insns = appendTaskIdentity(insns, -48)
 	insns = append(insns,
 		asm.LoadMem(asm.R9, asm.R6, fields["sector"].offset, asm.DWord),
 		asm.LoadMem(asm.R6, asm.R6, fields["nr_sector"].offset, asm.Word),
@@ -95,31 +101,38 @@ func diskInstructions(fields map[string]diskField, eventsFD int, filter *DiskFil
 		asm.StoreMem(asm.RFP, -8, asm.R8, asm.Byte),
 		asm.LoadMapPtr(asm.R1, eventsFD),
 		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -24),
-		asm.Mov.Imm(asm.R3, 24),
+		asm.Add.Imm(asm.R2, -48),
+		asm.Mov.Imm(asm.R3, 48),
 		asm.Mov.Imm(asm.R4, 0),
 		asm.FnRingbufOutput.Call(),
-		asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"),
-		asm.Return(),
 	)
+	insns = appendRingLoss(insns, collection)
+	insns = append(insns, asm.Mov.Imm(asm.R0, 0).WithSymbol("exit"), asm.Return())
 	return insns
 }
 
 func decodeDiskRecord(raw []byte) (Event, error) {
-	if len(raw) != 24 {
+	if len(raw) != taskIdentitySize+24 {
 		return Event{}, errors.New("invalid eBPF disk record")
 	}
+	event := Event{Time: time.Now().UTC()}
+	decodeTaskIdentity(raw[:taskIdentitySize], &event)
+	raw = raw[taskIdentitySize:]
 	op := map[byte]string{'R': "read", 'W': "write", 'D': "discard", 'F': "flush"}[raw[16]]
 	if op == "" {
 		op = "other"
 	}
-	return Event{Time: time.Now().UTC(), Disk: &DiskEvent{
+	event.Disk = &DiskEvent{
 		Device: binary.NativeEndian.Uint32(raw[:4]), Sectors: binary.NativeEndian.Uint32(raw[4:8]),
 		Sector: binary.NativeEndian.Uint64(raw[8:16]), Operation: op,
-	}}, nil
+	}
+	return event, nil
 }
 
 func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
+	if request.Phase == "completion" {
+		return diskCompletionEvents(ctx, request, emit)
+	}
 	fields, err := readDiskFormat()
 	if err != nil {
 		return err
@@ -129,7 +142,12 @@ func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) er
 		return fmt.Errorf("create eBPF disk ring buffer: %w", err)
 	}
 	defer events.Close()
-	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_disk_issue", Type: ebpf.TracePoint, License: "GPL", Instructions: diskInstructions(fields, events.FD(), request.Disk)})
+	collection, err := newCollectionState()
+	if err != nil {
+		return err
+	}
+	defer collection.close()
+	program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "portal_disk_issue", Type: ebpf.TracePoint, License: "GPL", Instructions: diskInstructions(fields, events.FD(), request.Disk, collection)})
 	if err != nil {
 		return fmt.Errorf("load eBPF disk monitor: %w", err)
 	}
@@ -150,12 +168,22 @@ func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) er
 		record, err := reader.Read()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, ringbuf.ErrClosed) {
-				return nil
+				if err := attached.Close(); err != nil {
+					return err
+				}
+				final := Event{Kind: "collection_stats", Time: time.Now().UTC()}
+				if err := collection.report(&final); err != nil {
+					return err
+				}
+				return emit(final)
 			}
 			return err
 		}
 		event, err := decodeDiskRecord(record.RawSample)
 		if err != nil {
+			return err
+		}
+		if err := collection.report(&event); err != nil {
 			return err
 		}
 		if request.matches(event) {
