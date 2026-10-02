@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -138,4 +139,54 @@ func hasProcessTransition(events []Event, pid uint32, action string) bool {
 		}
 	}
 	return false
+}
+
+func TestProcessSnapshotMetrics(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r := MonitorRequest{Source: "process", Mode: "snapshot", PID: uint32(os.Getpid())}
+	snapshot, err := processSnapshot(ctx, r)
+	if err != nil || len(snapshot.Processes) != 1 || snapshot.Processes[0].PID != r.PID {
+		t.Fatalf("current process snapshot: %+v, %v", snapshot.Processes, err)
+	}
+	info := snapshot.Processes[0]
+	if runtime.GOOS == "linux" {
+		if info.CPUSeconds == nil || *info.CPUSeconds < 0 || info.RSSBytes == nil || *info.RSSBytes == 0 || info.VMSBytes == nil || *info.VMSBytes < *info.RSSBytes ||
+			info.Threads == nil || *info.Threads <= 0 || info.User == "" || info.State == "" || !strings.Contains(info.CommandLine, os.Args[0]) {
+			t.Fatalf("current process is missing supported metrics: %+v", info)
+		}
+	}
+	r.Process = &ProcessFilter{Name: "no-such-portal-process"}
+	filtered, err := processSnapshot(ctx, r)
+	if err != nil || len(filtered.Processes) != 0 {
+		t.Fatalf("metric collection lost name filter: %+v, %v", filtered.Processes, err)
+	}
+	cancel()
+	if _, err := processSnapshot(ctx, r); err != context.Canceled {
+		t.Fatalf("canceled process snapshot: %v", err)
+	}
+}
+
+func TestProcessMetricsJSON(t *testing.T) {
+	var seconds float64
+	var rss uint64
+	var threads int32
+	data, err := json.Marshal(ProcessInfo{CPUSeconds: &seconds, RSSBytes: &rss, Threads: &threads})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"cpu_seconds", "rss_bytes", "threads"} {
+		if string(fields[name]) != "0" {
+			t.Fatalf("available zero %s was omitted: %s", name, data)
+		}
+	}
+	for _, name := range []string{"vms_bytes", "user", "state", "command_line"} {
+		if _, ok := fields[name]; ok {
+			t.Fatalf("unavailable %s was fabricated: %s", name, data)
+		}
+	}
 }

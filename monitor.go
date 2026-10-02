@@ -118,9 +118,16 @@ type ProcessEvent struct {
 
 // ProcessInfo is a process visible to the server at snapshot time.
 type ProcessInfo struct {
-	PID     uint32    `json:"pid"`
-	Name    string    `json:"name"`
-	Started time.Time `json:"started"`
+	PID         uint32    `json:"pid"`
+	Name        string    `json:"name"`
+	Started     time.Time `json:"started"`
+	CPUSeconds  *float64  `json:"cpu_seconds,omitempty"` // Cumulative user + system CPU time, excluding children.
+	RSSBytes    *uint64   `json:"rss_bytes,omitempty"`
+	VMSBytes    *uint64   `json:"vms_bytes,omitempty"`
+	User        string    `json:"user,omitempty"`
+	State       string    `json:"state,omitempty"`
+	Threads     *int32    `json:"threads,omitempty"`
+	CommandLine string    `json:"command_line,omitempty"`
 }
 
 // Snapshot is a one-shot view, not a stream of lifecycle events.

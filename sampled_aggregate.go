@@ -76,10 +76,14 @@ func snapshotSampleFields(source string) []SampleField {
 			}
 		case source == "kernel" && field.Path == "counters.context_switches":
 			kind, field.Unit = "counter", "switches"
-		case source == "process" || source == "gpu" && field.Path == "index" || source == "network" && field.Path == "index":
+		case source == "process" && field.Path == "cpu_seconds":
+			kind, field.Unit = "counter", "seconds"
+		case source == "process" && field.Path == "pid" || source == "gpu" && field.Path == "index" || source == "network" && field.Path == "index":
 			kind = "identity"
-		case source == "memory" || field.Path == "mtu":
+		case source == "memory" || field.Path == "mtu" || strings.HasSuffix(field.Path, "_bytes"):
 			field.Unit = "bytes"
+		case source == "process" && field.Path == "threads":
+			field.Unit = "threads"
 		case strings.HasSuffix(field.Path, "_celsius"):
 			field.Unit = "degrees Celsius"
 		case strings.HasSuffix(field.Path, "_percent"):
@@ -99,6 +103,9 @@ func snapshotSampleFields(source string) []SampleField {
 	}
 	if source == "cpu" {
 		fields = append(fields, SampleField{FieldCapability{Path: "utilization_percent", QueryField: "utilization_percent", Type: "number", Optional: true, Unit: "percent", Description: "100 × (delta total − delta idle − delta iowait) / delta total per CPU; needs consecutive observations."}, "utilization"})
+	}
+	if source == "process" {
+		fields = append(fields, SampleField{FieldCapability{Path: "cpu_percent", QueryField: "cpu_percent", Type: "number", Optional: true, Unit: "percent", Description: "100 × delta process user + system CPU seconds / elapsed seconds; 100% is one fully occupied core, may exceed 100%. Excludes child processes and needs consecutive observations of the same PID/start time."}, "utilization"})
 	}
 	return fields
 }
@@ -190,7 +197,11 @@ func deriveSample(fields map[string]any, previous sampleObservation, at time.Tim
 		delta := new(big.Rat).Sub(current, before)
 		deltas[field.Path] = delta
 		seconds := new(big.Rat).SetFrac(big.NewInt(int64(at.Sub(previous.time))), big.NewInt(int64(time.Second)))
-		fields[field.Path+"_per_second"] = json.Number(new(big.Rat).Quo(delta, seconds).FloatString(18))
+		rate := new(big.Rat).Quo(delta, seconds)
+		fields[field.Path+"_per_second"] = json.Number(rate.FloatString(18))
+		if field.Path == "cpu_seconds" {
+			fields["cpu_percent"] = json.Number(rate.Mul(rate, big.NewRat(100, 1)).FloatString(18))
+		}
 	}
 	total, idle, iowait := deltas["total"], deltas["idle"], deltas["iowait"]
 	if total != nil && idle != nil && iowait != nil && total.Sign() > 0 {

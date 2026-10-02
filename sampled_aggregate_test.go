@@ -20,6 +20,9 @@ func TestSampledQueryValidationAndProof(t *testing.T) {
 		"kernel max(counters.processes_running) over 10s every 1s",
 		"containers count_distinct(id) over 10s every 1s",
 		"process where name = worker* count over 10s every 1s by name",
+		"process avg(cpu_percent) over 5s every 1s by pid,name",
+		"process max(rss_bytes) over 5s every 1s by pid,name",
+		"process avg(threads) over 5s every 1s by user,state",
 	} {
 		r, err := ParseMonitorQuery(query)
 		if err != nil || !sampledAggregation(r) {
@@ -33,6 +36,8 @@ func TestSampledQueryValidationAndProof(t *testing.T) {
 		"cpu avg(user) over 30s", "network sum(bytes_sent) over 30s",
 		"cpu avg(utilization_percent) over 1s every 1s", "process where action = start count over 1s every 100ms",
 		"cpu count over 1s every 1s by utilization_percent",
+		"process avg(cpu_seconds) over 5s every 1s", "process avg(cpu_percent) over 5s",
+		"process avg(cpu_percent) over 1s every 1s", "process sum(pid) over 5s every 1s",
 		"process count_distinct(action) over 1s every 100ms", "packets count over 1s every 100ms",
 		"syscalls count over 1s every 100ms", "capabilities count over 1s every 100ms",
 	} {
@@ -145,6 +150,48 @@ func TestSampledCPUUtilization(t *testing.T) {
 			t.Fatalf("incorrect utilization or CPU identity: %+v", values)
 		}
 	})
+}
+
+func TestSampledProcessMetrics(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cpu := []float64{10, 100, 11.5, 100.25, 50, 100.75, 52, 101.5}
+		rss := []uint64{100, 1000, 300, 500, 200, 2000, 400, 1000}
+		var snapshots []Snapshot
+		for i := 0; i < 4; i++ {
+			started := time.Unix(1, 0)
+			if i >= 2 {
+				started = time.Unix(2, 0) // Reused PID with a larger counter must still start a new baseline.
+			}
+			snapshots = append(snapshots, Snapshot{Processes: []ProcessInfo{
+				{PID: 71, Name: "worker", Started: started, CPUSeconds: &cpu[2*i], RSSBytes: &rss[2*i]},
+				{PID: 72, Name: "worker", Started: time.Unix(1, 0), CPUSeconds: &cpu[2*i+1], RSSBytes: &rss[2*i+1]},
+			}})
+		}
+		for _, tc := range []struct{ metric, first, second string }{
+			{"avg(cpu_percent)", "175.000000000000000000", "50.000000000000000000"},
+			{"avg(rss_bytes)", "250.000000000000000000", "1125.000000000000000000"},
+		} {
+			got := sampledFixture(t, "process "+tc.metric+" over 4s every 1s by pid,name", snapshots)
+			values := got.Aggregation.Values
+			if len(values) != 2 || string(values[0].Group["pid"]) != "71" || string(values[0].Value) != tc.first || string(values[1].Value) != tc.second {
+				t.Fatalf("%s lost scale, PID identity, or precision: %+v", tc.metric, values)
+			}
+		}
+		missing := sampledFixture(t, "process avg(cpu_percent) over 3s every 1s", []Snapshot{
+			{Processes: []ProcessInfo{{PID: 71, Started: time.Unix(1, 0), CPUSeconds: &cpu[0]}}},
+			{Processes: []ProcessInfo{{PID: 71, Started: time.Unix(1, 0)}}},
+			{Processes: []ProcessInfo{{PID: 71, Started: time.Unix(1, 0), CPUSeconds: &cpu[2]}}},
+		})
+		if string(missing.Aggregation.Values[0].Value) != "null" {
+			t.Fatal("missing CPU counter must restart the baseline, not fabricate a measurement")
+		}
+	})
+	at := time.Now()
+	fields := map[string]any{"cpu_seconds": json.Number("13")}
+	deriveSample(fields, sampleObservation{map[string]any{"cpu_seconds": json.Number("10")}, at}, at.Add(2*time.Second), snapshotSampleFields("process"))
+	if fields["cpu_percent"] != json.Number("150.000000000000000000") {
+		t.Fatal("process CPU did not use actual elapsed time or was clamped to 100%")
+	}
 }
 
 func TestCounterRatesAndLifecycles(t *testing.T) {

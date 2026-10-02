@@ -166,7 +166,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 	selected.Operators = []string{"in"}
 	sources := []SourceCapability{
 		{Name: "syscalls", Description: "Linux eBPF syscall entry attempts, not completions. Non-root servers expose only their account; root servers expose all accounts.", Modes: events, Requirements: []string{"Linux eBPF raw tracepoint and ring buffer permissions"}, Fields: []FieldCapability{{Path: "pid", Type: "integer"}, {Path: "tid", Type: "integer"}, {Path: "syscall", Type: "integer"}}, Filters: []FilterCapability{filter("pid", "integer", "Process/thread-group ID, 1–4294967295.", events), syscall}, Examples: []string{"syscalls count over 30s by pid"}},
-		{Name: "process", Description: "Process snapshots and lifecycle changes polled once per second. Short-lived processes may be missed. Non-root servers see their own account; root sees all accounts on Unix. Windows is restricted to the server account.", Modes: processModes, Fields: append(outputFields(ProcessEvent{}, "process"), append(outputFields(ProcessInfo{}, "processes[]"), FieldCapability{Path: "pid", Type: "integer"})...), Filters: []FilterCapability{pidFilter, nameFilter(processModes), filter("action", "string", "Lifecycle action; not valid in snapshots.", events, "start", "exit")}, Examples: []string{"process where name = worker*", "process where action = start count over 1m by name"}},
+		{Name: "process", Description: "Process snapshots with best-effort resource metrics, plus lifecycle changes polled once per second. Short-lived processes may be missed. Non-root servers see their own account; root sees all accounts on Unix. Windows is restricted to the server account.", Modes: processModes, Fields: append(outputFields(ProcessEvent{}, "process"), append(outputFields(ProcessInfo{}, "processes[]"), FieldCapability{Path: "pid", Type: "integer"})...), Filters: []FilterCapability{pidFilter, nameFilter(processModes), filter("action", "string", "Lifecycle action; not valid in snapshots.", events, "start", "exit")}, Examples: []string{"process where name = worker*", "process where action = start count over 1m by name"}},
 		{Name: "packets", Description: "Linux eBPF AF_PACKET capture of TCP/UDP over IPv4/IPv6, with up to two VLAN tags. No TCP reassembly. Packet length is Ethernet/VLAN plus the declared IP packet size, excluding trailing padding/FCS; raw data is capped at 2048 bytes. Retransmissions and observations on multiple interfaces count separately.", Modes: events, Requirements: []string{"root server and explicit root policy authorization (also permits root commands)", "Linux eBPF socket-filter permissions and CAP_NET_RAW"}, Fields: outputFields(PacketEvent{}, "packet"), Filters: []FilterCapability{filter("protocol", "string", "Required when filtering ports.", events, "tcp", "udp"), filter("direction", "string", "Relative to the capture interface.", events, "incoming", "outgoing"), filter("src.ip", "IP address", "Exact IPv4 or IPv6 address; no CIDR.", events), filter("dst.ip", "IP address", "Exact IPv4 or IPv6 address; no CIDR.", events), filter("src.port", "integer", "Source port, 1–65535; requires protocol.", events), filter("dst.port", "integer", "Destination port, 1–65535; requires protocol.", events)}, Examples: []string{"packets where protocol = tcp and dst.port = 80 sum(length) over 30s by src.ip, dst.ip"}},
 		{Name: "disk", Description: "Linux block:block_rq_issue requests, not completions. No filesystem path or application PID. Sector values use 512-byte units.", Modes: events, Requirements: []string{"root server and explicit root policy authorization (also permits root commands)", "Linux eBPF tracepoint permissions and readable block:block_rq_issue format"}, Fields: outputFields(DiskEvent{}, "disk"), Filters: []FilterCapability{filter("device", "integer", "Nonzero kernel device ID, decimal or 0x hex, up to 4294967295.", events), filter("operation", "string", "Request operation; output may also contain other.", events, "read", "write", "discard", "flush")}, Examples: []string{"disk where operation = write percentile(sectors, 95) over 1m by device"}},
 		{Name: "tracepoint", Description: "Selected integer fields from a named Linux tracepoint. Pointer, array, bitfield and dynamic fields are rejected. field.NAME refers to a selected field for filters, grouping and aggregation. No arbitrary eBPF programs are accepted.", Modes: events, Requirements: []string{"root server and explicit root policy authorization (also permits root commands)", "Linux eBPF tracepoint/ring buffer permissions and readable kernel tracefs format"}, Fields: outputFields(TracepointEvent{}, "tracepoint"), Filters: []FilterCapability{filter("event", "string", "Required category:name tracepoint identifier.", events), selected, filter("field.NAME", "integer", "Equality on a selected field; signed decimal or unsigned decimal/0x hex, up to 64 bits. Applied after eBPF capture.", events)}, GroupByFields: []string{"field.NAME"}, NumericFields: []string{"field.NAME"}, Examples: []string{"tracepoint where event = sched:sched_wakeup and fields in (common_pid, target_cpu) count over 30s by field.target_cpu"}},
@@ -198,6 +198,8 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				s.Examples = append(s.Examples, "sensors max(temperature_celsius) over 30s every 1s by name")
 			case "gpu":
 				s.Examples = append(s.Examples, "gpu avg(utilization_percent) over 30s every 1s by uuid")
+			case "process":
+				s.Examples = append(s.Examples, "process avg(cpu_percent) over 5s every 1s by pid,name", "process max(rss_bytes) over 5s every 1s by pid,name")
 			}
 		}
 		s.PlatformSupported = true
@@ -252,12 +254,16 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				f.QueryField = alias
 			}
 			switch {
-			case s.Name == "memory" || strings.HasSuffix(f.Path, "bytes_sent") || strings.HasSuffix(f.Path, "bytes_recv") || f.Path == "packet.length":
+			case s.Name == "memory" || strings.HasSuffix(f.Path, "bytes_sent") || strings.HasSuffix(f.Path, "bytes_recv") || strings.HasSuffix(f.Path, "_bytes") || f.Path == "packet.length":
 				f.Unit = "bytes"
 			case f.Path == "disk.sector" || f.Path == "disk.sectors":
 				f.Unit = "512-byte sectors"
-			case s.Name == "cpu" && !strings.HasSuffix(f.Path, ".name") || f.Path == "kernel.uptime_seconds":
+			case s.Name == "cpu" && !strings.HasSuffix(f.Path, ".name") || f.Path == "kernel.uptime_seconds" || f.Path == "processes[].cpu_seconds":
 				f.Unit = "seconds"
+			case f.Path == "processes[].threads":
+				f.Unit = "threads"
+			case f.Path == "processes[].command_line":
+				f.Description = "Best-effort command line; may contain secrets. Process metrics require the existing process-source authorization."
 			case strings.HasSuffix(f.Path, "_celsius"):
 				f.Unit = "degrees Celsius"
 			case strings.HasSuffix(f.Path, "_percent"):
@@ -281,6 +287,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			"Sources with sampling metadata support sampled snapshot aggregates. every defaults to 1s for snapshot-only sources; process requires explicit every to select snapshots instead of lifecycle events. Sampling fields are record-relative paths, not event field aliases.",
 			"Samples are collected immediately and on the interval grid before the window ends; slow reads skip ticks without overlap. count counts observed records. avg is an arithmetic sample mean, not time-weighted; sum of a gauge is a sum of observations, not an integral. Missing optional metrics are skipped, not zero.",
 			"Raw counters cannot be summed/averaged/minimized/maximized/percentiled. Use FIELD_per_second for rates, or CPU utilization_percent. Derived values require consecutive observations, so the first observation is only a baseline. Resets, disappearing/reappearing entities, and missing fields start a new baseline; no zero is fabricated. A derived query needs a window longer than its interval.",
+			"Process snapshots include best-effort CPU seconds, RSS/virtual memory bytes, user, state, threads and command line. Unavailable values are omitted. Sampled process cpu_percent is 100 × delta cpu_seconds / elapsed seconds, excluding children: 100% is one busy core and multithreaded processes may exceed 100%. PID/start time identifies observations so PID reuse restarts the baseline.",
 			"Group/numeric field names are DSL aliases: src.ip/dst.ip map to packet.source_ip/destination_ip; src.port/dst.port map to packet.source_port/destination_port; name/action map to process.name/action; field.NAME maps to tracepoint.fields.NAME.",
 			"Event time is UTC receipt time. tai64n is the resumable registered-monitor cursor. Registered monitors survive disconnects, not server restarts; bounded storage can overwrite old events. Reads reset the idle TTL.",
 		},

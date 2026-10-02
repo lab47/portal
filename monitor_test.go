@@ -231,6 +231,8 @@ func TestMonitorStream(t *testing.T) {
 	}{
 		{"memory avg(total) over 1s", time.Second},
 		{fmt.Sprintf("process where pid = %d count_distinct(pid) over 300ms every 100ms", os.Getpid()), 100 * time.Millisecond},
+		{fmt.Sprintf("process where pid = %d avg(rss_bytes) over 300ms every 100ms", os.Getpid()), 100 * time.Millisecond},
+		{fmt.Sprintf("process where pid = %d avg(cpu_percent) over 500ms every 100ms", os.Getpid()), 100 * time.Millisecond},
 	} {
 		request, err := ParseMonitorQuery(tc.query)
 		if err != nil {
@@ -241,10 +243,10 @@ func TestMonitorStream(t *testing.T) {
 			t.Fatalf("remote sampled query %s: %+v, %v", tc.query, got.Aggregation, err)
 		}
 		var value float64
-		if err := json.Unmarshal(got.Aggregation.Values[0].Value, &value); err != nil || value <= 0 {
+		if err := json.Unmarshal(got.Aggregation.Values[0].Value, &value); err != nil || string(got.Aggregation.Values[0].Value) == "null" || value < 0 || value == 0 && request.Aggregation.Field != "cpu_percent" {
 			t.Fatalf("missing sampled value: %s, %v", got.Aggregation.Values[0].Value, err)
 		}
-		if request.Source == "process" && value != 1 {
+		if request.Aggregation.Function == "count_distinct" && value != 1 {
 			t.Fatalf("sampled process query lost PID filter: %s", got.Aggregation.Values[0].Value)
 		}
 	}

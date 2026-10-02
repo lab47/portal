@@ -103,9 +103,47 @@ func processSnapshot(ctx context.Context, request MonitorRequest) (Snapshot, err
 		if request.Process != nil && !processNameMatches(request.Process.Name, state.name) {
 			continue
 		}
-		snapshot.Processes = append(snapshot.Processes, ProcessInfo{
+		if ctx.Err() != nil {
+			return Snapshot{}, ctx.Err()
+		}
+		p, err := process.NewProcessWithContext(ctx, int32(pid))
+		if err != nil {
+			continue
+		}
+		info := ProcessInfo{
 			PID: pid, Name: state.name, Started: time.UnixMilli(state.started).UTC(),
-		})
+		}
+		// Metrics are best-effort: unsupported or inaccessible values are
+		// omitted rather than hiding the process or fabricating zeros.
+		if times, err := p.TimesWithContext(ctx); err == nil {
+			seconds := times.User + times.System
+			info.CPUSeconds = &seconds
+		}
+		if memory, err := p.MemoryInfoWithContext(ctx); err == nil {
+			info.RSSBytes, info.VMSBytes = &memory.RSS, &memory.VMS
+		}
+		info.User, _ = p.UsernameWithContext(ctx)
+		if states, err := p.StatusWithContext(ctx); err == nil {
+			info.State = strings.Join(states, ",")
+		}
+		if threads, err := p.NumThreadsWithContext(ctx); err == nil {
+			info.Threads = &threads
+		}
+		info.CommandLine, _ = p.CmdlineWithContext(ctx)
+		// Use a fresh handle to avoid a cached start time. If the PID was
+		// reused while collecting metrics, discard the mixed observation.
+		check, err := process.NewProcessWithContext(ctx, int32(pid))
+		if err != nil {
+			continue
+		}
+		started, err := check.CreateTimeWithContext(ctx)
+		if err != nil || started != state.started {
+			continue
+		}
+		snapshot.Processes = append(snapshot.Processes, info)
+	}
+	if ctx.Err() != nil {
+		return Snapshot{}, ctx.Err()
 	}
 	sort.Slice(snapshot.Processes, func(i, j int) bool { return snapshot.Processes[i].PID < snapshot.Processes[j].PID })
 	return snapshot, nil

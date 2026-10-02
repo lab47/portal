@@ -306,6 +306,38 @@ Snapshot-only sources default to `every 1s`. **Process requires explicit `every`
 
 Rates use actual elapsed collection time and consecutive observations of the same entity. The first observation establishes a baseline; counter resets, missing fields, and disappearing/reappearing entities restart it. Derived queries require a window longer than the interval. Missing optional metrics and unavailable derived values are skipped, **not treated as zero**. `avg` is an arithmetic mean of observed values, not a time-weighted mean; `sum` of a gauge sums observations, not elapsed-time usage. `count` counts observed records, not unique entities or average population. Source permissions and platform/hardware requirements are unchanged.
 
+### Process resource usage
+
+`process` snapshots include `pid`, `name`, `started`, and best-effort resource/display fields:
+
+| Field | Meaning |
+| --- | --- |
+| `cpu_seconds` | Cumulative user + system CPU seconds, excluding child processes |
+| `rss_bytes` | Resident memory in bytes |
+| `vms_bytes` | Virtual memory in bytes; platform accounting differs |
+| `user` | Owning account name |
+| `state` | Platform-reported process states, joined with commas |
+| `threads` | Current thread count |
+| `command_line` | Command line; may contain secrets |
+
+Unsupported, inaccessible, or unavailable values are omitted, not reported as zero. The existing process visibility and policy rules still apply. Lifecycle events remain lightweight start/exit notifications; they do not include these metrics.
+
+With explicit `every`, process aggregates also expose `cpu_seconds_per_second` and **`cpu_percent`**. Process CPU follows `top`'s convention: 100% means one fully occupied core, so multithreaded processes can exceed 100%. It is 100 × delta `cpu_seconds` / actual elapsed seconds, not lifetime CPU divided by process age. It is available only after consecutive samples of the same PID and start time; PID reuse starts a new baseline. A one-shot snapshot returns the CPU counter, not a fabricated instantaneous percentage.
+
+```sh
+# Top ten processes by sampled CPU usage during a fresh five-second window.
+portal query --name node-a --query 'process avg(cpu_percent) over 5s every 1s by pid,name' |
+  jq -r '.aggregation.values | map(select(.value != null)) | sort_by(.value) | reverse | .[:10][] | [.group.pid, .group.name, .value] | @tsv'
+
+# Peak resident memory by process during the window, in bytes.
+portal query --name node-a --query 'process max(rss_bytes) over 5s every 1s by pid,name'
+
+# Current process details; no aggregation window.
+portal query --name node-a --query 'process where name = worker*'
+```
+
+Sorting and limiting are client-side; the DSL does not implement `order by` or `limit`, and the CLI does not yet provide an interactive `top` screen. To keep separate results for different lifetimes of a reused PID, add `started` to `by pid,name,started`.
+
 ## Local walkthrough
 
 In a temporary directory, generate a CA and client key, then sign a one-hour user certificate with the `admin` principal:
