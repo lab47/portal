@@ -3,9 +3,12 @@
 package portal
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -34,6 +37,84 @@ func TestEventProcessNameEnrichment(t *testing.T) {
 	fields := eventGroupFields(Event{Name: "original"}, nil)
 	if fields["name_group"] != "original" {
 		t.Fatal("unenriched event lost its task-name grouping")
+	}
+}
+
+func TestUnifiedCgroupMembership(t *testing.T) {
+	for _, tc := range []struct{ data, want string }{
+		{"3:cpu:/wrong\n0::/apps/pg:writer\n", "/apps/pg:writer"},
+		{"0::/\n", "/"}, {"3:cpu:/only-v1\n", ""}, {"0::relative\n", ""},
+	} {
+		if got := unifiedCgroupPath([]byte(tc.data)); got != tc.want {
+			t.Fatalf("%q: %q", tc.data, got)
+		}
+	}
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 && parts[0] == "0" && parts[1] == "" {
+			want = parts[2]
+		}
+	}
+	if want == "" {
+		t.Skip("requires unified cgroup membership")
+	}
+	var got Event
+	emit := enrichEventNames(func(e Event) error { got = e; return nil })
+	if err := emit(Event{PID: uint32(os.Getpid()), TID: uint32(unix.Gettid())}); err != nil || got.CgroupPath != want {
+		t.Fatalf("membership: %+v, %v; want %s", got, err, want)
+	}
+	if err := emit(Event{PID: uint32(os.Getpid()), TID: ^uint32(0)}); err != nil || got.CgroupPath != "" {
+		t.Fatalf("missing thread inherited process membership: %+v, %v", got, err)
+	}
+}
+
+func TestEnrichedEventFiltersLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root eBPF")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, done := make(chan Event, 1), make(chan error, 1)
+	go func() {
+		done <- monitorEvents(ctx, MonitorRequest{Source: "syscalls", PID: uint32(os.Getpid()), Syscalls: []int{unix.SYS_GETPID}, EventFilters: map[string]string{"process_name": filepath.Base(exe)}}, func(e Event) error {
+			if e.Kind != "collection_stats" {
+				select {
+				case got <- e:
+				default:
+				}
+			}
+			return nil
+		})
+	}()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			unix.Getpid()
+		case e := <-got:
+			if e.ProcessName != filepath.Base(exe) || e.CgroupPath == "" || e.PID != uint32(os.Getpid()) {
+				t.Fatalf("missing enriched identity: %+v", e)
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			return
+		case err := <-done:
+			t.Fatalf("collector stopped: %v", err)
+		case <-ctx.Done():
+			t.Fatal("enriched filter discarded every event")
+		}
 	}
 }
 

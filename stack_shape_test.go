@@ -59,6 +59,8 @@ func TestStackShapeQueriesAndProof(t *testing.T) {
 		"syscalls where stacks = user and user.stack.offsets = false and user.stack.until = logstorage.* and user.stack.top = 8 count over 1s by user.stack",
 		"syscalls where kernel.stack.drop_bottom = 3 and stack.depth = 64 and stacks = both count over 1s by kernel.stack",
 		"syscalls where stacks = both and kernel.stack.from = submit_bio* and user.stack.drop_top = 5 count over 1s by kernel.stack",
+		`syscalls where stacks = user and user.stack.from = "os.(*File).Sync" count over 1s by user.stack`,
+		`syscalls where stacks = user and user.stack.from in ("os.(*File).Sync", '*Fdatasync') count over 1s by user.stack`,
 	} {
 		r, err := ParseMonitorQuery(text)
 		if err != nil {
@@ -76,8 +78,8 @@ func TestStackShapeQueriesAndProof(t *testing.T) {
 		"syscalls where stacks = both and user.stack.top = 65 count over 1s",
 		"syscalls where stacks = both and kernel.stack.drop_bottom = nope count over 1s",
 		"syscalls where stacks = both and user.stack.until = '*' count over 1s",
-		"syscalls where stacks = both and user.stack.until = a*b count over 1s",
-		"syscalls where stacks = both and user.stack.from = a*b count over 1s",
+		"syscalls where stacks = both and user.stack.until = '*foo*' count over 1s",
+		"syscalls where stacks = both and user.stack.from in (ok, '') count over 1s",
 		"syscalls where stacks = both and user.stack.drop_top = 65 count over 1s",
 		"syscalls where stacks = both and user.stack.until = '' count over 1s",
 		"syscalls where stacks = both and user.stack.offsets = nope count over 1s",

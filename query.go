@@ -41,7 +41,7 @@ func newMonitorQueryGrammar() p.Rule {
 	keyword := func(s string) p.Rule {
 		return token(p.Seq(p.Re("(?i:"+s+")"), p.Not(bare)))
 	}
-	quoted := p.Re(`"(?:[^"\\]|\\["\\])*"|'(?:[^'\\]|\\['\\])*'`)
+	quoted := p.Re(`(?:"(?:[^"\\]|\\["\\])*"|'(?:[^'\\]|\\['\\])*')`)
 	value := token(p.Transform(p.Or(quoted, bare), func(text string) any {
 		if len(text) == 0 || (text[0] != '\'' && text[0] != '"') {
 			return text
@@ -200,6 +200,17 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 		}
 		seen[condition.field] = true
 		if condition.op == "in" {
+			if condition.field == "user.stack.from" || condition.field == "kernel.stack.from" {
+				if err := setQueryFilter(&r, condition.field, condition.values[0]); err != nil {
+					return MonitorRequest{}, err
+				}
+				shape := r.Stacks.UserShape
+				if condition.field == "kernel.stack.from" {
+					shape = r.Stacks.KernelShape
+				}
+				shape.From, shape.FromPatterns = "", condition.values
+				continue
+			}
 			if r.Source == "symbols" && condition.field == "addresses" {
 				for _, text := range condition.values {
 					address, err := parseTracepointNumber(text)
@@ -231,6 +242,9 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 			return MonitorRequest{}, err
 		}
 	}
+	if seen["file.depth"] && !r.Paths {
+		return MonitorRequest{}, errors.New("file.depth requires paths=true")
+	}
 	if err := r.validate(); err != nil {
 		return MonitorRequest{}, err
 	}
@@ -238,6 +252,26 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 }
 
 func setQueryFilter(r *MonitorRequest, field, value string) error {
+	if r.Source == "syscalls" || r.Source == "disk" || r.Source == "tracepoint" {
+		switch field {
+		case "name", "process_name", "name_group", "cgroup.path", "device_name", "rwbs":
+			if r.EventFilters == nil {
+				r.EventFilters = make(map[string]string)
+			}
+			r.EventFilters[field] = value
+			return nil
+		case "file.depth":
+			if r.Source != "syscalls" || r.Aggregation == nil {
+				return errors.New("file.depth requires syscall path aggregation")
+			}
+			n, err := strconv.Atoi(value)
+			if err != nil {
+				return errors.New("file.depth must be an integer")
+			}
+			r.FileDepth = n
+			return nil
+		}
+	}
 	if strings.HasPrefix(field, "result.") {
 		if r.Aggregation == nil {
 			return errors.New("result options require aggregate mode")

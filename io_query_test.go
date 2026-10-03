@@ -1,8 +1,13 @@
 package portal
 
 import (
+	"context"
+	"encoding/json"
+	"reflect"
 	"slices"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -42,5 +47,117 @@ func TestIOQueryFields(t *testing.T) {
 		if s.Name == "syscalls" && !slices.Contains(s.GroupByFields, "file.path") {
 			t.Fatal("paths undiscoverable")
 		}
+	}
+}
+
+func TestEventStringFilters(t *testing.T) {
+	query := "disk where device_name = nvme0n1 and name = worker* and name_group = worker and process_name = writer and rwbs = *SM and cgroup.path = /apps/pg*"
+	r, err := ParseMonitorQuery(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := Event{Name: "worker-1", NameGroup: "worker", ProcessName: "writer", CgroupPath: "/apps/pg-17", Disk: &DiskEvent{DeviceName: "nvme0n1", RWBS: "WSM"}}
+	if !r.matches(e) {
+		t.Fatal("all matching filters rejected")
+	}
+	for field := range r.EventFilters {
+		wrong := r
+		wrong.EventFilters = map[string]string{field: "absent"}
+		if wrong.matches(e) {
+			t.Fatalf("ignored filter %s", field)
+		}
+	}
+	if r.matches(Event{Disk: &DiskEvent{}}) || !r.matches(Event{Kind: "collection_stats"}) {
+		t.Fatal("missing metadata matched or diagnostics discarded")
+	}
+	for _, query := range []string{
+		"syscalls where process_name = writer*", "syscalls where name = worker", "tracepoint where event = sched:sched_switch and fields in (prev_pid) and name_group = kworker",
+		"syscalls where paths = true and file.depth = 3 count over 1s by file.dir, cgroup.path",
+	} {
+		if _, err := ParseMonitorQuery(query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	for _, query := range []string{
+		"syscalls where device_name = disk", "tracepoint where event = sched:sched_switch and fields in (prev_pid) and rwbs = W",
+		"disk where process_name = ''", "disk where name = '*worker*'", "disk where file.depth = 0 count over 1s",
+		"syscalls where file.depth = 3 count over 1s", "syscalls where file.depth = 0 count over 1s", "syscalls where paths = true and file.depth = 33 count over 1s",
+	} {
+		if _, err := ParseMonitorQuery(query); err == nil {
+			t.Fatalf("accepted %s", query)
+		}
+	}
+	ca, signer := testSigner(t), testSigner(t)
+	cert := testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(time.Hour))
+	proof, err := signMonitor(signer, cert, []byte("nonce"), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyMonitor(ca.PublicKey(), "admin", []byte("nonce"), proof); err != nil {
+		t.Fatal(err)
+	}
+	proof.EventFilters["name"] = "other"
+	if _, err := verifyMonitor(ca.PublicKey(), "admin", []byte("nonce"), proof); err == nil {
+		t.Fatal("event filters not signed")
+	}
+}
+
+func TestDirectoryAggregationDepth(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		events := []Event{
+			{File: &SyscallFile{Path: "/var/lib/datadb/part-1/bloom"}},
+			{File: &SyscallFile{Path: "/var/lib/datadb/part-2/index"}},
+			{File: &SyscallFile{Path: "/var/lib/other/part-3/index"}},
+			{File: &SyscallFile{Error: "closed"}},
+		}
+		for _, depth := range []int{0, 3, 32} {
+			r := MonitorRequest{Source: "syscalls", Mode: "aggregate", Paths: true, FileDepth: depth, Aggregation: &AggregationRequest{Window: time.Second, GroupBy: []string{"file.dir"}}}
+			got, err := aggregateEvents(context.Background(), r, func(ctx context.Context, _ MonitorRequest, emit func(Event) error) error {
+				for _, e := range events {
+					if err := emit(e); err != nil {
+						return err
+					}
+				}
+				<-ctx.Done()
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			counts := map[string]uint64{}
+			for _, row := range got.Aggregation.Counts {
+				counts[string(row.Group["file.dir"])] = row.Count
+			}
+			want := map[string]uint64{`"/var/lib/datadb/part-1"`: 1, `"/var/lib/datadb/part-2"`: 1, `"/var/lib/other/part-3"`: 1, "null": 1}
+			if depth == 3 {
+				want = map[string]uint64{`"/var/lib/datadb"`: 2, `"/var/lib/other"`: 1, "null": 1}
+			}
+			if !reflect.DeepEqual(counts, want) {
+				t.Fatalf("depth=%d: %v, want %v", depth, counts, want)
+			}
+		}
+		data, err := json.Marshal(events)
+		if err != nil || events[0].File.Path != "/var/lib/datadb/part-1/bloom" {
+			t.Fatalf("projection altered events: %s, %v", data, err)
+		}
+	})
+}
+
+func TestLiteralAndMultipleStackAnchors(t *testing.T) {
+	r, err := ParseMonitorQuery(`syscalls where stacks = user and user.stack.offsets = false and user.stack.from in ("os.(*File).Sync", '*Fdatasync') count over 1s by user.stack`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := []SymbolFrame{{Module: "m", Name: "runtime.wrapper"}, {Module: "m", Name: "unix.Fdatasync"}, {Module: "m", Name: "os.(*File).Sync"}, {Module: "m", Name: "caller"}}
+	if got := (CapturedStack{Frames: frames}).key(r.Stacks.UserShape); got != "m:unix.Fdatasync;m:os.(*File).Sync;m:caller" {
+		t.Fatalf("pattern order won over first frame: %s", got)
+	}
+	shape := &StackShape{From: "os.(*File).Sync", DropOffsets: true}
+	if got := (CapturedStack{Frames: frames}).key(shape); got != "m:os.(*File).Sync;m:caller" {
+		t.Fatalf("literal pointer receiver not matched: %s", got)
+	}
+	frames[2].Name = "os.(xFile).Sync"
+	if got := (CapturedStack{Frames: frames}).key(shape); got != "m:runtime.wrapper;m:unix.Fdatasync;m:os.(xFile).Sync;m:caller" {
+		t.Fatalf("interior star treated as wildcard: %s", got)
 	}
 }

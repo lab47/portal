@@ -235,14 +235,21 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			s.Filters = append(s.Filters, filter("phase", "string", "entry is the default; completion emits only paired exits. duration_ns/return_value require completion. Completion needs readable raw_syscalls:sys_exit format and sched_process_exit.", events, "entry", "completion"))
 			s.Filters = append(s.Filters, filter("paths", "boolean", "Opt-in kernel FD path capture at syscall entry for fsync/fdatasync, read/write, vectored/positional variants, ftruncate and fallocate; retained through completion so later close/reuse does not affect it. Best-effort walk relative to process root, up to 32 steps and 256 encoded component bytes; errors instead of truncation. Concurrent rename/FD-table changes may race. Requires native 64-bit syscall ABI, runtime BTF and readable raw_syscalls:sys_enter format.", events, "true", "false"))
 			s.Fields = append(s.Fields, outputFields(SyscallFile{}, "file")...)
+			s.Fields = append(s.Fields, FieldCapability{Path: "file.dir", Type: "string", QueryField: "file.dir", Optional: true, Description: "Aggregation-only projection: POSIX parent directory of captured file.path; optionally truncated to file.depth components."})
+			s.Filters = append(s.Filters, filter("file.depth", "integer", "Aggregate file.dir prefix depth from process root, 0–32; zero keeps the full directory. Requires paths=true. Does not change raw paths.", []string{"aggregate"}))
 			s.Fields = append(s.Fields, FieldCapability{Path: "phase", Type: "string"}, FieldCapability{Path: "duration_ns", Type: "integer", Optional: true, Unit: "nanoseconds", Description: "Completion only; caller elapsed time including scheduling and waits, not pure disk time."}, FieldCapability{Path: "return_value", Type: "integer", Optional: true, Description: "Completion only; signed kernel return value, including negative errno."})
 			s.Examples = append(s.Examples, "syscalls where phase = completion and syscall in (:fsync,:fdatasync) and stacks = user sum(duration_ns) over 30s by pid, name, user.stack")
 			s.Examples = append(s.Examples, "syscalls where phase = completion and paths = true and syscall in (:fsync,:fdatasync) count, sum(duration_ns) over 30s by pid, file.path")
+			s.Examples = append(s.Examples, "syscalls where phase = completion and paths = true and file.depth = 3 and syscall in (:fsync,:fdatasync) count, sum(duration_ns) over 30s by cgroup.path, process_name, file.dir")
+			s.Examples = append(s.Examples, `syscalls where phase = completion and stacks = user and user.stack.from in ("os.(*File).Sync", '*Fdatasync') count over 30s by user.stack`)
 		}
 		if s.Name == "disk" {
 			s.Description = "Linux block request issues by default, or pointer-paired completions with monotonic duration_ns. Identity is the issuing task, not necessarily the application responsible for asynchronous writeback. Sectors use 512-byte units."
 			s.Filters = append(s.Filters, filter("phase", "string", "entry is the default. completion requires runtime kernel BTF and supported block tracepoint/request layouts; fails explicitly otherwise. Duration is latest issue to final byte completion, excluding pre-issue queue time. Partial completions produce one final event, preserving any nonzero block status. Reissues reset the timestamp and issuing identity. Bounded pending requests and loss counters are subscription-wide.", events, "entry", "completion"))
 			s.Examples = append(s.Examples, "disk where phase = completion count, avg(duration_ns), percentile(duration_ns,95) over 30s by device, pid, name")
+			for _, field := range []string{"device_name", "rwbs"} {
+				s.Filters = append(s.Filters, filter(field, "string", "Exact value or one edge glob. Applied server-side after capture, not inside eBPF; unavailable metadata does not match.", events))
+			}
 		}
 		if s.Name != "tracepoint" {
 			r := MonitorRequest{Source: s.Name}
@@ -252,10 +259,14 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			r.Paths = s.Name == "syscalls"
 			s.GroupByFields, s.NumericFields, _ = aggregateFields(r)
 		} else {
-			s.GroupByFields = append(s.GroupByFields, "pid", "tid", "name", "process_name", "name_group")
+			s.GroupByFields = append(s.GroupByFields, "pid", "tid", "name", "process_name", "name_group", "cgroup.path")
 			s.NumericFields = append(s.NumericFields, "pid", "tid")
 		}
 		if s.Name == "syscalls" || s.Name == "tracepoint" || s.Name == "disk" {
+			for _, field := range []string{"name", "process_name", "name_group", "cgroup.path"} {
+				s.Filters = append(s.Filters, filter(field, "string", "Exact value or one edge glob. Applied server-side after metadata enrichment; unavailable values do not match. Does not reduce eBPF ring traffic.", events))
+			}
+			s.Fields = append(s.Fields, FieldCapability{Path: "cgroup_path", Type: "string", QueryField: "cgroup.path", Optional: true, Description: "Best-effort per-thread unified cgroup membership from procfs at receipt; cached up to one second. Relative to server cgroup namespace; missing on v1, exit or invisible tasks. Not kernel-time identity or container-volume attribution."})
 			if s.Name != "syscalls" {
 				s.Fields = append(s.Fields, FieldCapability{Path: "pid", Type: "integer"}, FieldCapability{Path: "tid", Type: "integer"})
 			}
@@ -266,13 +277,15 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		if s.Name == "syscalls" || s.Name == "tracepoint" {
 			s.Filters = append(s.Filters, filter("stacks", "string", "Optional symbolized stacks. Requires root server and explicit root policy. user.stack/kernel.stack grouping requires the corresponding capture. Capture is best-effort.", events, "user", "kernel", "both"), filter("stack.depth", "integer", "Capture depth, 0–64; zero defaults to 32. Requires stacks selection.", events))
 			for _, prefix := range []string{"user.stack", "kernel.stack"} {
+				from := filter(prefix+".from", "string", "Discard leaf-side frames before the first matching function. Equality or in with 1–16 alternative patterns; first frame matching any pattern wins. Only edge stars are wildcards; interior stars such as os.(*File).Sync are literal. No match leaves frames unchanged. Requires symbolization.", []string{"aggregate"})
+				from.Operators = []string{"=", "in"}
 				s.Filters = append(s.Filters,
 					filter(prefix+".offsets", "boolean", "Keep offsets in aggregation keys (default true); false merges offset-only differences. Raw addresses remain distinct when unresolved.", []string{"aggregate"}, "true", "false"),
 					filter(prefix+".drop_bottom", "integer", "Remove this many root-side captured frames before other shaping, 0–64.", []string{"aggregate"}),
 					filter(prefix+".drop_top", "integer", "Remove this many leaf-side captured frames after drop_bottom, 0–64.", []string{"aggregate"}),
-					filter(prefix+".from", "string", "Discard leaf-side frames before the first matching function, retaining that frame and its callers. Exact name or one edge glob; no match leaves frames unchanged. Requires symbolization.", []string{"aggregate"}),
+					from,
 					filter(prefix+".top", "integer", "Keep at most this many leaf-side frames after trimming, 0–64; zero keeps all.", []string{"aggregate"}),
-					filter(prefix+".until", "string", "Keep leaf-side frames through the first function name matching an exact name or one edge glob, inclusive; no match leaves frames unchanged. Case-sensitive; requires symbolization.", []string{"aggregate"}))
+					filter(prefix+".until", "string", "Keep leaf-side frames through the first matching function, inclusive. Only edge stars are wildcards; interior stars are literal. No match leaves frames unchanged. Case-sensitive; requires symbolization.", []string{"aggregate"}))
 			}
 			s.GroupByFields = append(s.GroupByFields, "user.stack", "kernel.stack")
 			s.Fields = append(s.Fields, outputFields(CapturedStack{}, "user_stack")...)
@@ -287,6 +300,9 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 		for j := range s.Fields {
 			f := &s.Fields[j]
 			alias := f.Path[strings.LastIndex(f.Path, ".")+1:]
+			if f.Path == "cgroup_path" {
+				alias = "cgroup.path"
+			}
 			if s.Name == "syscalls" && strings.HasPrefix(f.Path, "file.") {
 				alias = f.Path
 			}

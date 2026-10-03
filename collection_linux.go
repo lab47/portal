@@ -115,10 +115,12 @@ func (s *collectionState) report(event *Event) error {
 func enrichEventNames(emit func(Event) error) func(Event) error {
 	type entry struct {
 		name    string
+		cgroup  string
 		kernel  bool
 		expires time.Time
 	}
 	cache := make(map[uint32]entry)
+	cgroups := make(map[uint64]entry)
 	return func(event Event) error {
 		if event.Kind == "collection_stats" {
 			return emit(event)
@@ -152,7 +154,37 @@ func enrichEventNames(emit func(Event) error) func(Event) error {
 			if e.kernel && strings.HasPrefix(event.Name, "kworker/") {
 				event.NameGroup = "kworker"
 			}
+			tid := event.TID
+			if tid == 0 {
+				tid = event.PID
+			}
+			key := uint64(event.PID)<<32 | uint64(tid)
+			cg, ok := cgroups[key]
+			if !ok || !now.Before(cg.expires) {
+				cg = entry{expires: now.Add(time.Second)}
+				if verifyHostPID(event.PID) == nil {
+					if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/cgroup", event.PID, tid)); err == nil {
+						cg.cgroup = unifiedCgroupPath(data)
+					}
+				}
+				if len(cgroups) >= 1024 {
+					clear(cgroups)
+				}
+				cgroups[key] = cg
+			}
+			event.CgroupPath = cg.cgroup
 		}
 		return emit(event)
 	}
+}
+
+// Procfs membership is per thread, and relative to the server's cgroup
+// namespace. Never guess a v2 path from one of the v1 controller hierarchies.
+func unifiedCgroupPath(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::/") {
+			return strings.TrimPrefix(line, "0::")
+		}
+	}
+	return ""
 }

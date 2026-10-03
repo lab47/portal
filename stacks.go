@@ -3,6 +3,7 @@ package portal
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -19,12 +20,13 @@ type StackCapture struct {
 // StackShape projects leaf-first frames into aggregation keys, without changing
 // raw event frames. Order: DropBottom, DropTop, From, Until, Top, DropOffsets.
 type StackShape struct {
-	DropOffsets bool   `json:"drop_offsets,omitempty"`
-	DropBottom  int    `json:"drop_bottom,omitempty"`
-	DropTop     int    `json:"drop_top,omitempty"`
-	Top         int    `json:"top,omitempty"`   // zero keeps all remaining frames
-	Until       string `json:"until,omitempty"` // exact function name or one edge glob; matching frame is included
-	From        string `json:"from,omitempty"`  // discard leaf-side frames before the first match, inclusive match retained
+	DropOffsets  bool     `json:"drop_offsets,omitempty"`
+	DropBottom   int      `json:"drop_bottom,omitempty"`
+	DropTop      int      `json:"drop_top,omitempty"`
+	Top          int      `json:"top,omitempty"`           // zero keeps all remaining frames
+	Until        string   `json:"until,omitempty"`         // exact function name or one edge glob; matching frame is included
+	From         string   `json:"from,omitempty"`          // discard leaf-side frames before the first match, inclusive match retained
+	FromPatterns []string `json:"from_patterns,omitempty"` // alternative to From; first matching frame wins, not pattern order
 }
 
 type CapturedStack struct {
@@ -50,8 +52,13 @@ func (s StackCapture) Validate() error {
 		if shape.Top < 0 || shape.Top > 64 || shape.DropBottom < 0 || shape.DropBottom > 64 || shape.DropTop < 0 || shape.DropTop > 64 {
 			return errors.New("stack top/drop_bottom/drop_top must be between 0 and 64")
 		}
-		for _, pattern := range []string{shape.Until, shape.From} {
-			if pattern != "" && (!s.Symbolize || !validEdgeGlob(pattern) || len(pattern) > 256) {
+		if len(shape.FromPatterns) > 16 || (shape.From != "" && len(shape.FromPatterns) != 0) || slices.Contains(shape.FromPatterns, "") {
+			return errors.New("stack from accepts 1–16 nonempty patterns, not both from and from_patterns")
+		}
+		for _, pattern := range append([]string{shape.Until, shape.From}, shape.FromPatterns...) {
+			// Only edge stars are wildcards. Interior stars (notably Go
+			// pointer receivers like os.(*File).Sync) are literal characters.
+			if pattern != "" && (!s.Symbolize || pattern == "*" || (strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*")) || len(pattern) > 256) {
 				return errors.New("stack until/from requires symbolization and an exact name or one edge glob (up to 256 bytes)")
 			}
 		}
@@ -71,9 +78,9 @@ func (s CapturedStack) key(shape *StackShape) string {
 	if shape != nil {
 		selected = selected[:max(0, len(selected)-shape.DropBottom)]
 		selected = selected[min(shape.DropTop, len(selected)):]
-		if shape.From != "" {
+		if shape.From != "" || len(shape.FromPatterns) != 0 {
 			for i, frame := range selected {
-				if frame.Name != "" && processNameMatches(shape.From, frame.Name) {
+				if frame.Name != "" && ((shape.From != "" && processNameMatches(shape.From, frame.Name)) || slices.ContainsFunc(shape.FromPatterns, func(pattern string) bool { return processNameMatches(pattern, frame.Name) })) {
 					selected = selected[i:]
 					break
 				}

@@ -38,8 +38,10 @@ type MonitorRequest struct {
 	Tracepoint   *TracepointFilter   `json:"tracepoint,omitempty"`
 	Symbols      *SymbolRequest      `json:"symbols,omitempty"`
 	Stacks       *StackCapture       `json:"stacks,omitempty"`
-	Name         string              `json:"name,omitempty"` // network interface or sensor key (exact or edge glob)
-	Path         string              `json:"path,omitempty"` // cgroup path relative to the visible v2 mount (exact or edge glob)
+	Name         string              `json:"name,omitempty"`          // network interface or sensor key (exact or edge glob)
+	Path         string              `json:"path,omitempty"`          // cgroup path relative to the visible v2 mount (exact or edge glob)
+	EventFilters map[string]string   `json:"event_filters,omitempty"` // task-context event strings; AND, exact or one edge glob
+	FileDepth    int                 `json:"file_depth,omitempty"`    // aggregate file.dir prefix depth; zero retains full directory
 }
 
 // TracepointFilter selects scalar fields from a Linux tracepoint. Equals values
@@ -256,6 +258,7 @@ type Event struct {
 	Name        string           `json:"name,omitempty"`         // current task comm, up to 15 bytes; may differ between threads
 	ProcessName string           `json:"process_name,omitempty"` // best-effort full executable basename, resolved on receipt
 	NameGroup   string           `json:"name_group,omitempty"`   // kernel workers normalized for grouping; otherwise task name
+	CgroupPath  string           `json:"cgroup_path,omitempty"`  // best-effort unified cgroup path of the event thread at receipt
 	Phase       string           `json:"phase,omitempty"`
 	DurationNS  *uint64          `json:"duration_ns,omitempty"`
 	ReturnValue *int64           `json:"return_value,omitempty"`
@@ -307,6 +310,26 @@ type monitorFrame struct {
 }
 
 func (r MonitorRequest) validate() error {
+	if r.FileDepth < 0 || r.FileDepth > 32 || (r.FileDepth != 0 && (r.Source != "syscalls" || !r.Paths || r.Mode != "aggregate")) {
+		return errors.New("file.depth requires syscall path aggregation and must be between 0 and 32")
+	}
+	for field, pattern := range r.EventFilters {
+		if r.Source != "syscalls" && r.Source != "disk" && r.Source != "tracepoint" {
+			return errors.New("event filters require syscalls, disk or tracepoint")
+		}
+		switch field {
+		case "name", "process_name", "name_group", "cgroup.path":
+		case "device_name", "rwbs":
+			if r.Source != "disk" {
+				return fmt.Errorf("%s requires disk source", field)
+			}
+		default:
+			return fmt.Errorf("unknown event filter %q", field)
+		}
+		if pattern == "" || len(pattern) > 4096 || !validEdgeGlob(pattern) {
+			return fmt.Errorf("%s requires a nonempty exact value or one edge glob", field)
+		}
+	}
 	if len(r.SyscallNames) != 0 && r.Source != "syscalls" {
 		return errors.New("syscall names require syscalls source")
 	}
@@ -437,6 +460,35 @@ func (r MonitorRequest) validate() error {
 func (r MonitorRequest) matches(event Event) bool {
 	if event.Kind == "collection_stats" {
 		return true
+	}
+	if len(r.EventFilters) != 0 {
+		for field, pattern := range r.EventFilters {
+			var value string
+			switch field {
+			case "name":
+				value = event.Name
+			case "process_name":
+				value = event.ProcessName
+			case "name_group":
+				value = event.NameGroup
+				if value == "" {
+					value = event.Name
+				}
+			case "cgroup.path":
+				value = event.CgroupPath
+			case "device_name":
+				if event.Disk != nil {
+					value = event.Disk.DeviceName
+				}
+			case "rwbs":
+				if event.Disk != nil {
+					value = event.Disk.RWBS
+				}
+			}
+			if value == "" || !processNameMatches(pattern, value) {
+				return false
+			}
+		}
 	}
 	if r.Source == "tracepoint" {
 		if event.Tracepoint == nil || r.Tracepoint == nil || event.Tracepoint.Event != r.Tracepoint.Event {

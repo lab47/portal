@@ -14,7 +14,17 @@ import (
 
 func monitorEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
 	if request.Source == "syscalls" || request.Source == "disk" || request.Source == "tracepoint" {
-		emit = enrichEventNames(emit)
+		selection := request
+		selection.EventFilters = nil // enrichment must precede string matching
+		filtered := emit
+		original := request
+		emit = enrichEventNames(func(event Event) error {
+			if original.matches(event) {
+				return filtered(event)
+			}
+			return nil
+		})
+		request = selection
 	}
 	switch request.Source {
 	case "process":

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -120,7 +121,7 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 			numeric = append(numeric, "duration_ns", "return_value")
 		}
 		if r.Paths {
-			fields = append(fields, "file.fd", "file.path", "file.error")
+			fields = append(fields, "file.fd", "file.path", "file.dir", "file.error")
 			numeric = append(numeric, "file.fd")
 		}
 	case "process":
@@ -151,7 +152,7 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 			fields = append(fields, "pid", "tid")
 			numeric = append(append([]string{}, numeric...), "pid", "tid")
 		}
-		fields = append(fields, "name", "process_name", "name_group")
+		fields = append(fields, "name", "process_name", "name_group", "cgroup.path")
 	}
 	if r.Stacks != nil {
 		if r.Stacks.User {
@@ -298,6 +299,9 @@ func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 		if event.ProcessName != "" {
 			fields["process_name"] = event.ProcessName
 		}
+		if event.CgroupPath != "" {
+			fields["cgroup.path"] = event.CgroupPath
+		}
 		fields["name_group"] = event.NameGroup
 		if event.NameGroup == "" {
 			fields["name_group"] = event.Name
@@ -313,6 +317,7 @@ func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 		fields["file.fd"] = event.File.FD
 		if event.File.Path != "" {
 			fields["file.path"] = event.File.Path
+			fields["file.dir"] = path.Dir(event.File.Path)
 		}
 		if event.File.Error != "" {
 			fields["file.error"] = event.File.Error
@@ -630,7 +635,14 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 		if !time.Now().Before(end) || windowCtx.Err() != nil || !selection.matches(event) {
 			return nil
 		}
-		return reduction.add(eventGroupFields(event, request.Stacks))
+		fields := eventGroupFields(event, request.Stacks)
+		if request.FileDepth > 0 {
+			if dir, ok := fields["file.dir"].(string); ok {
+				parts := strings.Split(strings.TrimPrefix(dir, "/"), "/")
+				fields["file.dir"] = "/" + strings.Join(parts[:min(request.FileDepth, len(parts))], "/")
+			}
+		}
+		return reduction.add(fields)
 	})
 	if ctx.Err() != nil {
 		return Snapshot{}, ctx.Err()
