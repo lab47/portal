@@ -105,6 +105,12 @@ func TestDiskPreflushOperationAndPrograms(t *testing.T) {
 			t.Fatalf("rwbs=%s: %+v, %v", tc.rwbs, e.Disk, err)
 		}
 	}
+	raw := make([]byte, 72)
+	copy(raw[40:], "WS\x00M\x00F")
+	e, err := decodeDiskRecord(raw)
+	if err != nil || e.Disk.RWBS != "WS" || e.Disk.Operation != "write" {
+		t.Fatalf("bytes after C terminator treated as flags: %+v, %v", e.Disk, err)
+	}
 	if os.Geteuid() != 0 {
 		return // decoder checks above run unprivileged too
 	}

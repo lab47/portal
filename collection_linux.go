@@ -28,6 +28,8 @@ const (
 	collectionBlockIssues
 	collectionBlockCompletions
 	collectionBlockReissues
+	collectionBlockPartialCompletions
+	collectionBlockFinalCompletions
 	collectionCounterCount
 )
 
@@ -98,6 +100,7 @@ func (s *collectionState) snapshot() (*CollectionStats, error) {
 		StackCollisions: values[collectionStackCollision], PairingFailures: values[collectionPairingFailed],
 		UnmatchedExits: values[collectionUnmatchedExit], BlockIssues: values[collectionBlockIssues],
 		BlockCompletions: values[collectionBlockCompletions], BlockReissues: values[collectionBlockReissues],
+		BlockPartialCompletions: values[collectionBlockPartialCompletions], BlockFinalCompletions: values[collectionBlockFinalCompletions],
 	}, nil
 }
 

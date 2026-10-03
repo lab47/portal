@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func TestDiskRequestRWBS(t *testing.T) {
 }
 
 func TestDiskCompletionDecoderAndInstructions(t *testing.T) {
-	raw := make([]byte, 72)
+	raw := make([]byte, 80)
 	binary.NativeEndian.PutUint64(raw[0:8], uint64(12)<<32|34)
 	copy(raw[8:24], "issuer")
 	binary.NativeEndian.PutUint32(raw[32:36], 0x800001)
@@ -52,22 +53,23 @@ func TestDiskCompletionDecoderAndInstructions(t *testing.T) {
 	bits := requestFlagBits{valid: true, sync: 10, meta: 13, fua: 21, preflush: 25, rahead: 17}
 	flags := uint32(1<<bits.sync | 1<<bits.fua | 1<<bits.preflush)
 	binary.NativeEndian.PutUint32(raw[60:64], flags)
-	binary.NativeEndian.PutUint64(raw[64:72], 999)
+	binary.NativeEndian.PutUint64(raw[64:72], 98765)
+	binary.NativeEndian.PutUint64(raw[72:80], 999)
 	e, err := decodeDiskCompletionRecordWithFlags(raw, bits)
 	if err != nil || e.PID != 12 || e.TID != 34 || e.Name != "issuer" || e.Phase != "completion" || e.Disk.Device != 0x800001 || e.Disk.Sector != 1234 || e.Disk.Sectors != 16 || e.Disk.Operation != "write" {
 		t.Fatalf("decode: %+v, %v", e, err)
 	}
-	if e.Disk.DurationNS == nil || *e.Disk.DurationNS != 999 {
+	if e.Disk.DurationNS == nil || *e.Disk.DurationNS != 999 || e.Disk.IOCgroupID == nil || *e.Disk.IOCgroupID != 98765 {
 		t.Fatalf("duration: %+v", e.Disk)
 	}
 	if e.Disk.RWBS != "FWFS" || e.Disk.RequestFlags == nil || *e.Disk.RequestFlags != flags {
 		t.Fatalf("flags: %+v", e.Disk)
 	}
-	if _, err := decodeDiskCompletionRecord(raw[:71]); err == nil {
+	if _, err := decodeDiskCompletionRecord(raw[:79]); err == nil {
 		t.Fatal("accepted truncated completion")
 	}
 	l := diskBTFLayout{issueArg: 0, completeArg: 0, rqQ: 8, rqSector: 16, rqBytes: 24, rqFlags: 28, qDisk: 32, diskMajor: 40, diskFirstMinor: 44}
-	for _, insns := range []asm.Instructions{diskIssueCompletionInstructions(l, 10, nil), diskCompleteInstructions(l, 10, 11, nil)} {
+	for _, insns := range []asm.Instructions{diskIssueCompletionInstructions(l, 10, 0, nil), diskIssueCompletionInstructions(l, 0, 11, nil), diskCompleteInstructions(l, 10, 11, nil)} {
 		if err := insns.Marshal(&bytes.Buffer{}, binary.LittleEndian); err != nil {
 			t.Fatalf("invalid instructions: %v", err)
 		}
@@ -95,7 +97,7 @@ func TestDiskCompletionProgramsLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending, err := ebpf.NewMap(&ebpf.MapSpec{Name: "disk_test_pending", Type: ebpf.Hash, KeySize: 8, ValueSize: 64, MaxEntries: 16})
+	pending, err := ebpf.NewMap(&ebpf.MapSpec{Name: "disk_test_pending", Type: ebpf.Hash, KeySize: 8, ValueSize: 72, MaxEntries: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,8 @@ func TestDiskCompletionProgramsLoad(t *testing.T) {
 	}
 	defer c.close()
 	for name, insns := range map[string]asm.Instructions{
-		"issue":    diskIssueCompletionInstructions(l, pending.FD(), c),
+		"issue":    diskIssueCompletionInstructions(l, pending.FD(), 0, c),
+		"entry":    diskIssueCompletionInstructions(l, 0, events.FD(), c),
 		"complete": diskCompleteInstructions(l, pending.FD(), events.FD(), c),
 	} {
 		program, err := ebpf.NewProgram(&ebpf.ProgramSpec{Name: "disk_test_" + name, Type: ebpf.RawTracepoint, License: "GPL", Instructions: insns})
@@ -129,7 +132,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root raw tracepoints")
 	}
-	pending, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 8, ValueSize: 64, MaxEntries: 16})
+	pending, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 8, ValueSize: 72, MaxEntries: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +160,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 		if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
 			t.Fatal(err)
 		}
-		value := make([]byte, 64)
+		value := make([]byte, 72)
 		binary.NativeEndian.PutUint64(value[0:8], uint64(pid)<<32|uint64(pid+1))
 		copy(value[8:24], "issuer")
 		binary.NativeEndian.PutUint64(value[24:32], uint64(now.Nano()-int64(age)))
@@ -166,6 +169,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 		binary.NativeEndian.PutUint64(value[40:48], 987)
 		binary.NativeEndian.PutUint32(value[48:52], 8)
 		value[52] = 1
+		binary.NativeEndian.PutUint64(value[64:72], uint64(pid)*100)
 		if err := pending.Update(key, value, ebpf.UpdateAny); err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +210,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 	seed(101, 11, 100*time.Millisecond)
 	seed(202, 22, 400*time.Millisecond) // same sector/device, different request
 	trigger(101, 1024, 0)
-	var value [64]byte
+	var value [72]byte
 	if err := pending.Lookup(uint64(101), &value); err != nil || binary.NativeEndian.Uint32(value[36:40]) != 3072 {
 		t.Fatalf("partial: %v %+v", err, value)
 	}
@@ -216,7 +220,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 	}
 	trigger(202, 4096, 0)
 	e := read()
-	if e.PID != 22 || e.TID != 23 || *e.Disk.DurationNS < uint64(400*time.Millisecond) || e.Disk.Device != 0x10300123 || *e.Disk.Status != 0 {
+	if e.PID != 22 || e.TID != 23 || *e.Disk.DurationNS < uint64(400*time.Millisecond) || e.Disk.Device != 0x10300123 || *e.Disk.Status != 0 || e.Disk.IOCgroupID == nil || *e.Disk.IOCgroupID != 2200 {
 		t.Fatalf("wrong second request: %+v %+v", e, e.Disk)
 	}
 	trigger(101, 3072, 0)
@@ -229,7 +233,7 @@ func TestDiskCompletionPairingLive(t *testing.T) {
 	}
 	trigger(101, 1, 0)
 	stats, err := c.snapshot()
-	if err != nil || stats.UnmatchedExits != 1 || stats.BlockCompletions != 4 || stats.BlockIssues != 0 || stats.BlockReissues != 0 {
+	if err != nil || stats.UnmatchedExits != 1 || stats.BlockCompletions != 4 || stats.BlockIssues != 0 || stats.BlockReissues != 0 || stats.BlockPartialCompletions != 1 || stats.BlockFinalCompletions != 2 {
 		t.Fatalf("unmatched: %+v %v", stats, err)
 	}
 	seed(303, 33, 20*time.Millisecond)
@@ -266,58 +270,78 @@ func TestDiskCompletionEventsLive(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root block tracepoints")
 	}
-	f, err := os.CreateTemp(t.TempDir(), "block-latency")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	got := make(chan Event, 256)
-	done := make(chan error, 1)
-	go func() {
-		done <- diskEvents(ctx, MonitorRequest{Source: "disk", Phase: "completion"}, func(e Event) error {
-			select {
-			case got <- e:
-			default:
+	for _, phase := range []string{"entry", "completion"} {
+		t.Run(phase, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "block-latency")
+			if err != nil {
+				t.Fatal(err)
 			}
-			return nil
+			defer f.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			got := make(chan Event, 256)
+			done := make(chan error, 1)
+			go func() {
+				done <- diskEvents(ctx, MonitorRequest{Source: "disk", Phase: phase}, func(e Event) error {
+					select {
+					case got <- e:
+					default:
+					}
+					return nil
+				})
+			}()
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+			var found Event
+			for found.Disk == nil {
+				select {
+				case <-ticker.C:
+					if _, err := f.WriteAt(bytes.Repeat([]byte{0x5a}, 65536), 0); err != nil {
+						t.Fatal(err)
+					}
+					if err := f.Sync(); err != nil {
+						t.Fatal(err)
+					}
+				case e := <-got:
+					if e.Disk != nil && e.Disk.Operation == "write" {
+						found = e
+					}
+				case err := <-done:
+					t.Fatalf("block collector stopped: %v", err)
+				case <-deadline.C:
+					t.Fatal("no completed block request after repeated writes/fsync")
+				}
+			}
+			if (phase == "completion" && (found.Phase != "completion" || found.Disk.DurationNS == nil || *found.Disk.DurationNS == 0 || found.Disk.Status == nil)) || found.Disk.RequestFlags == nil || found.Disk.RWBS == "" || found.Disk.DeviceName == "" || found.Name == "" {
+				t.Fatalf("incomplete event: %+v %+v", found, found.Disk)
+			}
+			if phase == "entry" && (found.Disk.DurationNS != nil || found.Disk.Status != nil) {
+				t.Fatalf("completion-only metadata on issue: %+v", found.Disk)
+			}
+			l, err := loadDiskBTFLayout()
+			if err != nil || len(l.ioCgroupOffsets) != 6 {
+				t.Fatalf("test kernel lacks expected block cgroup layout: %+v, %v", l, err)
+			}
+			if found.Disk.IOCgroupID == nil || *found.Disk.IOCgroupID == 0 {
+				t.Fatalf("write bio ownership not captured: %+v", found.Disk)
+			}
+			if found.Disk.IOCgroupPath != "" {
+				st, err := os.Stat("/sys/fs/cgroup" + found.Disk.IOCgroupPath)
+				if err != nil || st.Sys().(*syscall.Stat_t).Ino != *found.Disk.IOCgroupID {
+					t.Fatalf("charged ID/path mismatch: %+v, %v", found.Disk, err)
+				}
+			}
+			major, minor := found.Disk.Device>>20, found.Disk.Device&0xfffff
+			if _, err := os.Stat(fmt.Sprintf("/sys/dev/block/%d:%d", major, minor)); err != nil {
+				t.Fatalf("invalid kernel device encoding: %+v: %v", found.Disk, err)
+			}
+			t.Logf("observed device=%d:%d issuer=%s io_cgroup_id=%d io_cgroup_path=%q error=%q", major, minor, found.Name, *found.Disk.IOCgroupID, found.Disk.IOCgroupPath, found.Disk.IOCgroupError)
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
 		})
-	}()
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	var found Event
-	for found.Disk == nil {
-		select {
-		case <-ticker.C:
-			if _, err := f.WriteAt(bytes.Repeat([]byte{0x5a}, 65536), 0); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.Sync(); err != nil {
-				t.Fatal(err)
-			}
-		case e := <-got:
-			if e.Disk != nil {
-				found = e
-			}
-		case err := <-done:
-			t.Fatalf("block collector stopped: %v", err)
-		case <-deadline.C:
-			t.Fatal("no completed block request after repeated writes/fsync")
-		}
-	}
-	if found.Phase != "completion" || found.Disk.DurationNS == nil || *found.Disk.DurationNS == 0 || found.Disk.Status == nil || found.Disk.RequestFlags == nil || found.Disk.RWBS == "" || found.Disk.DeviceName == "" || found.Name == "" {
-		t.Fatalf("incomplete event: %+v %+v", found, found.Disk)
-	}
-	major, minor := found.Disk.Device>>20, found.Disk.Device&0xfffff
-	if _, err := os.Stat(fmt.Sprintf("/sys/dev/block/%d:%d", major, minor)); err != nil {
-		t.Fatalf("invalid kernel device encoding: %+v: %v", found.Disk, err)
-	}
-	t.Logf("observed device=%d:%d operation=%s issuer=%s pid=%d duration_ns=%d status=%d", major, minor, found.Disk.Operation, found.Name, found.PID, *found.Disk.DurationNS, *found.Disk.Status)
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
 	}
 }

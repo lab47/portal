@@ -107,15 +107,18 @@ type DiskFilter struct {
 
 // DiskEvent describes a block request issued to a device. Sector units are 512 bytes.
 type DiskEvent struct {
-	Device       uint32  `json:"device"`
-	Sector       uint64  `json:"sector"`
-	Sectors      uint32  `json:"sectors"`
-	Operation    string  `json:"operation"`
-	RWBS         string  `json:"rwbs,omitempty"`
-	DeviceName   string  `json:"device_name,omitempty"`
-	RequestFlags *uint32 `json:"request_flags,omitempty"`
-	DurationNS   *uint64 `json:"duration_ns,omitempty"`
-	Status       *uint32 `json:"status,omitempty"` // completion blk_status_t; zero is success, not errno
+	Device        uint32  `json:"device"`
+	Sector        uint64  `json:"sector"`
+	Sectors       uint32  `json:"sectors"`
+	Operation     string  `json:"operation"`
+	RWBS          string  `json:"rwbs,omitempty"`
+	DeviceName    string  `json:"device_name,omitempty"`
+	RequestFlags  *uint32 `json:"request_flags,omitempty"`
+	DurationNS    *uint64 `json:"duration_ns,omitempty"`
+	Status        *uint32 `json:"status,omitempty"`       // completion blk_status_t; zero is success, not errno
+	IOCgroupID    *uint64 `json:"io_cgroup_id,omitempty"` // kernel charged blkcg kernfs ID, not issuing task membership
+	IOCgroupPath  string  `json:"io_cgroup_path,omitempty"`
+	IOCgroupError string  `json:"io_cgroup_error,omitempty"`
 }
 
 // SyscallFile is a best-effort kernel path snapshot captured at syscall entry
@@ -239,14 +242,16 @@ type PacketEvent struct {
 // CollectionStats are cumulative subscription counters, not per-event deltas.
 // StackCaptureFailures includes StackCollisions. Kernel drops are not per-group.
 type CollectionStats struct {
-	RingBufferDropped    uint64 `json:"ring_buffer_dropped"`
-	StackCaptureFailures uint64 `json:"stack_capture_failures"`
-	StackCollisions      uint64 `json:"stack_collisions"`
-	PairingFailures      uint64 `json:"pairing_failures"`
-	UnmatchedExits       uint64 `json:"unmatched_exits"`
-	BlockIssues          uint64 `json:"block_issues,omitempty"`
-	BlockCompletions     uint64 `json:"block_completions,omitempty"`
-	BlockReissues        uint64 `json:"block_reissues,omitempty"`
+	RingBufferDropped       uint64 `json:"ring_buffer_dropped"`
+	StackCaptureFailures    uint64 `json:"stack_capture_failures"`
+	StackCollisions         uint64 `json:"stack_collisions"`
+	PairingFailures         uint64 `json:"pairing_failures"`
+	UnmatchedExits          uint64 `json:"unmatched_exits"`
+	BlockIssues             uint64 `json:"block_issues,omitempty"`
+	BlockCompletions        uint64 `json:"block_completions,omitempty"`
+	BlockReissues           uint64 `json:"block_reissues,omitempty"`
+	BlockPartialCompletions uint64 `json:"block_partial_completions,omitempty"`
+	BlockFinalCompletions   uint64 `json:"block_final_completions,omitempty"`
 }
 
 // Event is a source data record or a collection_stats diagnostic.
@@ -319,7 +324,7 @@ func (r MonitorRequest) validate() error {
 		}
 		switch field {
 		case "name", "process_name", "name_group", "cgroup.path":
-		case "device_name", "rwbs":
+		case "device_name", "rwbs", "io.cgroup.path":
 			if r.Source != "disk" {
 				return fmt.Errorf("%s requires disk source", field)
 			}
@@ -483,6 +488,10 @@ func (r MonitorRequest) matches(event Event) bool {
 			case "rwbs":
 				if event.Disk != nil {
 					value = event.Disk.RWBS
+				}
+			case "io.cgroup.path":
+				if event.Disk != nil {
+					value = event.Disk.IOCgroupPath
 				}
 			}
 			if value == "" || !processNameMatches(pattern, value) {

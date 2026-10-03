@@ -131,11 +131,11 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 		fields = []string{"protocol", "direction", "src.ip", "dst.ip", "src.port", "dst.port", "length"}
 		numeric = []string{"src.port", "dst.port", "length"}
 	case "disk":
-		fields = []string{"device", "device_name", "operation", "rwbs", "sector", "sectors"}
-		numeric = []string{"device", "sector", "sectors"}
+		fields = []string{"device", "device_name", "operation", "rwbs", "sector", "sectors", "io.cgroup.id", "io.cgroup.path", "io.cgroup.error", "request_flags"}
+		numeric = []string{"device", "sector", "sectors", "io.cgroup.id", "request_flags"}
 		if r.Phase == "completion" {
-			fields = append(fields, "duration_ns", "status", "request_flags")
-			numeric = append(numeric, "duration_ns", "status", "request_flags")
+			fields = append(fields, "duration_ns", "status")
+			numeric = append(numeric, "duration_ns", "status")
 		}
 	case "tracepoint":
 		if r.Tracepoint != nil {
@@ -262,6 +262,15 @@ func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 		fields = map[string]any{"device": event.Disk.Device, "operation": event.Disk.Operation, "rwbs": event.Disk.RWBS, "sector": event.Disk.Sector, "sectors": event.Disk.Sectors}
 		if event.Disk.DeviceName != "" {
 			fields["device_name"] = event.Disk.DeviceName
+		}
+		if event.Disk.IOCgroupID != nil {
+			fields["io.cgroup.id"] = *event.Disk.IOCgroupID
+		}
+		if event.Disk.IOCgroupPath != "" {
+			fields["io.cgroup.path"] = event.Disk.IOCgroupPath
+		}
+		if event.Disk.IOCgroupError != "" {
+			fields["io.cgroup.error"] = event.Disk.IOCgroupError
 		}
 		if event.Disk.RequestFlags != nil {
 			fields["request_flags"] = *event.Disk.RequestFlags

@@ -247,7 +247,8 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			s.Description = "Linux block request issues by default, or pointer-paired completions with monotonic duration_ns. Identity is the issuing task, not necessarily the application responsible for asynchronous writeback. Sectors use 512-byte units."
 			s.Filters = append(s.Filters, filter("phase", "string", "entry is the default. completion requires runtime kernel BTF and supported block tracepoint/request layouts; fails explicitly otherwise. Duration is latest issue to final byte completion, excluding pre-issue queue time. Partial completions produce one final event, preserving any nonzero block status. Reissues reset the timestamp and issuing identity. Bounded pending requests and loss counters are subscription-wide.", events, "entry", "completion"))
 			s.Examples = append(s.Examples, "disk where phase = completion count, avg(duration_ns), percentile(duration_ns,95) over 30s by device, pid, name")
-			for _, field := range []string{"device_name", "rwbs"} {
+			s.Examples = append(s.Examples, "disk where operation = write count, sum(sectors) over 30s by device_name, io.cgroup.path")
+			for _, field := range []string{"device_name", "rwbs", "io.cgroup.path"} {
 				s.Filters = append(s.Filters, filter(field, "string", "Exact value or one edge glob. Applied server-side after capture, not inside eBPF; unavailable metadata does not match.", events))
 			}
 		}
@@ -303,6 +304,9 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			if f.Path == "cgroup_path" {
 				alias = "cgroup.path"
 			}
+			if s.Name == "disk" && strings.HasPrefix(alias, "io_cgroup_") {
+				alias = "io.cgroup." + strings.TrimPrefix(alias, "io_cgroup_")
+			}
 			if s.Name == "syscalls" && strings.HasPrefix(f.Path, "file.") {
 				alias = f.Path
 			}
@@ -322,6 +326,12 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 				f.QueryField = alias
 			}
 			switch {
+			case f.Path == "disk.io_cgroup_id":
+				f.Description = "Kernel-time first-bio blkcg kernfs ID captured at issue and retained through completion. Requires supported BTF/CONFIG_BLK_CGROUP. No task-ownership fallback; synthetic flushes may have no bio."
+			case f.Path == "disk.io_cgroup_path":
+				f.Description = "Best-effort charged ID lookup in server's visible cgroup-v2 mount; directory cache refreshed up to once per second. Not the issuer's cgroup.path. Journal/metadata may legitimately remain root; no backing-volume inference."
+			case f.Path == "disk.io_cgroup_error":
+				f.Description = "Explicit unavailable association or invisible/deleted cgroup; known IDs remain available when paths cannot resolve."
 			case f.Path == "disk.duration_ns":
 				f.Unit = "nanoseconds"
 				f.Description = "Completion only; latest issue to final completion, excluding pre-issue queueing."
@@ -369,7 +379,7 @@ func describeCapabilities(p policy, cert *ssh.Certificate) Capabilities {
 			"Filters use AND only; no OR, comparisons, regex or interior globs. Source/field keywords are case-insensitive except kernel field names and name values. Quote values containing spaces.",
 			"Aggregation collects a fresh half-open server-ingestion window [start,end), not registered-monitor history. Up to 8 distinct comma-separated functions share a single source subscription/sampler, window, interval, filters and grouping; no repeating windows or cross-source joins. Multi results appear in aggregation.metrics in request order, each with function/field/percentile and counts or values; single-function result shape is unchanged. API aggregation.metrics replaces top-level function/field/percentile. All metrics share the 65536 retained-value budget; the 4096-group limit is per metric. Missing sampled metrics are skipped independently. Capture is best-effort; cancellation stops collection and source failures return errors.",
 			"Missing grouping fields use a JSON null bucket, for events and snapshots alike. Missing optional metric values are skipped independently, never fabricated as zero. Compact output uses aggregation.columns (metric descriptors) and rows [{group, values}], with total_groups before output filtering/limiting and omitted_zero_groups. Metric arrays align with columns; unavailable group metrics are null. API controls: compact, nonzero, limit, sort_metric. Legacy output is retained by default except MCP JSON aggregates without jq; MCP format=legacy opts out. Compact controls cannot be combined with folded output.",
-			"Disk rwbs is the kernel request flag string: optional leading F=preflush, operation R/W/D/F/N (DE=secure erase), then F=FUA, A=readahead, S=sync and M=metadata. Completion reconstructs it from issue cmd_flags using runtime BTF flag positions; request_flags retains the raw flags. device_name is a best-effort sysfs name alongside numeric device. Completion collection block_issues/block_completions count callbacks before filtering; block_reissues counts issues replacing a pending pointer. unmatched_exits counts callbacks without a pending pointer, not unique requests; attachment boundaries, repeated callbacks and pairing failures need separate investigation.",
+			"Disk rwbs is the kernel request flag string: optional leading F=preflush, operation R/W/D/F/N (DE=secure erase), then F=FUA, A=readahead, S=sync and M=metadata. Supported BTF kernels reconstruct both phases from issue cmd_flags; request_flags retains raw flags. Entry falls back to tracefs C-string decoding without BTF; stops at the first null. device_name is a best-effort sysfs name. collection block_issues/block_completions count callbacks before filtering; block_reissues counts issues replacing a pending pointer. block_partial_completions and block_final_completions separate matched callbacks, with one event per final completion. unmatched_exits counts callbacks without a pending pointer, not unique requests; attachment boundaries, repeated callbacks and pairing failures need separate investigation.",
 			"Sources with sampling metadata support sampled snapshot aggregates. every defaults to 1s for snapshot-only sources; process requires explicit every to select snapshots instead of lifecycle events. Sampling fields are record-relative paths, not event field aliases.",
 			"Samples are collected immediately and on the interval grid before the window ends; slow reads skip ticks without overlap. count counts observed records. avg is an arithmetic sample mean, not time-weighted; sum of a gauge is a sum of observations, not an integral. Missing optional metrics are skipped, not zero.",
 			"Raw counters cannot be summed/averaged/minimized/maximized/percentiled. Use FIELD_per_second for rates, or CPU utilization_percent. Derived values require consecutive observations, so the first observation is only a baseline. Resets, disappearing/reappearing entities, and missing fields start a new baseline; no zero is fabricated. A derived query needs a window longer than its interval.",

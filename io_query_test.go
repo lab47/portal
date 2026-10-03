@@ -51,12 +51,12 @@ func TestIOQueryFields(t *testing.T) {
 }
 
 func TestEventStringFilters(t *testing.T) {
-	query := "disk where device_name = nvme0n1 and name = worker* and name_group = worker and process_name = writer and rwbs = *SM and cgroup.path = /apps/pg*"
+	query := "disk where device_name = nvme0n1 and name = worker* and name_group = worker and process_name = writer and rwbs = *SM and cgroup.path = /apps/pg* and io.cgroup.path = /apps/logs*"
 	r, err := ParseMonitorQuery(query)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := Event{Name: "worker-1", NameGroup: "worker", ProcessName: "writer", CgroupPath: "/apps/pg-17", Disk: &DiskEvent{DeviceName: "nvme0n1", RWBS: "WSM"}}
+	e := Event{Name: "worker-1", NameGroup: "worker", ProcessName: "writer", CgroupPath: "/apps/pg-17", Disk: &DiskEvent{DeviceName: "nvme0n1", RWBS: "WSM", IOCgroupPath: "/apps/logs-3"}}
 	if !r.matches(e) {
 		t.Fatal("all matching filters rejected")
 	}
@@ -73,6 +73,7 @@ func TestEventStringFilters(t *testing.T) {
 	for _, query := range []string{
 		"syscalls where process_name = writer*", "syscalls where name = worker", "tracepoint where event = sched:sched_switch and fields in (prev_pid) and name_group = kworker",
 		"syscalls where paths = true and file.depth = 3 count over 1s by file.dir, cgroup.path",
+		"disk count, sum(sectors) over 30s by device_name, io.cgroup.id, io.cgroup.path, io.cgroup.error",
 	} {
 		if _, err := ParseMonitorQuery(query); err != nil {
 			t.Fatalf("%s: %v", query, err)
@@ -80,6 +81,7 @@ func TestEventStringFilters(t *testing.T) {
 	}
 	for _, query := range []string{
 		"syscalls where device_name = disk", "tracepoint where event = sched:sched_switch and fields in (prev_pid) and rwbs = W",
+		"syscalls where io.cgroup.path = /", "tracepoint where event = sched:sched_switch and fields in (prev_pid) count over 1s by io.cgroup.path",
 		"disk where process_name = ''", "disk where name = '*worker*'", "disk where file.depth = 0 count over 1s",
 		"syscalls where file.depth = 3 count over 1s", "syscalls where file.depth = 0 count over 1s", "syscalls where paths = true and file.depth = 33 count over 1s",
 	} {

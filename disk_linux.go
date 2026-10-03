@@ -135,7 +135,13 @@ func decodeDiskRecord(raw []byte) (Event, error) {
 	event := Event{Time: time.Now().UTC()}
 	decodeTaskIdentity(raw[:taskIdentitySize], &event)
 	raw = raw[taskIdentitySize:]
-	rwbs := string(bytes.TrimRight(raw[16:48], "\x00"))
+	flags := raw[16:48]
+	// Tracefs exposes a C string, not a zero-padded array. Bytes after
+	// the first terminator may retain flags from an earlier ring-buffer use.
+	if end := bytes.IndexByte(flags, 0); end >= 0 {
+		flags = flags[:end]
+	}
+	rwbs := string(flags)
 	opByte := raw[16]
 	if len(rwbs) > 1 && rwbs[0] == 'F' && strings.ContainsRune("RWDFN", rune(rwbs[1])) {
 		opByte = rwbs[1]
@@ -174,8 +180,14 @@ func (d *diskDeviceNames) lookup(device uint32) string {
 }
 
 func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
+	// BTF exposes the request/bio association and original flags for both
+	// phases. Retain the tracefs entry collector on kernels without it.
+	l, layoutErr := loadDiskBTFLayout()
+	if layoutErr == nil {
+		return diskRequestEvents(ctx, request, emit, l)
+	}
 	if request.Phase == "completion" {
-		return diskCompletionEvents(ctx, request, emit)
+		return layoutErr
 	}
 	fields, err := readDiskFormat()
 	if err != nil {
@@ -229,6 +241,7 @@ func diskEvents(ctx context.Context, request MonitorRequest, emit func(Event) er
 			return err
 		}
 		event.Disk.DeviceName = deviceNames.lookup(event.Disk.Device)
+		event.Disk.IOCgroupError = "request ownership requires supported runtime kernel BTF"
 		if err := collection.report(&event); err != nil {
 			return err
 		}

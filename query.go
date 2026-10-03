@@ -254,7 +254,7 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 func setQueryFilter(r *MonitorRequest, field, value string) error {
 	if r.Source == "syscalls" || r.Source == "disk" || r.Source == "tracepoint" {
 		switch field {
-		case "name", "process_name", "name_group", "cgroup.path", "device_name", "rwbs":
+		case "name", "process_name", "name_group", "cgroup.path", "device_name", "rwbs", "io.cgroup.path":
 			if r.EventFilters == nil {
 				r.EventFilters = make(map[string]string)
 			}
