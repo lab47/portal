@@ -4,6 +4,7 @@ package portal
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"runtime"
 	"sync"
@@ -12,6 +13,51 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestProbeSyscallCompletionLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root for live raw tracepoints")
+	}
+	r, err := ParseMonitorQuery(fmt.Sprintf(`syscalls:completion where pid = %d and syscall = :getpid { @calls[pid] = {calls: count(), elapsed: sum(duration_ns)} } every 1s { emit @calls; clear @calls } after 3s { stop }`, os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err = resolveSyscallNames(r, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				unix.Getpid()
+			}
+		}
+	}()
+	result, err := aggregateEvents(ctx, r, syscallEvents)
+	cancel()
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Windows) != 3 {
+		t.Fatalf("missing reports: %+v", result)
+	}
+	for _, window := range result.Windows[1:] {
+		if window.Table != "calls" || len(window.Rows) != 1 || len(window.Rows[0].Values) != 2 || string(window.Rows[0].Values[0]) == "0" || string(window.Rows[0].Values[1]) == "0" {
+			t.Fatalf("missing live completion reductions: %+v", window)
+		}
+		t.Logf("live bucket calls=%s elapsed_ns=%s", window.Rows[0].Values[0], window.Rows[0].Values[1])
+	}
+}
 
 func TestSyscallCompletionLive(t *testing.T) {
 	if os.Geteuid() != 0 {

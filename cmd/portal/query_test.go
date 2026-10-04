@@ -43,6 +43,18 @@ func TestClientQueryPipes(t *testing.T) {
 	}
 }
 
+func TestClientProbeQueryPipe(t *testing.T) {
+	r, code, err := parseClientQuery(`disk:completion { let device = device_name; @writes[device] = {calls: count(), sectors: sum(sectors)} } every 1s { emit @writes; clear @writes } after 3s { stop } | [.windows[].table]`)
+	if err != nil || code == nil || r.Aggregation == nil || r.Aggregation.Table != "writes" || r.Aggregation.GroupAliases["device_name"] != "device" {
+		t.Fatalf("action query pipeline: %+v, %v", r, err)
+	}
+	var out bytes.Buffer
+	snapshot := portal.Snapshot{Source: "disk", Windows: []*portal.AggregationResult{{Table: "writes"}, {Table: "writes"}}}
+	if err := writeQueryResult(context.Background(), &out, snapshot, code); err != nil || out.String() != "[\"writes\",\"writes\"]\n" {
+		t.Fatalf("action pipeline result: %q, %v", out.String(), err)
+	}
+}
+
 func TestQueryResultJQ(t *testing.T) {
 	snapshot := portal.Snapshot{Source: "memory", Memory: &portal.MemoryInfo{Used: ^uint64(0)}, Processes: []portal.ProcessInfo{{Name: "alpha"}, {Name: "beta"}}}
 	for _, tc := range []struct{ filter, want string }{

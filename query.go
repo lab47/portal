@@ -170,6 +170,13 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	if len(query) > 4096 {
 		return MonitorRequest{}, errors.New("monitor query exceeds 4096 bytes")
 	}
+	if strings.Contains(query, "{") {
+		// Quoted braces remain ordinary values in the original DSL.
+		if value, matched, err := p.New().Parse(monitorQueryGrammar, query); err == nil && matched {
+			return compileMonitorQuery(value.(parsedMonitorQuery))
+		}
+		return parseProbeQuery(query)
+	}
 	value, matched, err := p.New().Parse(monitorQueryGrammar, query, p.WithErrors())
 	if err != nil {
 		return MonitorRequest{}, err
@@ -177,7 +184,10 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	if !matched {
 		return MonitorRequest{}, errors.New("invalid monitor query")
 	}
-	parsed := value.(parsedMonitorQuery)
+	return compileMonitorQuery(value.(parsedMonitorQuery))
+}
+
+func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
 	r := MonitorRequest{Source: parsed.source}
 	if r.Source == "symbols" {
 		r.Mode = "snapshot"
@@ -195,6 +205,9 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	}
 	seen := make(map[string]bool)
 	for _, condition := range parsed.conditions {
+		if len(condition.values) == 0 {
+			return MonitorRequest{}, fmt.Errorf("filter %q requires a value", condition.field)
+		}
 		if seen[condition.field] {
 			return MonitorRequest{}, fmt.Errorf("duplicate filter %q", condition.field)
 		}

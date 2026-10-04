@@ -157,20 +157,21 @@ type ProcessInfo struct {
 
 // Snapshot is a one-shot view, not a stream of lifecycle events.
 type Snapshot struct {
-	Source       string             `json:"source"`
-	Time         time.Time          `json:"time"`
-	Processes    []ProcessInfo      `json:"processes,omitempty"`
-	CPU          []CPUInfo          `json:"cpu,omitempty"`
-	Memory       *MemoryInfo        `json:"memory,omitempty"`
-	Network      []InterfaceInfo    `json:"network,omitempty"`
-	Kernel       *KernelInfo        `json:"kernel,omitempty"`
-	Sensors      []SensorInfo       `json:"sensors,omitempty"`
-	Containers   []ContainerInfo    `json:"containers,omitempty"`
-	Cgroups      []CgroupInfo       `json:"cgroups,omitempty"`
-	GPUs         []GPUInfo          `json:"gpus,omitempty"`
-	Aggregation  *AggregationResult `json:"aggregation,omitempty"`
-	Capabilities *Capabilities      `json:"capabilities,omitempty"`
-	Symbols      *SymbolResult      `json:"symbols,omitempty"`
+	Source       string               `json:"source"`
+	Time         time.Time            `json:"time"`
+	Processes    []ProcessInfo        `json:"processes,omitempty"`
+	CPU          []CPUInfo            `json:"cpu,omitempty"`
+	Memory       *MemoryInfo          `json:"memory,omitempty"`
+	Network      []InterfaceInfo      `json:"network,omitempty"`
+	Kernel       *KernelInfo          `json:"kernel,omitempty"`
+	Sensors      []SensorInfo         `json:"sensors,omitempty"`
+	Containers   []ContainerInfo      `json:"containers,omitempty"`
+	Cgroups      []CgroupInfo         `json:"cgroups,omitempty"`
+	GPUs         []GPUInfo            `json:"gpus,omitempty"`
+	Aggregation  *AggregationResult   `json:"aggregation,omitempty"`
+	Windows      []*AggregationResult `json:"windows,omitempty"` // finite periodic reports, returned together at query completion
+	Capabilities *Capabilities        `json:"capabilities,omitempty"`
+	Symbols      *SymbolResult        `json:"symbols,omitempty"`
 }
 
 // MarshalJSON keeps empty collections visible for the selected source while
@@ -181,7 +182,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.Aggregation != nil {
+	if s.Aggregation != nil || s.Windows != nil {
 		return encoded, nil
 	}
 	var collection string

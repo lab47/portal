@@ -402,7 +402,44 @@ Percentiles sort numeric observations and select the nearest rank: for a nonempt
 
 Available event aggregate/grouping fields are `pid`, `tid`, `syscall` for syscalls; `pid`, `name`, `action` for process events; `protocol`, `direction`, `src.ip`, `dst.ip`, `src.port`, `dst.port`, `length` for packets; `device`, `operation`, `sector`, `sectors` for disk; and selected `field.NAME` values for tracepoints. Numeric functions on event sources accept integer fields: process `pid`, packet ports and `length` (full captured frame length in bytes), disk `device`, `sector` and `sectors` (512-byte sector units), and all syscall/tracepoint fields. Strings can be grouped or counted distinctly, not summed or averaged. These additions do not change the available `where` filters. Up to four grouping fields can be combined. Windows must be positive and at most one hour. More than 4,096 groups fails explicitly rather than returning truncated results.
 
-For event sources, the window is half-open `[start, end)` using server ingestion time, beginning immediately before the source is attached; attachment time is included and events outside that interval are excluded. This does not query registered-monitor history or repeat windows. Collection is still best-effort according to each source's capture limits. Disconnecting or canceling stops collection; source failures and premature termination return errors, not a misleading complete result. Filters, function, field, percentile, grouping fields, window duration, and sampling interval are signed and checked server-side with the existing source authorization rules. `portal monitor` and registered monitors reject aggregation queries; use `portal query` or `Client.Query(ctx, request)`, where `request` comes from `ParseMonitorQuery` or specifies `Aggregation: &AggregationRequest{Window: 30*time.Second, Function: "sum", Field: "length", GroupBy: []string{"dst.ip"}}` with `Source: "packets"`. Omitted `Function` still means `count`. The result is in `Snapshot.Aggregation`.
+For event sources, the window is half-open `[start, end)` using server ingestion time, beginning immediately before the source is attached; attachment time is included and events outside that interval are excluded. This does not query registered-monitor history. Collection is still best-effort according to each source's capture limits. Disconnecting or canceling stops collection; source failures and premature termination return errors, not a misleading complete result. Filters, function, field, percentile, grouping fields, window duration, and sampling interval are signed and checked server-side with the existing source authorization rules. `portal monitor` and registered monitors reject aggregation queries; use `portal query` or `Client.Query(ctx, request)`, where `request` comes from `ParseMonitorQuery` or specifies `Aggregation: &AggregationRequest{Window: 30*time.Second, Function: "sum", Field: "length", GroupBy: []string{"dst.ip"}}` with `Source: "packets"`. Omitted `Function` still means `count`. The result is in `Snapshot.Aggregation`.
+
+### Selector/action queries
+
+The original DSL remains supported. Alternatively, separate event selection from aggregation actions and reporting:
+
+```sh
+portal query --name node-a --query '
+syscalls:completion where syscall in (:fsync, :fdatasync) {
+  let caller = stack.user(from: ["os.(*File).Sync", glob("*Fdatasync")], offsets: false)
+  let directory = path.prefix(file.path, 3)
+  @syncs[process_name, directory, caller] = {
+    calls: count(), elapsed: sum(duration_ns), p95: percentile(duration_ns, 95)
+  }
+} after 30s { emit @syncs order by elapsed desc limit 25 }'
+```
+
+`let` defines a field alias or supported projection, not a general expression. Stack and file projections automatically request capture. Stack functions are `stack.user(...)` and `stack.kernel(...)`, with named options `offsets`, `from`, `until`, `top`, `drop_top`, and `drop_bottom`. Stack patterns use double-quoted literal names (including Go pointer methods) or explicit `glob("prefix*")` / `glob("*suffix")`; literal names beginning or ending with `*` are not supported. `from` accepts a list of alternatives. `path.prefix(file.path, N)` groups by the parent directory truncated to N components. Aliases become output grouping keys.
+
+The selector may be a bare source, `syscalls:entry` / `syscalls:completion`, `disk:entry` / `disk:completion`, `process:start` / `process:exit`, or `tracepoint:CATEGORY:NAME`. Tracepoints still require `where fields in (...)`. Predicates reuse existing server filters, supporting `=` / `==`, `in (...)` or `in [...]`, and `and`. Existing predicate glob semantics are unchanged. This syntax is case-sensitive, uses double-quoted strings, and does not support comments.
+
+One selector and one named table are supported per query. Table groups use existing fields or local aliases; `[]` means ungrouped. Values are named aggregate functions, or a lone function such as `@traffic[src.ip] = sum(length)` (column name `value`). Available functions are `count()`, `sum`, `avg`, `min`, `max`, `count_distinct`, and `percentile`. Results use compact `aggregation.table`, `columns` with metric names, and `rows` with group keys and aligned values. Optional `order by METRIC desc` and `limit N` apply to output, not collection. CLI/MCP queries accept this syntax and the usual trailing jq stage. Both client and server must support this extension.
+
+For finite periodic reports, keep one subscription open and clear the table between buckets:
+
+```sh
+portal query --name node-a --query '
+disk:completion where operation = write {
+  @writes[device_name, io.cgroup.path] = {
+    requests: count(), sectors: sum(sectors), p95: percentile(duration_ns, 95)
+  }
+} every 30s { emit @writes order by sectors desc limit 10; clear @writes }
+  after 5m { stop }'
+```
+
+These are **non-overlapping buckets, returned together when the query finishes**, not live streaming or rolling windows. Results are in `Snapshot.Windows` / JSON `windows`; the last bucket is shortened if necessary. Empty buckets are included. Assignment uses server receipt time, not event timestamps. The final bucket carries subscription-wide collection counters, not per-bucket loss estimates. Periodic reports require event sources, an interval of at least 100ms, at most 64 buckets, and a total duration of at most one hour. All buckets/metrics share 4,096 retained metric groups and 65,536 retained values; output is capped at 7 MiB. Limits fail explicitly rather than silently truncating capture.
+
+Snapshot-only sources support one-shot action aggregates with their normal default sampling interval (for example `memory { @usage[] = avg(used) } after 5s { emit @usage }`), not periodic action reports. Process actions currently select lifecycle events. There is no arbitrary scripting, multiple probes/tables, cross-source joining, or persistent aggregate monitor. Actions lower to the same signed and validated requests and policy checks as the original DSL. API equivalents add `Table`, metric `Name`, `GroupAliases`, and `ReportEvery` to `AggregationRequest`; `ReportEvery` is separate from the existing snapshot sampling `Every`.
 
 ### Sampled snapshot aggregations
 

@@ -211,6 +211,22 @@ func TestMonitorStream(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("aggregation did not stop its source")
 	}
+	probe, err := ParseMonitorQuery(`syscalls where syscall = 3 { let process = pid; @calls[process] = {calls: count(), total: sum(syscall)} } every 100ms { emit @calls; clear @calls } after 250ms { stop }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	series, err := monitorRequestRemote(ctx, client, reg, signer, cert, probe, nil)
+	if err != nil || len(series.Windows) != 3 || len(series.Windows[0].Rows) != 2 || series.Windows[0].Table != "calls" || series.Windows[0].Columns[1].Name != "total" {
+		t.Fatalf("remote probe reports: %+v, %v", series, err)
+	}
+	if string(series.Windows[0].Rows[0].Group["process"]) != "71" || string(series.Windows[0].Rows[0].Values[1]) != "6" || len(series.Windows[1].Rows) != 0 {
+		t.Fatalf("remote report lost aliases, metrics or clear: %+v", series.Windows)
+	}
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("probe did not stop source")
+	}
 	for _, tc := range []struct{ metric, want string }{{"sum(syscall)", "9"}, {"count_distinct(pid)", "2"}, {"percentile(pid,95)", "72"}} {
 		request, err := ParseMonitorQuery("syscalls where syscall = 3 " + tc.metric + " over 50ms")
 		if err != nil {
