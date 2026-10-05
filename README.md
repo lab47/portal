@@ -675,6 +675,38 @@ Every input table must participate in an emit or join; periodic scripts must cle
 
 API callers set `MonitorRequest.Reports` to `[]AggregateReport{{Left: "flush", Right: "journal", Kind: "left", On: []string{"proc"}, Sort: "flush_ns", Limit: 20}}`. A report with only `Left` emits an original table. Input probes must have compact output and no pre-join row filtering/sorting/limits; source predicates remain supported. Joined JSON decodes to the existing column-aligned Go `AggregateRow.Values`. Reports are included in the signed request and validated on the server. Upgrade both client and server for join support; scripts without joins retain their existing syntax and output.
 
+#### Rollups and computed columns
+
+Use `rollup by` to keep a subset of a table's **output group names**, either when emitting it or on either side of a join. This avoids collecting the source twice just to get coarser groups. For example:
+
+```sh
+portal query --name node-a --query '
+disk:completion where device_name = "nvme0n1" {
+  @io[owner: io.cgroup.path, operation: operation] = {ops: count(), sectors: sum(sectors), p99: percentile(duration_ns, 99)}
+}
+cgroups {
+  @kernel[owner: path] = {write_ops: rate(io.write_ios)}
+}
+after 30s {
+  emit @io;
+  emit @io rollup by owner full join @kernel on owner
+    select ops_per_s = io.ops / window.seconds,
+           kib_per_s = io.sectors * 512 / 1024 / window.seconds,
+           ratio = ops_per_s / kernel.write_ops
+    order by kib_per_s desc limit 20
+}'
+```
+
+For a write-only comparison, add `and operation = write` to the disk selector; otherwise `ops` includes all selected operations while `write_ops` counts only writes. The example's first emit intentionally retains the detailed operation breakdown. Neither join nor arithmetic implies that disk requests and cgroup accounting count identical operations.
+
+`emit @io rollup by owner` combines operations for each owner. `emit @a rollup by owner full join @b rollup by owner on owner` rolls up both inputs before matching. Rollup takes 1–4 unique existing group columns, in the requested order; it does not invent groups or turn null keys into joinable identities. Remaining duplicate join keys still fail. You can reuse an original table and multiple rollups without mutating them. Rollups operate on the **same observations**, not displayed summary numbers: averages retain weighting, percentiles retain samples, distinct counts retain set semantics, histograms combine observations, and rates preserve the union of valid observation intervals. Coarse reductions share the original subscription/sampler and retention budgets; requesting rollups consumes additional aggregate state, so percentile/distinct/histogram queries may reach the existing limits sooner. Periodic reports roll up each bucket independently; diagnostics remain source-wide or bucket-wide, not per rolled-up group.
+
+`select NAME = EXPRESSION[, ...]` **appends** up to eight numeric columns before `order by` and `limit`. It supports decimal literals, `+`, `-`, `*`, `/`, unary minus and parentheses with conventional precedence. Refer to existing metrics, unambiguous `TABLE.METRIC` names in joins, or previously defined computed columns. `window.seconds` is the actual output bucket/window length, including shorter final buckets; it is not the observed-time denominator used internally by `rate`. Unknown/ambiguous metrics, histograms in arithmetic, and conflicting column names are rejected before collection. Missing/null operands or division by zero produce null, which sorts last; missing measurements are not silently replaced with zero.
+
+Computed values use exact rational arithmetic over the completed metric values, with fractions rounded to at most 18 decimal places on output and full-width integers preserved. Expressions are limited to 64 nodes, depth 16, decimal literals of 128 bytes and 4096-bit numeric results. In a join, existing metrics remain nested under input table names while computed values are direct keys, such as `.tables[].aggregation.rows[].values.ratio`; `columns` includes descriptors with `function: "computed"`. API reports use `LeftRollup`, `RightRollup`, and `Select: []AggregateComputedColumn`; expressions are `AggregateExpression{Op, Value, Args}` trees with `number`, `field`, `neg`, `+`, `-`, `*`, `/` operators. These controls are signed and server-validated. Reports with rollups/select return `tables` in emit order, even with one selector. Both client and server must be updated. The old syntax is unchanged; buckets still arrive at completion rather than streaming.
+
+**Choosing join keys:** use task `cgroup.path` for syscall/tracepoint activity from the same executing cgroup, or disk `io.cgroup.path` against the cgroups source's `path` for charged I/O comparisons. Task membership is best-effort procfs information at receipt; charged I/O ownership comes from the request and can differ during writeback. Kernel journal/metadata work may legitimately be charged to root, and a tracepoint task's cgroup is not a substitute for the request's charged owner. Avoid treating the 15-character task `name` as a unique identity; `process_name` is more readable, but executable basenames can also collide. Ensure paths use compatible namespaces, and avoid adding ancestor/descendant cgroup counters together. Unequal event/counter rates alone do not prove lost events or disabled accounting.
+
 ### Sampled snapshot aggregations
 
 CPU, memory, network, kernel, sensors, GPU, containers, cgroups, and process snapshots use the same functions and grouping mechanism:

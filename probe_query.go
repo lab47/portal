@@ -31,6 +31,8 @@ type probeReport struct {
 	ascending                          bool
 	joinKind, right                    string
 	on, clears                         []string
+	leftRollup, rightRollup            []string
+	selects                            []AggregateComputedColumn
 }
 
 type probeProgram struct {
@@ -158,18 +160,45 @@ func newProbeGrammar() p.Rule {
 	order := p.Action(p.Seq(kw("order"), kw("by"), p.Named("field", id), p.Named("ascending", p.Or(p.Transform(kw("asc"), func(string) any { return true }), p.Transform(kw("desc"), func(string) any { return false })))), func(v p.Values) any {
 		return probeReport{sort: v.Get("field").(string), ascending: v.Get("ascending").(bool)}
 	})
-	join := p.Action(p.Seq(p.Named("kind", p.Or(p.Transform(kw("inner"), func(string) any { return "inner" }), p.Transform(kw("left"), func(string) any { return "left" }), p.Transform(kw("full"), func(string) any { return "full" }))), kw("join"), sym("@"), p.Named("right", id), kw("on"), p.Named("first", id), p.Named("rest", p.Many(p.Seq(sym(","), id), 0, -1, func(v []any) any { return v }))), func(v p.Values) any {
+	groupNames := p.Action(p.Seq(p.Named("first", id), p.Named("rest", p.Many(p.Seq(sym(","), id), 0, -1, func(v []any) any { return v }))), func(v p.Values) any {
+		names := []string{v.Get("first").(string)}
+		for _, x := range v.Get("rest").([]any) {
+			names = append(names, x.(string))
+		}
+		return names
+	})
+	rollup := p.Seq(kw("rollup"), kw("by"), groupNames)
+	join := p.Action(p.Seq(p.Named("kind", p.Or(p.Transform(kw("inner"), func(string) any { return "inner" }), p.Transform(kw("left"), func(string) any { return "left" }), p.Transform(kw("full"), func(string) any { return "full" }))), kw("join"), sym("@"), p.Named("right", id), p.Named("rollup", p.Maybe(rollup)), kw("on"), p.Named("first", id), p.Named("rest", p.Many(p.Seq(sym(","), id), 0, -1, func(v []any) any { return v }))), func(v p.Values) any {
 		r := probeReport{joinKind: v.Get("kind").(string), right: v.Get("right").(string), on: []string{v.Get("first").(string)}}
+		if x := v.Get("rollup"); x != nil {
+			r.rightRollup = x.([]string)
+		}
 		for _, x := range v.Get("rest").([]any) {
 			r.on = append(r.on, x.(string))
 		}
 		return r
 	})
-	emit := p.Action(p.Seq(kw("emit"), sym("@"), p.Named("table", id), p.Named("join", p.Maybe(join)), p.Named("sort", p.Maybe(order)), p.Named("limit", p.Maybe(p.Seq(kw("limit"), word)))), func(v p.Values) any {
+	selectColumn := p.Action(p.Seq(p.Named("name", id), sym("="), p.Named("expr", newAggregateExpressionGrammar(token))), func(v p.Values) any {
+		return AggregateComputedColumn{Name: v.Get("name").(string), Expression: v.Get("expr").(AggregateExpression)}
+	})
+	selects := p.Action(p.Seq(kw("select"), p.Named("first", selectColumn), p.Named("rest", p.Many(p.Seq(sym(","), selectColumn), 0, -1, func(v []any) any { return v }))), func(v p.Values) any {
+		out := []AggregateComputedColumn{v.Get("first").(AggregateComputedColumn)}
+		for _, x := range v.Get("rest").([]any) {
+			out = append(out, x.(AggregateComputedColumn))
+		}
+		return out
+	})
+	emit := p.Action(p.Seq(kw("emit"), sym("@"), p.Named("table", id), p.Named("rollup", p.Maybe(rollup)), p.Named("join", p.Maybe(join)), p.Named("select", p.Maybe(selects)), p.Named("sort", p.Maybe(order)), p.Named("limit", p.Maybe(p.Seq(kw("limit"), word)))), func(v p.Values) any {
 		r := probeReport{table: v.Get("table").(string)}
+		if x := v.Get("rollup"); x != nil {
+			r.leftRollup = x.([]string)
+		}
+		if x := v.Get("select"); x != nil {
+			r.selects = x.([]AggregateComputedColumn)
+		}
 		if x := v.Get("join"); x != nil {
 			j := x.(probeReport)
-			r.joinKind, r.right, r.on = j.joinKind, j.right, j.on
+			r.joinKind, r.right, r.on, r.rightRollup = j.joinKind, j.right, j.on, j.rightRollup
 		}
 		if x := v.Get("sort"); x != nil {
 			sort := x.(probeReport)
@@ -236,7 +265,7 @@ func parseProbeQuery(text string) (MonitorRequest, error) {
 	if script.reportBlocks == 2 && (script.reports[0].kind != "every" || script.reports[len(script.reports)-1].kind != "after") {
 		return MonitorRequest{}, errors.New("reporting requires one after block, optionally preceded by one every block")
 	}
-	if slices.ContainsFunc(script.reports, func(r probeReport) bool { return r.right != "" }) {
+	if slices.ContainsFunc(script.reports, func(r probeReport) bool { return r.right != "" || len(r.leftRollup) != 0 || len(r.selects) != 0 }) {
 		return compileJoinedScript(script)
 	}
 	for _, report := range script.reports {

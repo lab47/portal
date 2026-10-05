@@ -98,6 +98,7 @@ type AggregationResult struct {
 	Rows                 []AggregateRow                  `json:"rows,omitempty"`
 	TotalGroups          int                             `json:"total_groups,omitempty"`
 	OmittedZeroGroups    int                             `json:"omitted_zero_groups,omitempty"`
+	rollups              map[string]*AggregationResult   // execution-only coarse reductions; never sent on the wire
 }
 
 // Keep the selected result collection visible even for an empty grouped window.
@@ -113,7 +114,7 @@ func (a AggregationResult) MarshalJSON() ([]byte, error) {
 				}
 				values := make(map[string]any, len(a.Columns))
 				for i, column := range a.Columns {
-					if a.Join == nil {
+					if a.Join == nil || column.Function == "computed" {
 						values[column.Name] = row.Values[i]
 					} else {
 						table, metric, _ := strings.Cut(column.Name, ".")
@@ -187,6 +188,10 @@ func (a *AggregationResult) UnmarshalJSON(data []byte) error {
 			if result.Join != nil {
 				flat := make(map[string]json.RawMessage)
 				for table, data := range named {
+					if slices.ContainsFunc(result.Columns, func(c AggregateMetric) bool { return c.Name == table && c.Function == "computed" }) {
+						flat[table] = data
+						continue
+					}
 					var metrics map[string]json.RawMessage
 					if err := json.Unmarshal(data, &metrics); err != nil {
 						return err
@@ -595,17 +600,19 @@ func (e *aggregateAccumulator) add(a AggregationRequest, value any, retained *in
 	return nil
 }
 
-func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
-	number := func(n *big.Rat) string {
-		if n.IsInt() {
-			return n.Num().String()
-		}
-		value := strings.TrimRight(strings.TrimRight(n.FloatString(18), "0"), ".")
-		if value == "-0" {
-			value = "0"
-		}
-		return value
+func aggregateNumber(n *big.Rat) string {
+	if n.IsInt() {
+		return n.Num().String()
 	}
+	value := strings.TrimRight(strings.TrimRight(n.FloatString(18), "0"), ".")
+	if value == "-0" {
+		value = "0"
+	}
+	return value
+}
+
+func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
+	number := aggregateNumber
 	var value string
 	switch a.Function {
 	case "sum":
@@ -699,6 +706,7 @@ type aggregateReduction struct {
 	metrics       []*aggregateReduction
 	seriesGroups  *int // periodic queries share a bounded group budget across buckets/metrics
 	stackCoverage *StackCoverageReport
+	rollups       map[string]*aggregateReduction
 }
 
 func newAggregateReduction(a AggregationRequest) *aggregateReduction {
@@ -725,6 +733,11 @@ func newAggregateReduction(a AggregationRequest) *aggregateReduction {
 }
 
 func (r *aggregateReduction) add(fields map[string]any) error {
+	for _, coarse := range r.rollups {
+		if err := coarse.add(fields); err != nil {
+			return err
+		}
+	}
 	if len(r.metrics) != 0 {
 		for _, metric := range r.metrics {
 			if err := metric.add(fields); err != nil {
@@ -792,6 +805,7 @@ func (r *aggregateReduction) result(source string, start, end time.Time) Snapsho
 			result.Metrics = append(result.Metrics, metric.result(source, start, end).Aggregation)
 		}
 		r.formatRows(result)
+		r.attachRollups(result, source)
 		return Snapshot{Source: source, Time: end.UTC(), Aggregation: result}
 	}
 	keys := make([]string, 0, len(r.groups))
@@ -814,6 +828,7 @@ func (r *aggregateReduction) result(source string, start, end time.Time) Snapsho
 		}
 	}
 	r.formatRows(result)
+	r.attachRollups(result, source)
 	return Snapshot{Source: source, Time: end.UTC(), Aggregation: result}
 }
 
@@ -926,10 +941,19 @@ func aggregateScript(ctx context.Context, request MonitorRequest, source eventSo
 		go func() {
 			var snapshot Snapshot
 			var err error
+			var rollups [][]string
+			for _, report := range request.Reports {
+				if report.Left == probe.Aggregation.Table && len(report.LeftRollup) != 0 {
+					rollups = append(rollups, report.LeftRollup)
+				}
+				if report.Right == probe.Aggregation.Table && len(report.RightRollup) != 0 {
+					rollups = append(rollups, report.RightRollup)
+				}
+			}
 			if sampledAggregation(probe) {
-				snapshot, err = aggregateSnapshotsAt(ctx, probe, collect, start)
+				snapshot, err = aggregateSnapshotsAt(ctx, probe, collect, start, rollups...)
 			} else {
-				snapshot, err = aggregateEventsAt(ctx, probe, source, start)
+				snapshot, err = aggregateEventsAt(ctx, probe, source, start, rollups...)
 			}
 			done <- completed{i, snapshot, err}
 		}()
@@ -969,7 +993,7 @@ func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSo
 	return aggregateEventsAt(ctx, request, source, time.Now())
 }
 
-func aggregateEventsAt(ctx context.Context, request MonitorRequest, source eventSource, start time.Time) (Snapshot, error) {
+func aggregateEventsAt(ctx context.Context, request MonitorRequest, source eventSource, start time.Time, rollups ...[]string) (Snapshot, error) {
 	if err := request.validate(); err != nil {
 		return Snapshot{}, err
 	}
@@ -991,6 +1015,9 @@ func aggregateEventsAt(ctx context.Context, request MonitorRequest, source event
 			}
 			reductions = append(reductions, r)
 		}
+	}
+	for _, reduction := range reductions {
+		reduction.configureRollups(rollups)
 	}
 	if request.Stacks != nil {
 		for _, reduction := range reductions {

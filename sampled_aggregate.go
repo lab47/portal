@@ -275,17 +275,6 @@ func cgroupIODeltaValid(current, previous map[string]any, path string) bool {
 // Each sampled metric independently skips unavailable fields. In particular,
 // a rate's first observation is a baseline, but gauges/count can use that sample.
 func (r *aggregateReduction) addSample(fields map[string]any) error {
-	if len(r.metrics) != 0 {
-		for _, metric := range r.metrics {
-			if err := metric.addSample(fields); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if r.request.Field != "" && fields[r.request.Field] == nil {
-		return nil
-	}
 	return r.add(fields)
 }
 
@@ -295,7 +284,7 @@ func aggregateSnapshots(ctx context.Context, request MonitorRequest, collect fun
 	return aggregateSnapshotsAt(ctx, request, collect, time.Now())
 }
 
-func aggregateSnapshotsAt(ctx context.Context, request MonitorRequest, collect func(context.Context, MonitorRequest) (Snapshot, error), start time.Time) (Snapshot, error) {
+func aggregateSnapshotsAt(ctx context.Context, request MonitorRequest, collect func(context.Context, MonitorRequest) (Snapshot, error), start time.Time, rollups ...[]string) (Snapshot, error) {
 	if err := request.validate(); err != nil {
 		return Snapshot{}, err
 	}
@@ -314,6 +303,7 @@ func aggregateSnapshotsAt(ctx context.Context, request MonitorRequest, collect f
 	selection := request
 	selection.Mode, selection.Aggregation = "snapshot", nil
 	reduction := newAggregateReduction(a)
+	reduction.configureRollups(rollups)
 	previous := make(map[string]sampleObservation)
 	metadata := snapshotSampleFields(request.Source)
 	next := start

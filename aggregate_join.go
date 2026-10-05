@@ -14,13 +14,16 @@ import (
 // AggregateReport emits a table or a one-to-one join of two completed tables.
 // Sort is a metric name (unambiguous) or TABLE.METRIC; limits apply after joining.
 type AggregateReport struct {
-	Left      string   `json:"left"`
-	Right     string   `json:"right,omitempty"`
-	Kind      string   `json:"kind,omitempty"` // inner, left, full; empty without Right
-	On        []string `json:"on,omitempty"`
-	Sort      string   `json:"sort,omitempty"`
-	Limit     int      `json:"limit,omitempty"`
-	Ascending bool     `json:"ascending,omitempty"`
+	Left        string                    `json:"left"`
+	Right       string                    `json:"right,omitempty"`
+	Kind        string                    `json:"kind,omitempty"` // inner, left, full; empty without Right
+	On          []string                  `json:"on,omitempty"`
+	LeftRollup  []string                  `json:"left_rollup,omitempty"`
+	RightRollup []string                  `json:"right_rollup,omitempty"`
+	Select      []AggregateComputedColumn `json:"select,omitempty"` // appended numeric columns, evaluated before sorting/limit
+	Sort        string                    `json:"sort,omitempty"`
+	Limit       int                       `json:"limit,omitempty"`
+	Ascending   bool                      `json:"ascending,omitempty"`
 }
 
 func compileJoinedScript(script probeScript) (MonitorRequest, error) {
@@ -43,7 +46,7 @@ func compileJoinedScript(script probeScript) (MonitorRequest, error) {
 		if report.kind != "after" && !periodic || periodic && report.kind != "every" {
 			return MonitorRequest{}, errors.New("joins require after { emit } or every { emit; clear } followed by after { stop }")
 		}
-		a := AggregateReport{Left: report.table, Right: report.right, Kind: report.joinKind, On: report.on, Sort: report.sort, Ascending: report.ascending}
+		a := AggregateReport{Left: report.table, Right: report.right, Kind: report.joinKind, On: report.on, LeftRollup: report.leftRollup, RightRollup: report.rightRollup, Select: report.selects, Sort: report.sort, Ascending: report.ascending}
 		if report.limit != "" {
 			var err error
 			a.Limit, err = strconv.Atoi(report.limit)
@@ -163,6 +166,9 @@ func validateAggregateReports(r MonitorRequest) error {
 			return fmt.Errorf("report references unknown table @%s", report.Left)
 		}
 		used[report.Left] = true
+		if err := validateRollup(left, report.LeftRollup); err != nil {
+			return err
+		}
 		columns := reportColumns(left, report.Right != "")
 		if report.Right != "" {
 			right := tables[report.Right]
@@ -172,20 +178,29 @@ func validateAggregateReports(r MonitorRequest) error {
 			if report.Kind != "inner" && report.Kind != "left" && report.Kind != "full" {
 				return errors.New("join kind must be inner, left or full")
 			}
+			if err := validateRollup(right, report.RightRollup); err != nil {
+				return err
+			}
 			if len(report.On) == 0 || len(report.On) > 4 {
 				return errors.New("join requires 1–4 explicit group keys")
 			}
 			keys := make(map[string]bool)
 			for _, key := range report.On {
-				if keys[key] || !slices.Contains(outputGroupNames(left), key) || !slices.Contains(outputGroupNames(right), key) {
+				if keys[key] || !slices.Contains(reportGroupNames(left, report.LeftRollup), key) || !slices.Contains(reportGroupNames(right, report.RightRollup), key) {
 					return fmt.Errorf("join key %q must be a unique grouping column on both tables", key)
 				}
 				keys[key] = true
 			}
 			used[report.Right] = true
 			columns = append(columns, reportColumns(right, true)...)
-		} else if report.Kind != "" || len(report.On) != 0 {
+		} else if report.Kind != "" || len(report.On) != 0 || len(report.RightRollup) != 0 {
 			return errors.New("join kind/keys require a right table")
+		}
+		if err := validateComputedColumns(report.Select, columns); err != nil {
+			return err
+		}
+		for _, column := range report.Select {
+			columns = append(columns, AggregateMetric{Name: column.Name, Function: "computed"})
 		}
 		if report.Limit < 0 || report.Limit > maxAggregateGroups {
 			return errors.New("report limit must be 0–4096")
@@ -324,6 +339,9 @@ func joinAggregateRows(report AggregateReport, left, right *AggregationResult) (
 			}
 		}
 	}
+	if err := applyComputedColumns(report.Select, result); err != nil {
+		return nil, err
+	}
 	applyReportControls(report, result)
 	return result, nil
 }
@@ -370,11 +388,16 @@ func reportScriptTables(request MonitorRequest, tables []Snapshot) ([]Snapshot, 
 			joined.Source = "join"
 		}
 		combine := func(l, r *AggregationResult) (*AggregationResult, error) {
+			l = reportRollupResult(l, report.LeftRollup)
 			if report.Right != "" {
+				r = reportRollupResult(r, report.RightRollup)
 				return joinAggregateRows(report, l, r)
 			}
 			copy := *l
 			copy.Rows = slices.Clone(l.Rows)
+			if err := applyComputedColumns(report.Select, &copy); err != nil {
+				return nil, err
+			}
 			applyReportControls(report, &copy)
 			return &copy, nil
 		}
