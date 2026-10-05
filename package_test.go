@@ -124,7 +124,7 @@ func TestPackageAPI(t *testing.T) {
 		t.Fatalf("configured CA trust ignored: %v", err)
 	}
 	result, err = (portal.Client{
-		Name: "node-a", CoordinatorURL: coord.URL, KeyFile: keyFile, CertFile: certFile, User: account.Username,
+		Name: "node-a", CoordinatorURL: coord.URL, KeyFile: keyFile, CertFile: certFile, CAFile: caFile, User: account.Username,
 	}).Run(ctx, []string{"/usr/bin/id", "-un"})
 	if err != nil || result.Output != account.Username+"\n" || result.Error != "" {
 		t.Fatalf("package client target user: %+v, %v", result, err)

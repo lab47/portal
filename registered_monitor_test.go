@@ -373,7 +373,7 @@ func TestRegisteredMonitorReconnectAndAuthorization(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- serveWithSource(ctx, server, ca.PublicKey(), "admin", policy{"operator": {fmt.Sprint(os.Geteuid()): true}}, source)
+		done <- serveWithSource(ctx, server, peerAuthenticator{ca: ca.PublicKey(), principal: "admin"}, policy{"operator": {fmt.Sprint(os.Geteuid()): true}}, source)
 	}()
 	request := MonitorRequest{Source: "syscalls", PID: 42}
 	id, err := registeredMonitorRemote(ctx, client, reg, signer, cert, monitorAction{Action: "create", Request: &request, TTL: time.Hour}, nil)

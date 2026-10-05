@@ -14,14 +14,16 @@ import (
 // ServerConfig bundles server settings, the registration secret, the trusted
 // CA public key (authorized_keys format), and the account authorization policy.
 type ServerConfig struct {
-	Name        string              `json:"name"`
-	Coordinator string              `json:"coordinator"`
-	CA          string              `json:"ca"`
-	Identities  map[string][]string `json:"identities"`
-	Principal   string              `json:"principal,omitempty"`
-	Relay       string              `json:"relay,omitempty"`
-	Listen      string              `json:"listen,omitempty"`
-	Labels      map[string]string   `json:"labels,omitempty"`
+	Name                string              `json:"name"`
+	Coordinator         string              `json:"coordinator"`
+	CA                  string              `json:"ca,omitempty"`
+	Identities          map[string][]string `json:"identities,omitempty"`
+	Principal           string              `json:"principal,omitempty"`
+	Relay               string              `json:"relay,omitempty"`
+	Listen              string              `json:"listen,omitempty"`
+	Labels              map[string]string   `json:"labels,omitempty"`
+	AuthorizedKeys      string              `json:"authorized_keys,omitempty"`
+	QueryAuthorizedKeys string              `json:"query_authorized_keys,omitempty"`
 }
 
 func DefaultServerConfigPath() (string, error) {
@@ -35,17 +37,26 @@ func DefaultServerConfigPath() (string, error) {
 // Validate checks configuration before saving or opening network listeners.
 // Account names are resolved on the server, just as for a standalone policy.
 func (c ServerConfig) Validate() error {
-	if c.Name == "" || c.CA == "" {
-		return errors.New("server config requires name and CA public key")
+	if c.Name == "" {
+		return errors.New("server config requires name")
 	}
 	if _, err := ParseCoordinatorURL(c.Coordinator); err != nil {
 		return err
 	}
-	if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(c.CA)); err != nil {
-		return errors.New("server config has an invalid CA public key")
-	}
-	if _, err := compilePolicy(c.Identities); err != nil {
-		return err
+	if c.CA == "" {
+		if c.Identities != nil || c.Principal != "" {
+			return errors.New("certificate identities and principal require a configured CA")
+		}
+	} else {
+		if c.AuthorizedKeys != "" || c.QueryAuthorizedKeys != "" {
+			return errors.New("authorized_keys and query_authorized_keys cannot be combined with a CA")
+		}
+		if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(c.CA)); err != nil {
+			return errors.New("server config has an invalid CA public key")
+		}
+		if _, err := compilePolicy(c.Identities); err != nil {
+			return err
+		}
 	}
 	if c.Listen != "" {
 		if _, err := netip.ParseAddrPort(c.Listen); err != nil {
@@ -87,6 +98,11 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 	if err := c.Validate(); err != nil {
 		return ServerConfig{}, err
 	}
+	for _, field := range []*string{&c.AuthorizedKeys, &c.QueryAuthorizedKeys} {
+		if *field != "" && !filepath.IsAbs(*field) {
+			*field = filepath.Join(filepath.Dir(path), *field)
+		}
+	}
 	return c, nil
 }
 
@@ -119,6 +135,8 @@ func (s Server) configured() (Server, error) {
 		{&s.Name, &c.Name}, {&s.CoordinatorURL, &coordinator.URL},
 		{&s.Token, &coordinator.Token}, {&s.Principal, &c.Principal},
 		{&s.RelayURL, &c.Relay}, {&s.Listen, &c.Listen},
+		{&s.AuthorizedKeysFile, &c.AuthorizedKeys},
+		{&s.QueryAuthorizedKeysFile, &c.QueryAuthorizedKeys},
 	} {
 		if *pair[0] == "" {
 			*pair[0] = *pair[1]
@@ -142,7 +160,7 @@ func (s Server) configured() (Server, error) {
 		}
 		s.Labels = labels
 	}
-	if s.Principal == "" {
+	if s.Principal == "" && (s.CAFile != "" || s.CAPublicKey != "") {
 		s.Principal = "admin"
 	}
 	return s, nil

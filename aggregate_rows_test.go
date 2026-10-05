@@ -76,6 +76,16 @@ func TestAggregateRowSelectionPrecisionAndMissingMetrics(t *testing.T) {
 	if len(a.Rows) != 3 || string(a.Rows[2].Group["group"]) != `"missing"` || string(a.Rows[2].Values[1]) != "null" {
 		t.Fatalf("missing metric: %+v", a.Rows)
 	}
+	r.request.Ascending, r.request.Limit = true, 1
+	a = r.result("test", time.Now(), time.Now()).Aggregation
+	if len(a.Rows) != 1 || string(a.Rows[0].Group["group"]) != `"smaller"` {
+		t.Fatalf("ascending limit/precision: %+v", a.Rows)
+	}
+	r.request.Limit = 0
+	a = r.result("test", time.Now(), time.Now()).Aggregation
+	if string(a.Rows[0].Group["group"]) != `"smaller"` || string(a.Rows[1].Group["group"]) != `"larger"` || string(a.Rows[2].Group["group"]) != `"missing"` {
+		t.Fatalf("ascending null ordering: %+v", a.Rows)
+	}
 	// Sampled grouping also uses a null bucket, rather than dropping the record.
 	if err := r.addSample(map[string]any{"a": 7}); err != nil {
 		t.Fatal(err)
@@ -134,4 +144,65 @@ func TestCompactRowsDoNotRepeatLongStacks(t *testing.T) {
 		t.Fatalf("stack output not compact: %d vs legacy %d bytes, %v", len(compact), len(legacy), err)
 	}
 	t.Logf("long-stack output: %d bytes compact vs %d legacy", len(compact), len(legacy))
+}
+
+func TestNamedTableRowJSON(t *testing.T) {
+	r, err := ParseMonitorQuery(`syscalls:completion { @io[proc: pid] = {total: sum(duration_ns), ops: count(), p99: percentile(duration_ns, 99)} } after 1s { emit @io order by total asc }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reduction := newAggregateReduction(*r.Aggregation)
+	for _, fields := range []map[string]any{
+		{"pid": 7, "duration_ns": uint64(18446744073709551615)},
+		{"pid": 7, "duration_ns": uint64(1)},
+		{"pid": 8}, // count observes the group; optional duration metrics remain null
+	} {
+		if err := reduction.add(fields); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := reduction.result("syscalls", time.Now(), time.Now()).Aggregation
+	data, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"values":{"ops":2,"p99":18446744073709551615,"total":18446744073709551616}`) || !strings.Contains(string(data), `"values":{"ops":1,"p99":null,"total":null}`) || strings.Contains(string(data), `"values":[`) {
+		t.Fatalf("incorrect named metrics: %s", data)
+	}
+	var decoded AggregationResult
+	if err := json.Unmarshal(data, &decoded); err != nil || !reflect.DeepEqual(decoded.Rows, a.Rows) || !reflect.DeepEqual(decoded.Columns, a.Columns) {
+		t.Fatalf("named roundtrip lost column order: %s %v", data, err)
+	}
+	// Keep the legacy wire format, including compatibility with older table results.
+	a.Table = ""
+	legacy, err := json.Marshal(a)
+	if err != nil || !strings.Contains(string(legacy), `"values":[18446744073709551616,2,18446744073709551615]`) {
+		t.Fatalf("legacy arrays changed: %s %v", legacy, err)
+	}
+	if err := json.Unmarshal(legacy, &decoded); err != nil || !reflect.DeepEqual(decoded.Rows, a.Rows) {
+		t.Fatalf("legacy decoding changed: %v", err)
+	}
+	for _, value := range []string{`{"ops":1,"p99":2}`, `{"ops":1,"p99":2,"wrong":3}`} {
+		bad := `{"table":"io","columns":[{"name":"ops"},{"name":"p99"},{"name":"total"}],"rows":[{"group":{},"values":` + value + `}]}`
+		if err := json.Unmarshal([]byte(bad), &decoded); err == nil {
+			t.Fatal("silently lost a named metric")
+		}
+	}
+	for _, query := range []string{
+		`syscalls { @x[] = count() } after 1s { emit @x }`,
+		`syscalls { @x[pid] = count() } after 1s { emit @x }`,
+	} {
+		r, err := ParseMonitorQuery(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := newAggregateReduction(*r.Aggregation).result(r.Source, time.Now(), time.Now()).Aggregation
+		data, err := json.Marshal(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Aggregation.GroupBy) == 0 && !strings.Contains(string(data), `"values":{"value":0}`) || len(r.Aggregation.GroupBy) != 0 && !strings.Contains(string(data), `"rows":[]`) {
+			t.Fatalf("empty named output: %s", data)
+		}
+	}
 }

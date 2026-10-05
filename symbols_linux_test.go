@@ -14,8 +14,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
 func TestSymbolMappingsIgnoreHeapButRetainExecutableIdentity(t *testing.T) {
@@ -32,16 +30,15 @@ func TestSymbolMappingsIgnoreHeapButRetainExecutableIdentity(t *testing.T) {
 }
 
 func TestSymbolAndStackAuthorizationRequiresExplicitRoot(t *testing.T) {
-	cert := &ssh.Certificate{KeyId: "operator"}
 	for _, request := range []MonitorRequest{
 		{Source: "symbols"},
 		{Source: "syscalls", Stacks: &StackCapture{User: true}},
 		{Source: "tracepoint", Stacks: &StackCapture{Kernel: true}},
 	} {
-		if err := authorizeMonitorRequest(policy{"operator": {"65534": true}}, cert, request); err == nil {
+		if err := authorizeMonitorRequest(policy{"operator": {"65534": true}}, "operator", request); err == nil {
 			t.Fatalf("accepted request without root policy: %+v", request)
 		}
-		err := authorizeMonitorRequest(policy{"operator": {"0": true}}, cert, request)
+		err := authorizeMonitorRequest(policy{"operator": {"0": true}}, "operator", request)
 		if os.Geteuid() == 0 && err != nil {
 			t.Fatalf("explicit root authorization rejected: %v", err)
 		}

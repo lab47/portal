@@ -16,7 +16,8 @@ import (
 type Client struct {
 	Name, CoordinatorURL          string
 	KeyFile, CertFile             string
-	ConfigFile, CAFile, Principal string // Config defaults; optional local certificate trust check.
+	ConfigFile, CAFile, Principal string // Config defaults; a CA selects certificate authentication.
+	CAURL, RefreshTokenFile       string // Headless renewal; token defaults to <key>.refresh.
 	User                          string // Optional local account on the server; empty uses the server process's account.
 }
 
@@ -24,37 +25,42 @@ type Client struct {
 // while err reports transport, setup, or protocol failures.
 func (c Client) Run(ctx context.Context, argv []string) (Result, error) {
 	if len(argv) == 0 {
-		return Result{}, errors.New("client requires name, coordinator URL, key, certificate and command")
+		return Result{}, errors.New("command required")
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 80*time.Second)
 	defer cancel()
-	return withClient(c, requestCtx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (Result, error) {
+	return withClient(c, requestCtx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (Result, error) {
 		return runRemote(requestCtx, ep, reg, signer, cert, c.User, argv)
 	})
 }
 
-func withClient[T any](c Client, ctx context.Context, use func(*iroh.Endpoint, registration, ssh.Signer, *ssh.Certificate) (T, error)) (T, error) {
+func withClient[T any](c Client, ctx context.Context, use func(*iroh.Endpoint, registration, ssh.Signer, ssh.PublicKey) (T, error)) (T, error) {
 	var zero T
 	var err error
 	c, err = c.configured()
 	if err != nil {
 		return zero, err
 	}
-	if c.Name == "" || c.CoordinatorURL == "" || c.KeyFile == "" || c.CertFile == "" {
+	if c.Name == "" || c.CoordinatorURL == "" {
+		return zero, errors.New("client requires name and coordinator URL")
+	}
+	if c.CAFile != "" && (c.KeyFile == "" || c.CertFile == "") {
 		return zero, errors.New("client requires name, coordinator URL, key and certificate")
 	}
-	signer, cert, err := loadSigner(c.KeyFile, c.CertFile)
+	var signer ssh.Signer
+	var cert ssh.PublicKey
+	if c.CAFile == "" {
+		var closeAgent func()
+		signer, closeAgent, err = openSSHSigner(ctx, c.KeyFile)
+		if err == nil {
+			defer closeAgent()
+			cert = signer.PublicKey()
+		}
+	} else {
+		signer, cert, err = c.clientSigner(ctx)
+	}
 	if err != nil {
 		return zero, err
-	}
-	if c.CAFile != "" {
-		ca, err := LoadCAPublicKey(ctx, c.CAFile)
-		if err != nil {
-			return zero, err
-		}
-		if err := VerifyUserCertificate(ca, c.Principal, cert); err != nil {
-			return zero, err
-		}
 	}
 	reg, err := lookup(ctx, strings.TrimRight(c.CoordinatorURL, "/"), c.Name)
 	if err != nil {

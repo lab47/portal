@@ -88,6 +88,88 @@ func TestMonitorProofAndFilters(t *testing.T) {
 	}
 }
 
+func TestScriptValidationAuthorizationAndProof(t *testing.T) {
+	r, err := ParseMonitorQuery(`process { @starts[] = count() } syscalls where syscall = :fsync { @calls[] = count() } after 1s { emit @starts; emit @calls }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*MonitorRequest){
+		func(r *MonitorRequest) { r.Mode = "" },
+		func(r *MonitorRequest) { r.Source = "process" },
+		func(r *MonitorRequest) { r.PID = 7 },
+		func(r *MonitorRequest) { r.Aggregation = nil },
+		func(r *MonitorRequest) { r.Aggregation.Compact = true },
+		func(r *MonitorRequest) { r.Aggregation.Window = 2 * time.Second },
+		func(r *MonitorRequest) { r.Probes = nil },
+		func(r *MonitorRequest) { r.Probes = append(r.Probes, make([]MonitorRequest, 7)...) },
+		func(r *MonitorRequest) { r.Probes[1].Source = "script" },
+		func(r *MonitorRequest) { r.Probes[1].Probes = []MonitorRequest{r.Probes[0]} },
+		func(r *MonitorRequest) { r.Probes[1].Mode = "snapshot" },
+		func(r *MonitorRequest) { r.Probes[1].Aggregation = nil },
+		func(r *MonitorRequest) { r.Probes[1].Aggregation.Table = "starts" },
+		func(r *MonitorRequest) { r.Probes[1].Aggregation.Table = "" },
+		func(r *MonitorRequest) { r.Probes[1].Aggregation.ReportEvery = 100 * time.Millisecond },
+		func(r *MonitorRequest) { r.Probes[1].Syscalls = []int{-1} },
+	} {
+		var bad MonitorRequest
+		if err := json.Unmarshal(data, &bad); err != nil {
+			t.Fatal(err)
+		}
+		mutate(&bad)
+		called := false
+		_, err := aggregateScript(context.Background(), bad, func(context.Context, MonitorRequest, func(Event) error) error {
+			called = true
+			return errors.New("unexpected collection")
+		}, nil)
+		if err == nil || called {
+			t.Fatalf("invalid script reached collection: %+v, %v", bad, err)
+		}
+	}
+	ca, signer := testSigner(t), testSigner(t)
+	cert := testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(time.Hour))
+	nonce := []byte(strings.Repeat("n", 32))
+	proof, err := signMonitor(signer, cert, nonce, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyMonitor(ca.PublicKey(), "admin", nonce, proof); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*MonitorRequest){
+		func(r *MonitorRequest) { r.Probes[1].PID = 42 },
+		func(r *MonitorRequest) { r.Probes[1].SyscallNames[0] = "fdatasync" },
+		func(r *MonitorRequest) { r.Probes[1].Aggregation.Table = "other" },
+		func(r *MonitorRequest) { r.Probes = r.Probes[:1] },
+		func(r *MonitorRequest) { r.Aggregation.Window = time.Minute },
+	} {
+		var modified MonitorRequest
+		if err := json.Unmarshal(data, &modified); err != nil {
+			t.Fatal(err)
+		}
+		mutate(&modified)
+		changed := proof
+		changed.MonitorRequest = modified
+		if _, err := verifyMonitor(ca.PublicKey(), "admin", nonce, changed); err == nil {
+			t.Fatal("modified nested script passed signature check")
+		}
+	}
+	allowed := policy{"operator": {fmt.Sprint(os.Geteuid()): true}}
+	if err := authorizeMonitorRequest(allowed, cert.KeyId, r); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() != 0 {
+		// First selector is allowed, second now requires a root server.
+		r.Probes[1].Stacks = &StackCapture{User: true}
+		if err := authorizeMonitorRequest(allowed, cert.KeyId, r); err == nil || !strings.Contains(err.Error(), "selector syscalls") {
+			t.Fatalf("second selector bypassed stack authorization: %v", err)
+		}
+	}
+}
+
 func TestMonitorStream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -118,7 +200,7 @@ func TestMonitorStream(t *testing.T) {
 	ca, signer := testSigner(t), testSigner(t)
 	cert := testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(time.Hour))
 	allowed := policy{"operator": {fmt.Sprint(os.Geteuid()): true}}
-	stopped := make(chan struct{}, 1)
+	stopped := make(chan struct{}, maxScriptProbes)
 	source := func(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
 		if request.PID == 99 || request.Source == "packets" || request.Source == "disk" {
 			return errors.New("eBPF unavailable")
@@ -152,7 +234,9 @@ func TestMonitorStream(t *testing.T) {
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- serveWithSource(ctx, server, ca.PublicKey(), "admin", allowed, source) }()
+	go func() {
+		done <- serveWithSource(ctx, server, peerAuthenticator{ca: ca.PublicKey(), principal: "admin"}, allowed, source)
+	}()
 	request := MonitorRequest{Source: "syscalls", PID: 71, Syscalls: []int{3}}
 	stopEvent := errors.New("stop after matching event")
 	count := 0
@@ -211,21 +295,41 @@ func TestMonitorStream(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("aggregation did not stop its source")
 	}
-	probe, err := ParseMonitorQuery(`syscalls where syscall = 3 { let process = pid; @calls[process] = {calls: count(), total: sum(syscall)} } every 100ms { emit @calls; clear @calls } after 250ms { stop }`)
+	probe, err := ParseMonitorQuery(`syscalls where syscall = 3 and pid > 71 { let process = pid; @calls[process] = {calls: count(), total: sum(syscall)} } every 100ms { emit @calls; clear @calls } after 250ms { stop }`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	series, err := monitorRequestRemote(ctx, client, reg, signer, cert, probe, nil)
-	if err != nil || len(series.Windows) != 3 || len(series.Windows[0].Rows) != 2 || series.Windows[0].Table != "calls" || series.Windows[0].Columns[1].Name != "total" {
+	if err != nil || len(series.Windows) != 3 || len(series.Windows[0].Rows) != 1 || series.Windows[0].Table != "calls" || series.Windows[0].Columns[1].Name != "total" {
 		t.Fatalf("remote probe reports: %+v, %v", series, err)
 	}
-	if string(series.Windows[0].Rows[0].Group["process"]) != "71" || string(series.Windows[0].Rows[0].Values[1]) != "6" || len(series.Windows[1].Rows) != 0 {
+	if string(series.Windows[0].Rows[0].Group["process"]) != "72" || string(series.Windows[0].Rows[0].Values[1]) != "3" || len(series.Windows[1].Rows) != 0 {
 		t.Fatalf("remote report lost aliases, metrics or clear: %+v", series.Windows)
 	}
 	select {
 	case <-stopped:
 	case <-ctx.Done():
 		t.Fatal("probe did not stop source")
+	}
+	script, err := ParseMonitorQuery(`syscalls where syscall = 3 { @calls[] = {ops: count(), total: sum(syscall)} }
+process:start { @starts[] = count() } after 50ms { emit @starts; emit @calls }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := monitorRequestRemote(ctx, client, reg, signer, cert, script, nil)
+	if err != nil || len(tables.Tables) != 2 {
+		t.Fatalf("remote script: %+v, %v", tables, err)
+	}
+	a, b := tables.Tables[0].Aggregation, tables.Tables[1].Aggregation
+	if a == nil || b == nil || a.Table != "calls" || b.Table != "starts" || !a.Start.Equal(b.Start) || !a.End.Equal(b.End) || string(a.Rows[0].Values[0]) != "3" || string(a.Rows[0].Values[1]) != "9" || string(b.Rows[0].Values[0]) != "2" {
+		t.Fatalf("remote script lost tables, named metrics, filters or shared timing: %+v", tables)
+	}
+	for range 2 {
+		select {
+		case <-stopped:
+		case <-ctx.Done():
+			t.Fatal("script did not stop all sources")
+		}
 	}
 	for _, tc := range []struct{ metric, want string }{{"sum(syscall)", "9"}, {"count_distinct(pid)", "2"}, {"percentile(pid,95)", "72"}} {
 		request, err := ParseMonitorQuery("syscalls where syscall = 3 " + tc.metric + " over 50ms")

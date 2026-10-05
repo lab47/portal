@@ -1,9 +1,12 @@
 package portal
 
 import (
+	"context"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -13,6 +16,7 @@ func TestParseMonitorQuery(t *testing.T) {
 		want  MonitorRequest
 	}{
 		{"packets", MonitorRequest{Source: "packets"}},
+		{"packets where protocol == tcp", MonitorRequest{Source: "packets", Packet: &PacketFilter{Protocol: "tcp"}}},
 		{"process", MonitorRequest{Source: "process"}},
 		{"cpu", MonitorRequest{Source: "cpu", Mode: "snapshot"}},
 		{"memory", MonitorRequest{Source: "memory", Mode: "snapshot"}},
@@ -73,7 +77,7 @@ func TestParseMonitorQuery(t *testing.T) {
 
 func TestParseMonitorQueryRejectsAmbiguity(t *testing.T) {
 	for _, query := range []string{
-		"", "anything", "packets where", "packets protocol = tcp", "packets where protocol =", "packets where protocol == tcp",
+		"", "anything", "packets where", "packets protocol = tcp", "packets where protocol =",
 		"packets where protocol = tcp and", "packets where protocol = tcp protocol = udp", "packets where protocol = tcp and protocol = udp",
 		"packets where dst.port = 80", "packets where protocol = icmp", "packets where protocol = tcp and dst.port = 65536",
 		"packets where protocol = tcp and dst.port = 0", "packets where pid = 42", "packets where protocol in (tcp,udp)",
@@ -114,5 +118,126 @@ func TestParseMonitorQueryRejectsAmbiguity(t *testing.T) {
 				t.Fatalf("invalid query accepted: %+v", got)
 			}
 		})
+	}
+}
+
+func TestNumericEventComparisons(t *testing.T) {
+	for _, op := range []string{">", ">=", "<", "<="} {
+		for _, text := range []string{
+			"syscalls where phase = completion and duration_ns" + op + "5000000 count over 1s",
+			"syscalls:completion where duration_ns " + op + " 5000000 { @slow[] = count() } after 1s { emit @slow }",
+		} {
+			r, err := ParseMonitorQuery(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, n := range []uint64{4999999, 5000000, 5000001} {
+				want := op == ">" && n > 5000000 || op == ">=" && n >= 5000000 || op == "<" && n < 5000000 || op == "<=" && n <= 5000000
+				if r.matches(Event{DurationNS: &n}) != want {
+					t.Fatalf("%s at %d", text, n)
+				}
+			}
+			if r.matches(Event{}) || !r.matches(Event{Kind: "collection_stats"}) {
+				t.Fatal("missing values or diagnostics mishandled")
+			}
+		}
+	}
+	for _, tc := range []struct {
+		query, value string
+		want         bool
+	}{
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value > 18446744073709551614`, "18446744073709551615", true},
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value > 18446744073709551614`, "18446744073709551614", false},
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value < -2`, "-3", true},
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value < -2`, "-1", false},
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value >= 010`, "9", false},
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value >= 0x10`, "16", true},
+		{`tracepoint where event = custom:sample and fields in (Value) and field.Value < 2.5`, "2", true},
+	} {
+		r, err := ParseMonitorQuery(tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := r.matches(Event{Tracepoint: &TracepointEvent{Event: "custom:sample", Fields: map[string]json.Number{"Value": json.Number(tc.value)}}}); got != tc.want {
+			t.Fatalf("%s with %s: %v", tc.query, tc.value, got)
+		}
+	}
+	for _, text := range []string{
+		`syscalls where duration_ns > 1`, `disk where operation > 2`, `memory where used > 1`,
+		`process where pid > 1 avg(cpu_percent) over 2s every 1s`,
+		`disk:completion where duration_ns > NaN { @x[] = count() } after 1s { emit @x }`,
+		`disk:completion where duration_ns > [1,2] { @x[] = count() } after 1s { emit @x }`,
+		`tracepoint where event = custom:sample and fields in (a) and field.b > 1`,
+	} {
+		if _, err := ParseMonitorQuery(text); err == nil {
+			t.Fatalf("accepted %s", text)
+		}
+	}
+	synctest.Test(t, func(t *testing.T) {
+		r, err := ParseMonitorQuery(`disk:completion where duration_ns > 5000000 and duration_ns <= 9000000 { @slow[] = {calls: count(), elapsed: sum(duration_ns)} } every 1s { emit @slow; clear @slow } after 2s { stop }`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := aggregateEvents(context.Background(), r, func(ctx context.Context, _ MonitorRequest, emit func(Event) error) error {
+			for _, n := range []uint64{5000000, 5000001, 9000000, 9000001} {
+				if err := emit(Event{Disk: &DiskEvent{DurationNS: &n}}); err != nil {
+					return err
+				}
+			}
+			<-ctx.Done()
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.Windows[0].Rows[0].Values; string(got[0]) != "2" || string(got[1]) != "14000001" {
+			t.Fatalf("unfiltered reductions: %s", got)
+		}
+	})
+}
+
+func TestReadableQuerySyntaxErrors(t *testing.T) {
+	for _, text := range []string{
+		"disk:completion where duration_ns ! 1 { @io[] = count() } after 1s { emit @io }",
+		"disk where sectors ! 1 count over 1s",
+		"disk {\n  @io[] = count(\n} after 1s { emit @io }",
+		"disk { @io[] = count() } after 1s { emit @io order by value sideways }",
+		"process where name = \"é\" and pid ! 1",
+	} {
+		_, err := ParseMonitorQuery(text)
+		if err == nil {
+			t.Fatalf("accepted %s", text)
+		}
+		message := err.Error()
+		if !strings.Contains(message, "line ") || !strings.Contains(message, "column ") || !strings.Contains(message, "^") || strings.Contains(message, "check rune") || strings.Contains(message, "!/") || strings.Contains(message, "&{") {
+			t.Fatalf("unreadable error: %s", message)
+		}
+		if strings.Contains(text, " ! ") && !strings.Contains(message, "after a field name") {
+			t.Fatalf("missing operator hint: %s", message)
+		}
+	}
+	_, err := ParseMonitorQuery("disk where sectors ! 1 count over 1s")
+	want := "line 1, column 20: expected =, ==, in, >, >=, < or <= after a field name\n  disk where sectors ! 1 count over 1s\n  " + strings.Repeat(" ", 19) + "^"
+	if err.Error() != want {
+		t.Fatalf("incorrect caret: %s", err)
+	}
+}
+
+func TestNumericComparisonValidation(t *testing.T) {
+	for _, c := range []NumericComparison{
+		{Field: "duration_ns", Op: "!=", Value: "1"},
+		{Field: "duration_ns", Op: ">", Value: "1/2"},
+		{Field: "duration_ns", Op: ">", Value: "NaN"},
+		{Field: "duration_ns", Op: ">", Value: strings.Repeat("1", 129)},
+		{Field: "operation", Op: ">", Value: "1"},
+	} {
+		r := MonitorRequest{Source: "disk", Phase: "completion", Comparisons: []NumericComparison{c}}
+		if err := r.validate(); err == nil {
+			t.Fatalf("server accepted invalid predicate: %+v", c)
+		}
+	}
+	r := MonitorRequest{Source: "disk", Phase: "completion", Comparisons: make([]NumericComparison, 17)}
+	if err := r.validate(); err == nil {
+		t.Fatal("unbounded comparisons")
 	}
 }

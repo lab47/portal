@@ -32,7 +32,7 @@ func TestClientQueryPipes(t *testing.T) {
 			t.Fatalf("invalid client query accepted: %q", text)
 		}
 	}
-	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	for _, text := range []string{"memory | .memory.used", "process avg(cpu_percent) over 5s every 1s by pid,name | .aggregation.values | sort_by(.value)"} {
 		if err := run(append([]string{"query", "--query", text}, connection...)); err == nil || !strings.Contains(err.Error(), "/missing-key") {
 			t.Fatalf("pipeline did not reach client request: %v", err)
@@ -121,5 +121,53 @@ func TestQueryResultMultipleMetrics(t *testing.T) {
 	var out bytes.Buffer
 	if err := writeQueryResult(context.Background(), &out, snapshot, code); err != nil || out.String() != "18446744073709551615\n" {
 		t.Fatalf("multi-metric selection or precision: %s, %v", out.String(), err)
+	}
+}
+
+func TestQueryResultNamedTableMetrics(t *testing.T) {
+	_, code, err := parseClientQuery(`syscalls:completion { @io[proc: pid] = {total: sum(duration_ns), ops: count()} } every 1s { emit @io; clear @io } after 2s { stop } | .windows[].rows[] | {proc: .group.proc, ops: .values.ops, total: .values.total}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns := []portal.AggregateMetric{{Name: "total", Function: "sum", Field: "duration_ns"}, {Name: "ops", Function: "count"}}
+	snapshot := portal.Snapshot{Source: "syscalls", Windows: []*portal.AggregationResult{
+		{Table: "io", Columns: columns, Rows: []portal.AggregateRow{{Group: map[string]json.RawMessage{"proc": json.RawMessage("7")}, Values: []json.RawMessage{json.RawMessage("18446744073709551616"), json.RawMessage("2")}}}},
+		{Table: "io", Columns: columns, Rows: []portal.AggregateRow{}},
+	}}
+	// Exercise the server -> Go client -> jq path, not only local encoding.
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received portal.Snapshot
+	if err := json.Unmarshal(data, &received); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := writeQueryResult(context.Background(), &out, received, code); err != nil || out.String() != "{\"ops\":2,\"proc\":7,\"total\":18446744073709551616}\n" {
+		t.Fatalf("named metric pipeline: %q, %v", out.String(), err)
+	}
+}
+
+func TestQueryResultMultipleSources(t *testing.T) {
+	r, code, err := parseClientQuery(`syscalls { @calls[] = count() } process { @starts[] = count() } after 1s { emit @calls; emit @starts } | .tables[] | {source, table: .aggregation.table, ops: .aggregation.rows[0].values.value}`)
+	if err != nil || len(r.Probes) != 2 {
+		t.Fatalf("multi-source pipeline: %+v, %v", r, err)
+	}
+	snapshot := portal.Snapshot{Source: "script", Tables: []portal.Snapshot{
+		{Source: "syscalls", Aggregation: &portal.AggregationResult{Table: "calls", Columns: []portal.AggregateMetric{{Name: "value", Function: "count"}}, Rows: []portal.AggregateRow{{Group: map[string]json.RawMessage{}, Values: []json.RawMessage{json.RawMessage("19")}}}}},
+		{Source: "process", Aggregation: &portal.AggregationResult{Table: "starts", Columns: []portal.AggregateMetric{{Name: "value", Function: "count"}}, Rows: []portal.AggregateRow{{Group: map[string]json.RawMessage{}, Values: []json.RawMessage{json.RawMessage("7")}}}}},
+	}}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received portal.Snapshot
+	if err := json.Unmarshal(data, &received); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := writeQueryResult(context.Background(), &out, received, code); err != nil || out.String() != "{\"ops\":19,\"source\":\"syscalls\",\"table\":\"calls\"}\n{\"ops\":7,\"source\":\"process\",\"table\":\"starts\"}\n" {
+		t.Fatalf("nested table pipeline: %q, %v", out.String(), err)
 	}
 }

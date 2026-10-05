@@ -581,7 +581,10 @@ func RefreshCertificate(ctx context.Context, caURL string, signer ssh.Signer, to
 		return IssuedCertificate{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	client := *http.DefaultClient
+	// A renewal carries a private token; never forward it to a redirect target.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	res, err := client.Do(req)
 	if err != nil {
 		return IssuedCertificate{}, err
 	}

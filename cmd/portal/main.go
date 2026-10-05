@@ -65,6 +65,8 @@ func run(args []string) error {
 	caFile := serverFlags.String("ca", 0, "", "trusted SSH user CA public key file or HTTPS URL (overrides embedded key)")
 	policyFile := serverFlags.String("policy", 0, "", "JSON authorization policy file (overrides embedded policy)")
 	principal := serverFlags.String("principal", 0, "", "required certificate principal (default: admin)")
+	authorizedKeys := serverFlags.String("authorized-keys", 0, "", "authorized_keys override for the server account only, without a CA; other target accounts use their own ~/.ssh/authorized_keys")
+	queryAuthorizedKeys := serverFlags.String("query-authorized-keys", 0, "", "additional authorized_keys file for queries and monitors only, never commands (without a CA)")
 	var labelFlags []string
 	serverFlags.StringArrayNoSplitVar(&labelFlags, "label", 0, nil, "inventory label KEY=VALUE (repeatable)")
 	dispatcher.Dispatch("server", mflags.NewCommand(serverFlags, func(_ *mflags.FlagSet, _ []string) error {
@@ -82,6 +84,7 @@ func run(args []string) error {
 		return (portal.Server{
 			Name: *name, CoordinatorURL: *coordinatorURL, Token: *token,
 			ConfigFile: *serverConfig, CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen, Labels: labels,
+			AuthorizedKeysFile: *authorizedKeys, QueryAuthorizedKeysFile: *queryAuthorizedKeys,
 		}).Serve(ctx)
 	}, mflags.WithUsage("Check in and serve authenticated commands")))
 
@@ -263,7 +266,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		if mcpMode && request.Aggregation != nil && filter == nil && *queryFormat == "json" {
+		if mcpMode && request.Aggregation != nil && len(request.Probes) == 0 && filter == nil && *queryFormat == "json" {
 			request.Aggregation.Compact = true
 		}
 		if *queryFormat == "folded" {

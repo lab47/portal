@@ -38,9 +38,10 @@ type AggregationRequest struct {
 	Every        time.Duration     `json:"every,omitempty"`      // Snapshot sampling interval; zero defaults to 1s for snapshot-only sources.
 	Metrics      []AggregateMetric `json:"metrics,omitempty"`    // Alternative to Function/Field/Percentile; all share Window/Every/GroupBy.
 	Compact      bool              `json:"compact,omitempty"`
-	Limit        int               `json:"limit,omitempty"`       // top rows by SortMetric (descending); zero is unlimited
+	Limit        int               `json:"limit,omitempty"`       // first rows in SortMetric order; zero is unlimited
 	Nonzero      bool              `json:"nonzero,omitempty"`     // omit rows whose every metric is numeric zero
 	SortMetric   int               `json:"sort_metric,omitempty"` // zero-based metric index, default first
+	Ascending    bool              `json:"ascending,omitempty"`   // compact rows sorted low-to-high; default descending, nulls always last
 	Table        string            `json:"table,omitempty"`
 	GroupAliases map[string]string `json:"group_aliases,omitempty"`
 	ReportEvery  time.Duration     `json:"report_every,omitempty"` // finite tumbling event buckets; Window is total observation duration
@@ -58,7 +59,7 @@ type AggregateValue struct {
 
 type AggregateRow struct {
 	Group  map[string]json.RawMessage `json:"group"`
-	Values []json.RawMessage          `json:"values"` // aligned with Columns, null if unavailable
+	Values []json.RawMessage          `json:"values"` // Go values align with Columns; named table JSON uses a metric-name object, legacy JSON an array
 }
 
 // AggregationResult describes a half-open server ingestion window [Start, End).
@@ -85,6 +86,21 @@ type AggregationResult struct {
 func (a AggregationResult) MarshalJSON() ([]byte, error) {
 	type fields AggregationResult
 	if a.Columns != nil {
+		var rows any = a.Rows
+		if a.Table != "" {
+			named := make([]map[string]any, 0, len(a.Rows))
+			for _, row := range a.Rows {
+				if len(row.Values) != len(a.Columns) {
+					return nil, errors.New("aggregate row values must align with columns")
+				}
+				values := make(map[string]json.RawMessage, len(a.Columns))
+				for i, column := range a.Columns {
+					values[column.Name] = row.Values[i]
+				}
+				named = append(named, map[string]any{"group": row.Group, "values": values})
+			}
+			rows = named
+		}
 		return json.Marshal(struct {
 			Table             string            `json:"table,omitempty"`
 			Start             time.Time         `json:"start"`
@@ -93,10 +109,10 @@ func (a AggregationResult) MarshalJSON() ([]byte, error) {
 			Every             time.Duration     `json:"every,omitempty"`
 			Collection        *CollectionStats  `json:"collection,omitempty"`
 			Columns           []AggregateMetric `json:"columns"`
-			Rows              []AggregateRow    `json:"rows"`
+			Rows              any               `json:"rows"`
 			TotalGroups       int               `json:"total_groups"`
 			OmittedZeroGroups int               `json:"omitted_zero_groups,omitempty"`
-		}{a.Table, a.Start, a.End, a.GroupBy, a.Every, a.Collection, a.Columns, a.Rows, a.TotalGroups, a.OmittedZeroGroups})
+		}{a.Table, a.Start, a.End, a.GroupBy, a.Every, a.Collection, a.Columns, rows, a.TotalGroups, a.OmittedZeroGroups})
 	}
 	if len(a.Metrics) != 0 {
 		return json.Marshal(fields(a))
@@ -111,6 +127,51 @@ func (a AggregationResult) MarshalJSON() ([]byte, error) {
 		fields
 		Values []AggregateValue `json:"values"`
 	}{fields(a), a.Values})
+}
+
+// Decode both row wire formats into the same column-aligned Go representation.
+func (a *AggregationResult) UnmarshalJSON(data []byte) error {
+	type fields AggregationResult
+	var result fields
+	var wire struct {
+		*fields
+		Rows []struct {
+			Group  map[string]json.RawMessage `json:"group"`
+			Values json.RawMessage            `json:"values"`
+		} `json:"rows"`
+	}
+	wire.fields = &result
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Rows != nil {
+		result.Rows = make([]AggregateRow, 0, len(wire.Rows))
+	}
+	for _, raw := range wire.Rows {
+		row := AggregateRow{Group: raw.Group}
+		if len(raw.Values) != 0 && raw.Values[0] == '{' {
+			var named map[string]json.RawMessage
+			if err := json.Unmarshal(raw.Values, &named); err != nil {
+				return err
+			}
+			if len(named) != len(result.Columns) {
+				return errors.New("named aggregate row must match columns")
+			}
+			row.Values = make([]json.RawMessage, len(result.Columns))
+			for i, column := range result.Columns {
+				value, ok := named[column.Name]
+				if !ok {
+					return fmt.Errorf("aggregate row missing metric %q", column.Name)
+				}
+				row.Values[i] = value
+			}
+		} else if err := json.Unmarshal(raw.Values, &row.Values); err != nil {
+			return err
+		}
+		result.Rows = append(result.Rows, row)
+	}
+	*a = AggregationResult(result)
+	return nil
 }
 
 func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
@@ -210,6 +271,9 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 		seen := make(map[AggregateMetric]bool)
 		metricNames := make(map[string]bool)
 		for _, metric := range a.Metrics {
+			if a.Table != "" && metric.Name == "" {
+				return errors.New("named tables require metric names")
+			}
 			if metric.Name != "" {
 				if !tracepointIdentifier.MatchString(metric.Name) || len(metric.Name) > 64 || metricNames[metric.Name] {
 					return errors.New("invalid or duplicate metric name")
@@ -488,7 +552,7 @@ func newAggregateReduction(a AggregationRequest) *aggregateReduction {
 		for _, metric := range a.Metrics {
 			one := a
 			one.Metrics = nil
-			one.Compact, one.Nonzero, one.Limit, one.SortMetric = false, false, 0, 0
+			one.Compact, one.Nonzero, one.Limit, one.SortMetric, one.Ascending = false, false, 0, 0, false
 			one.Function, one.Field, one.Percentile = metric.Function, metric.Field, metric.Percentile
 			if one.Function == "" {
 				one.Function = "count"
@@ -597,7 +661,7 @@ func (r *aggregateReduction) result(source string, start, end time.Time) Snapsho
 // Join on the group, not positional row indexes: sampled metrics can have
 // different available groups. Rendering controls never change collection.
 func (r *aggregateReduction) formatRows(a *AggregationResult) {
-	if !r.request.Compact && !r.request.Nonzero && r.request.Limit == 0 && r.request.SortMetric == 0 {
+	if !r.request.Compact && !r.request.Nonzero && r.request.Limit == 0 && r.request.SortMetric == 0 && !r.request.Ascending {
 		return
 	}
 	metrics := a.Metrics
@@ -613,6 +677,9 @@ func (r *aggregateReduction) formatRows(a *AggregationResult) {
 		column := AggregateMetric{Function: function, Field: metric.Field, Percentile: metric.Percentile}
 		if len(r.request.Metrics) != 0 {
 			column.Name = r.request.Metrics[index].Name
+		}
+		if a.Table != "" && column.Name == "" {
+			column.Name = "value"
 		}
 		a.Columns = append(a.Columns, column)
 		add := func(group map[string]json.RawMessage, value json.RawMessage) {
@@ -664,6 +731,9 @@ func (r *aggregateReduction) formatRows(a *AggregationResult) {
 		if !yok {
 			return true
 		}
+		if r.request.Ascending {
+			return x.Cmp(y) < 0
+		}
 		return x.Cmp(y) > 0
 	})
 	if r.request.Limit > 0 && len(keys) > r.request.Limit {
@@ -675,14 +745,71 @@ func (r *aggregateReduction) formatRows(a *AggregationResult) {
 	}
 }
 
+// Each selector has its own subscription/sampler and reduction. The shared
+// clock aligns reporting boundaries, not individual kernel attachment times.
+func aggregateScript(ctx context.Context, request MonitorRequest, source eventSource, collect func(context.Context, MonitorRequest) (Snapshot, error)) (Snapshot, error) {
+	if err := request.validate(); err != nil {
+		return Snapshot{}, err
+	}
+	if request.Source != "script" {
+		return Snapshot{}, errors.New("script query required")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	start := time.Now()
+	type completed struct {
+		index    int
+		snapshot Snapshot
+		err      error
+	}
+	done := make(chan completed, len(request.Probes))
+	for i, probe := range request.Probes {
+		go func() {
+			var snapshot Snapshot
+			var err error
+			if sampledAggregation(probe) {
+				snapshot, err = aggregateSnapshotsAt(ctx, probe, collect, start)
+			} else {
+				snapshot, err = aggregateEventsAt(ctx, probe, source, start)
+			}
+			done <- completed{i, snapshot, err}
+		}()
+	}
+	result := Snapshot{Source: "script", Time: start.Add(request.Aggregation.Window).UTC(), Tables: make([]Snapshot, len(request.Probes))}
+	var failure error
+	for range request.Probes {
+		item := <-done
+		if item.err != nil && failure == nil {
+			failure = fmt.Errorf("table @%s (%s): %w", request.Probes[item.index].Aggregation.Table, request.Probes[item.index].Source, item.err)
+			cancel()
+		}
+		result.Tables[item.index] = item.snapshot
+	}
+	if failure != nil {
+		return Snapshot{}, failure
+	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	if data, err := json.Marshal(result); err != nil {
+		return Snapshot{}, err
+	} else if len(data) > 7<<20 {
+		return Snapshot{}, errors.New("script output exceeds 7 MiB; narrow groups or limit output")
+	}
+	return result, nil
+}
+
 func aggregateEvents(ctx context.Context, request MonitorRequest, source eventSource) (Snapshot, error) {
+	return aggregateEventsAt(ctx, request, source, time.Now())
+}
+
+func aggregateEventsAt(ctx context.Context, request MonitorRequest, source eventSource, start time.Time) (Snapshot, error) {
 	if err := request.validate(); err != nil {
 		return Snapshot{}, err
 	}
 	if request.Mode != "aggregate" {
 		return Snapshot{}, errors.New("aggregate mode required")
 	}
-	start := time.Now()
 	end := start.Add(request.Aggregation.Window)
 	windowCtx, cancel := context.WithDeadline(ctx, end)
 	defer cancel()

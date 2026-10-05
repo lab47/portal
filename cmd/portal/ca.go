@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/lab47/portal"
@@ -49,7 +46,7 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	trustedCA := request.String("ca", 0, "", "trusted CA public key file or HTTPS URL")
 	certPrincipal := request.String("principal", 0, "admin", "expected SSH principal")
 	dispatcher.Dispatch("cert request", mflags.NewCommand(request, func(_ *mflags.FlagSet, _ []string) error {
-		if err := certificateConfigDefaults(request, *requestConfig, map[string]*string{"key": keyPath, "cert": certPath, "ca": trustedCA, "ca-url": caURL, "principal": certPrincipal}); err != nil {
+		if err := certificateConfigDefaults(request, *requestConfig, map[string]*string{"key": keyPath, "cert": certPath, "ca": trustedCA, "ca-url": caURL, "principal": certPrincipal, "refresh-token": refreshPath}); err != nil {
 			return err
 		}
 		if *caURL == "" || *keyPath == "" || *certPath == "" || *trustedCA == "" {
@@ -91,7 +88,7 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 	refreshCA := refresh.String("ca", 0, "", "trusted CA public key file or HTTPS URL")
 	refreshPrincipal := refresh.String("principal", 0, "admin", "expected SSH principal")
 	dispatcher.Dispatch("cert refresh", mflags.NewCommand(refresh, func(_ *mflags.FlagSet, _ []string) error {
-		if err := certificateConfigDefaults(refresh, *refreshConfig, map[string]*string{"key": refreshKey, "cert": refreshCert, "ca": refreshCA, "ca-url": refreshURL, "principal": refreshPrincipal}); err != nil {
+		if err := certificateConfigDefaults(refresh, *refreshConfig, map[string]*string{"key": refreshKey, "cert": refreshCert, "ca": refreshCA, "ca-url": refreshURL, "principal": refreshPrincipal, "refresh-token": refreshToken}); err != nil {
 			return err
 		}
 		if *refreshURL == "" || *refreshKey == "" || *refreshCert == "" || *refreshCA == "" {
@@ -101,30 +98,12 @@ func registerCACommands(dispatcher *mflags.Dispatcher, ctx context.Context) {
 		if path == "" {
 			path = *refreshKey + ".refresh"
 		}
-		info, err := os.Stat(path)
+		cert, err := (portal.Client{CAURL: *refreshURL, CAFile: *refreshCA, KeyFile: *refreshKey, CertFile: *refreshCert, Principal: *refreshPrincipal, RefreshTokenFile: path}).Refresh(ctx)
 		if err != nil {
 			return err
 		}
-		if info.Mode().Perm()&0077 != 0 {
-			return errors.New("refresh token file must only be readable by its owner")
-		}
-		token, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		private, err := os.ReadFile(*refreshKey)
-		if err != nil {
-			return err
-		}
-		signer, err := ssh.ParsePrivateKey(private)
-		if err != nil {
-			return err
-		}
-		issued, err := portal.RefreshCertificate(ctx, *refreshURL, signer, strings.TrimSpace(string(token)))
-		if err != nil {
-			return err
-		}
-		return saveIssued(issued, signer, *refreshCA, *refreshPrincipal, *refreshKey, *refreshCert, path)
+		fmt.Printf("Certificate for %s written to %s (expires %s); refresh token saved to %s\n", cert.KeyId, *refreshCert, time.Unix(int64(cert.ValidBefore), 0).Format(time.RFC3339), path)
+		return nil
 	}, mflags.WithUsage("Rotate a key-bound refresh token and renew a certificate without a browser")))
 }
 
@@ -132,51 +111,10 @@ func saveIssued(issued portal.IssuedCertificate, signer ssh.Signer, caPath, prin
 	if tokenPath == "" {
 		tokenPath = keyPath + ".refresh"
 	}
-	if tokenPath == keyPath || tokenPath == certPath || certPath == keyPath || caPath == tokenPath || caPath == certPath {
-		return errors.New("key, CA, certificate and refresh token paths must differ")
-	}
-	caPub, err := portal.LoadCAPublicKey(context.Background(), caPath)
+	cert, err := portal.SaveIssuedCertificate(context.Background(), issued, signer, caPath, principal, keyPath, certPath, tokenPath)
 	if err != nil {
-		return err
-	}
-	pub, _, _, _, err := ssh.ParseAuthorizedKey(issued.Certificate)
-	cert, ok := pub.(*ssh.Certificate)
-	if err != nil || !ok || !bytes.Equal(cert.Key.Marshal(), signer.PublicKey().Marshal()) {
-		return errors.New("CA returned certificate for another SSH key")
-	}
-	if err := portal.VerifyUserCertificate(caPub, principal, cert); err != nil {
-		return err
-	}
-	if len(issued.RefreshToken) != 32 {
-		return errors.New("CA returned invalid refresh token")
-	}
-	if err := writeAtomic(tokenPath, []byte(issued.RefreshToken), 0600); err != nil {
-		return err
-	}
-	if err := writeAtomic(certPath, issued.Certificate, 0644); err != nil {
 		return err
 	}
 	fmt.Printf("Certificate for %s written to %s (expires %s); refresh token saved to %s\n", cert.KeyId, certPath, time.Unix(int64(cert.ValidBefore), 0).Format(time.RFC3339), tokenPath)
 	return nil
-}
-
-func writeAtomic(path string, data []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".portal-credential-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err = f.Chmod(mode); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), path)
 }

@@ -40,6 +40,18 @@ func addSyscallFilter(r *MonitorRequest, text string) error {
 // Resolve only on the server, after authentication and before any collection or
 // userspace filtering. The client architecture must not determine syscall IDs.
 func resolveSyscallNames(r MonitorRequest, serverArch string) (MonitorRequest, error) {
+	if r.Source == "script" {
+		probes := make([]MonitorRequest, len(r.Probes))
+		for i, probe := range r.Probes {
+			resolved, err := resolveSyscallNames(probe, serverArch)
+			if err != nil {
+				return MonitorRequest{}, err
+			}
+			probes[i] = resolved
+		}
+		r.Probes = probes
+		return r, nil
+	}
 	if len(r.SyscallNames) == 0 {
 		return r, nil
 	}

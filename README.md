@@ -1,10 +1,116 @@
 # Portal
 
-A small coordinator, server, and client for running commands over [go-iroh](https://github.com/tmc/go-iroh). The coordinator keeps short-lived in-memory inventory; the server checks in every 30 seconds and accepts commands from holders of SSH **user** certificates signed by its trusted CA, subject to its local authorization policy. The client looks up the server, connects to its authenticated iroh endpoint, and signs a fresh challenge bound to the command arguments. Commands run directly (not through a shell) as the server process's OS user unless another account is requested and allowed.
+A small coordinator, server, and client for running commands over [go-iroh](https://github.com/tmc/go-iroh). The coordinator keeps short-lived in-memory inventory; the server checks in every 30 seconds and accepts commands from ordinary SSH keys in its account's `authorized_keys` when no CA is configured, or SSH **user** certificates signed by its trusted CA, subject to its local authorization policy. The client looks up the server, connects to its authenticated iroh endpoint, and signs a fresh challenge bound to the command arguments. Commands run directly (not through a shell) as the server process's OS user unless another account is requested and allowed.
 
 Requires outbound access to an iroh relay from both server and client. Inventory contains only an endpoint ID and relay URL, never a server UDP address. Iroh establishes the connection via the relay, then discovers and selects a direct UDP path when reachable, retaining the relay as fallback. Building from source requires Go 1.26: `go build -o portal ./cmd/portal`.
 
 The importable `github.com/lab47/portal` package exposes `NewCoordinator(token)` as an HTTP handler, `Server.Serve(ctx)` for registration and command serving, and `Client.Run(ctx, argv)` for lookup and execution. `Client.Run` returns a `Result` containing output and remote exit status; the CLI in `cmd/portal` uses `miren.dev/mflags` for subcommands and flags. Use `--` before the remote command to pass flag-like arguments through unchanged.
+
+## Using existing SSH keys
+
+When no CA is configured, Portal automatically uses ordinary SSH keys instead of
+certificates. Put the client's ordinary
+SSH public key in the **server account's** `~/.ssh/authorized_keys`, just as for
+OpenSSH login (for example, using `ssh-copy-id`). Then, on the server:
+
+```sh
+portal server init --name node-a \
+  --coordinator 'https://coordinator.example/register/REGISTRATION_TOKEN'
+portal server
+```
+
+The registration URL is still secret; SSH-key authentication removes certificate enrollment,
+not coordinator registration. Initialization stores it in the existing owner-only
+server config and never overwrites an existing config. To use a nonstandard trust
+file, add `--authorized-keys /absolute/path/authorized_keys`. Flag-only startup is
+also supported: `portal server --name node-a --coordinator '…'`.
+
+On the client:
+
+```sh
+portal config init --coordinator https://coordinator.example
+portal client --name node-a -- uname -a
+portal query --name node-a --query 'process'
+```
+
+Without a saved config, add `--coordinator https://coordinator.example`
+to any client, query, capabilities, or monitor command. The same flags/config also
+work through MCP. The client selects the first existing `~/.ssh/id_ed25519`,
+`id_ecdsa`, or `id_rsa`, in that order; `--key PATH` chooses another key explicitly.
+It does not offer multiple keys after rejection. Encrypted keys must already be
+loaded with `ssh-add`; Portal uses the matching plain key through `SSH_AUTH_SOCK`
+without asking for a passphrase. With no default key file, it uses the first plain
+key in the agent. Unix-domain agents are supported; native Windows named-pipe
+agents, hardware-key files, and `ssh_config`/`sshd_config` overrides are not read.
+
+**Trust and privileges:** command access follows the requested account's keys.
+`portal client --name node-a --user root -- id` checks root's
+`~/.ssh/authorized_keys`; `--user alice` checks Alice's file. With no `--user`,
+the server account is the target. A key accepted for one account does not grant
+access to another. Switching accounts requires a root server on Unix; Windows
+and non-root servers accept only their own account. `--authorized-keys` overrides
+the server account's file only, never another requested account's file.
+Queries, capabilities and monitors have no target account and use the server
+account's keys. For root-only tracing, deliberately run the server as root;
+the default then becomes `/root/.ssh/authorized_keys` on Linux, not a sudo caller's
+home. Keys in that file also grant arbitrary root commands. Each authentication
+requires the key file, its parent and grandparent to be owned by the target account
+or root and not group/world writable; Windows relies on filesystem ACLs.
+Only unrestricted plain-key lines are accepted: entries with any SSH options
+(including `command=`, `from=`, `restrict`, or `cert-authority`) and certificate
+entries are skipped. Missing, unsafe or empty key files reject requests for that
+account, without falling back to another account's keys. Files are read on each
+new request, so edits and revocations need no restart; already-running commands
+and streams are not terminated. Startup does not require a key file for the
+server account when it will only serve commands for other accounts.
+
+### Delegating queries without command access
+
+In plain SSH-key mode, `--query-authorized-keys PATH` adds a separate trust file
+for queries, capability discovery, streaming monitors, and registered-monitor
+creation/read/delete. It never authorizes commands, even with `--user root`.
+Normal server-account keys continue to work for both commands and queries.
+
+For a root server, store delegates' ordinary SSH public keys in a root-controlled
+file outside `/root/.ssh/authorized_keys`, for example:
+
+```sh
+sudo install -d -m 700 /etc/portal
+sudo install -m 600 analyst.pub /etc/portal/query_authorized_keys
+sudo portal server --query-authorized-keys /etc/portal/query_authorized_keys
+```
+
+The server command uses its existing server config; initialization can also save
+the option with `portal server init ... --query-authorized-keys PATH`.
+In JSON, set `"query_authorized_keys": "/etc/portal/query_authorized_keys"`;
+relative paths resolve beside the server config. Go callers use
+`Server.QueryAuthorizedKeysFile`.
+
+Delegates use the normal client key discovery or `--key`, without a special
+client flag. They receive all query sources available to the server account,
+including root-level tracing on a root server, **not** unrestricted commands.
+This is powerful observability access: traces can expose sensitive data and
+consume resources; it is not a sandbox or a per-source policy. Monitor ownership
+still belongs to its creating key. Keep delegates' keys out of every account's
+command `authorized_keys` if they must not get command access there.
+
+The additional file has the same ownership, permissions, size and SSH-option
+restrictions as account key files. It is read on each new request; revocation
+blocks later queries and monitor reads without stopping existing streams.
+Delegation works even when the server account has no command keys. This option
+cannot be combined with a configured CA; certificate policy is unchanged.
+
+Each side selects its authentication method from its own resolved configuration:
+`ca`/`--ca` selects certificates; an absent CA selects plain SSH keys. The server's
+inline `CAPublicKey` also selects certificate authentication. Configure both sides
+consistently; mismatched modes are rejected. A configured but missing, malformed,
+or untrusted CA is an error, never a fallback to plain keys. Certificate-specific
+settings (certificate, renewal, principal, or certificate policy) without a CA are
+rejected rather than silently ignored. Existing saved CA configs keep using
+certificates; use separate files with `--config PATH` for SSH-key configurations.
+Go callers can omit `CAFile`/`CAPublicKey` and use
+`Server{AuthorizedKeysFile: optionalPath, …}`. Clients and servers must both be updated
+for plain-key authentication.
 
 ## Installation
 
@@ -95,7 +201,11 @@ portal query --name node-a --query 'process where name = worker*'
 
 The default file is `portal/config.json` inside the OS user-config directory: `$XDG_CONFIG_HOME/portal/config.json` or `~/.config/portal/config.json` on Linux, `~/Library/Application Support/portal/config.json` on macOS, and `%AppData%\portal\config.json` on Windows. `config init --config PATH` selects another output file; `--config PATH` on any client, monitor, query, certificate request or refresh command selects it for use. Initialization refuses to overwrite an existing config, creates its directory, and writes the file with mode 0600 (OS ACLs govern access on Windows). It stores only paths and endpoints, not private keys or refresh tokens. Credential files need not exist yet; `cert request` creates the key using the existing approval workflow. `--ca-url` is optional when a certificate already exists.
 
-The JSON fields are `key`, `ca` (trusted SSH CA **public key file or HTTPS URL**, not a private key), `coordinator`, and optional `cert`, `ca_url`, and `principal`. Setup stores absolute credential paths and preserves CA URLs; manually written relative file paths resolve against the config file's directory. Omitted `cert` defaults to `<key>-cert.pub`, and omitted `principal` defaults to `admin`. Nonempty command-line credential/endpoint options override config defaults. A missing default config allows the original flag-only usage; an explicitly selected missing file or malformed config returns an error. With `ca` configured, clients check that their user certificate is valid for that CA and principal before connecting; this does not authenticate the server with an SSH host certificate. Use HTTPS for a trusted coordinator connection. Go clients use these defaults too and can set `Client.ConfigFile`, `CAFile`, and `Principal` explicitly. `cert request` and `cert refresh` also inherit the saved CA URL and credentials; refresh tokens retain their `<key>.refresh` default.
+The JSON fields are `coordinator`, optional `key`, and optional `ca` (trusted SSH CA **public key file or HTTPS URL**, not a private key). Without `ca`, the client discovers ordinary SSH keys as described above. Certificate configurations also accept `cert`, `ca_url`, `refresh_token` (a **file path**, never token contents), and `principal`. Setup stores absolute credential paths and preserves CA URLs; manually written relative file paths resolve against the config file's directory. With `ca` configured, omitted `cert` defaults to `<key>-cert.pub`, omitted `refresh_token` defaults to `<key>.refresh`, and omitted `principal` defaults to `admin`. Nonempty command-line credential/endpoint options override config defaults. A missing default config allows flag-only usage; an explicitly selected missing file or malformed config returns an error. With `ca` configured, clients check that their user certificate is valid for that CA and principal before connecting; this does not authenticate the server with an SSH host certificate. Use HTTPS for a trusted coordinator connection. Go clients use these defaults too and can set `Client.ConfigFile`, `CAFile`, `Principal`, `CAURL`, and `RefreshTokenFile` explicitly. `cert request` and `cert refresh` inherit the saved CA URL, credentials and token path.
+
+In certificate mode, every client connection (commands, queries, capabilities, monitors and MCP tools) checks its certificate before looking up the server. With both `ca_url` and `ca` configured, certificates expiring within **five minutes**, or already expired, are renewed automatically using the saved key-bound refresh token. Healthy certificates do not contact the renewal endpoint. Flag-only clients can pass `--ca-url` and optionally `--refresh-token`; these also override config. Initial enrollment still requires `cert request`: missing or malformed certificates are not silently replaced. Certificates issued manually without renewal configuration remain usable until expiry.
+
+Renewal is headless, bounded to 30 seconds, and verifies the trusted CA, principal, signature and key before installing the result. A cross-process lock at `<refresh-token-path>.lock` serializes token rotation with manual `cert refresh`; automatic callers reload the certificate after acquiring the lock to avoid duplicate refreshes. The new token is atomically saved with mode 0600 before the certificate is atomically replaced (Windows relies on account ACLs). Renewal does not print credential data or alter query JSON output. A failed configured renewal fails the connection with a recovery instruction instead of silently continuing with stale credentials. After the token's 30-day approval lifetime, use `portal cert request` and approve again. This checks on connection, not on a background timer or during an already-open stream. Go callers can force headless renewal with `Client.Refresh(ctx)`, including recovery of a missing certificate.
 
 ## Capability discovery
 
@@ -138,7 +248,7 @@ Clients can attach a long-lived, authenticated monitor to a server. The `syscall
 
 ```sh
 ./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub --source syscalls \
+  --key operator --ca ca.pub --cert operator-cert.pub --source syscalls \
   --pid 1234 --syscall 0 --syscall 1
 ```
 
@@ -181,13 +291,13 @@ To keep collecting while the client is disconnected, register a server-owned mon
 
 ```sh
 ./portal monitor-register --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub \
+  --key operator --ca ca.pub --cert operator-cert.pub \
   --query 'process where name = worker*' # prints a monitor ID
 ./portal monitor-read --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub --id MONITOR_ID --after 0
+  --key operator --ca ca.pub --cert operator-cert.pub --id MONITOR_ID --after 0
 # Disconnect with Ctrl-C; later, use --after with the last processed sequence.
 ./portal monitor-delete --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub --id MONITOR_ID
+  --key operator --ca ca.pub --cert operator-cert.pub --id MONITOR_ID
 ```
 
 `monitor-read` outputs JSON lines of `{ "sequence": N, "event": { ... } }`, first replaying retained events after `--after` and then following new events. Save the sequence **only after processing** each record; supplying it on the next read avoids both skips and duplicates. A new reader can start from `--after 0`. Multiple readers may use independent cursors.
@@ -206,7 +316,7 @@ To show packets sent to TCP destination port 80, select the `packets` source and
 
 ```sh
 ./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub \
+  --key operator --ca ca.pub --cert operator-cert.pub \
   --query 'packets where protocol = tcp and direction = outgoing and dst.port = 80'
 ```
 
@@ -214,7 +324,7 @@ To watch a process name across starts and exits, use the cross-platform `process
 
 ```sh
 ./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub \
+  --key operator --ca ca.pub --cert operator-cert.pub \
   --query 'process where name = "worker"'
 ```
 
@@ -226,7 +336,7 @@ To query the current process table instead of waiting for lifecycle events, use 
 
 ```sh
 ./portal query --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub \
+  --key operator --ca ca.pub --cert operator-cert.pub \
   --query 'process where name = worker*'
 ```
 
@@ -245,11 +355,11 @@ Other one-shot sources use the same `portal query --query 'SOURCE [where name = 
 | `cgroups` | `cgroups` | Linux cgroup v2 paths, identities, CPU accounting/quota, memory accounting/limit, task counts, and per-device I/O accounting |
 | `gpu` | `gpus` | Nvidia GPU index, UUID, name, and available temperature, utilization, memory, and power readings |
 
-`network`, `sensors`, `containers`, and `gpu` support `where name = ...` with exact names or one leading/trailing `*` glob, for example `network where name = eth*`. `cgroups` instead supports `where path = ...` with the same edge-glob rules. Other sources do not take filters. An empty collection is returned as `[]`; metric fields unavailable from `nvidia-smi` are omitted. Docker requires Linux, a readable `/var/run/docker.sock`, a root server and **explicit `root` policy authorization**, because it exposes other workloads' metadata. GPU queries require `nvidia-smi` installed on the server and an Nvidia driver. Missing dependencies and unsupported platforms return errors, not fabricated empty results. Sensors depend on the host's exposed sensors and may legitimately be empty. Packet, syscall, disk, and tracepoint sources represent transient events rather than retained current state, so snapshot mode rejects them.
+`network`, `sensors`, `containers`, and `gpu` support `where name = ...` with exact names or one leading/trailing `*` glob, for example `network where name = eth*`. `cgroups` instead supports `where path = ...` with the same edge-glob rules. Other sources do not take filters. An empty collection is returned as `[]`; metric fields unavailable from `nvidia-smi` are omitted. Docker requires Linux, a readable `/var/run/docker.sock`, a root server and **root query authorization** (certificate policy, root account keys, or query-only delegation), because it exposes other workloads' metadata. GPU queries require `nvidia-smi` installed on the server and an Nvidia driver. Missing dependencies and unsupported platforms return errors, not fabricated empty results. Sensors depend on the host's exposed sensors and may legitimately be empty. Packet, syscall, disk, and tracepoint sources represent transient events rather than retained current state, so snapshot mode rejects them.
 
 ### Cgroup resource usage
 
-`cgroups` reads the server's visible **cgroup v2** hierarchy at `/sys/fs/cgroup`, independently of Docker or any container runtime. It requires Linux, a root server, and explicit `root` policy access for the client identity, since groups may expose other workloads. Cgroup v1 and missing/non-v2 mounts return errors. In a cgroup namespace or container, the source only sees the mounted subtree; `/` means that visible root, not necessarily the host root. Paths returned in `cgroups[]` are relative to the mount and begin with `/`.
+`cgroups` reads the server's visible **cgroup v2** hierarchy at `/sys/fs/cgroup`, independently of Docker or any container runtime. It requires Linux, a root server, and root query authorization (certificate policy, root account keys, or query-only delegation), since groups may expose other workloads. Cgroup v1 and missing/non-v2 mounts return errors. In a cgroup namespace or container, the source only sees the mounted subtree; `/` means that visible root, not necessarily the host root. Paths returned in `cgroups[]` are relative to the mount and begin with `/`.
 
 | Field | Meaning |
 | --- | --- |
@@ -285,7 +395,7 @@ To observe block requests issued to a device on Linux, use the eBPF `disk` sourc
 
 ```sh
 ./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub \
+  --key operator --ca ca.pub --cert operator-cert.pub \
   --query 'disk where operation = write and device = 0x800'
 ```
 
@@ -300,7 +410,7 @@ portal query --name node-a --query 'disk where phase = completion and operation 
 
 Completions pair by **kernel request pointer**, not device/sector, preserving identity and request metadata from issue. `disk.duration_ns` (aggregate field `duration_ns`) is monotonic time from the **latest issue** to completion of all bytes; it excludes pre-issue scheduler queueing. Partial completions produce a single final event, including for zero-byte flushes. `disk.status` (aggregate field `status`) is zero on success or the last nonzero kernel `blk_status_t` seen across completions—not a negative errno. Reissues reset identity, byte accounting and timestamp, so this is not total latency across retries. Only requests observed issuing and completing within collection contribute. Issuing PID is not definitive application attribution for asynchronous writeback; use cgroup I/O accounting for workload totals.
 
-Completion mode requires a native 64-bit server/kernel ABI, kernel BTF plus supported `request`, `request_queue`, `gendisk` and raw block tracepoint layouts; unsupported kernels fail explicitly without guessing offsets. Pending requests occupy a bounded 16,384-entry hash; requests without final completion remain until collector teardown. `pairing_failures`, `unmatched_exits` (unmatched block completions here), and ring-buffer drops are reported through collection counters. Completion operation/device filters run after pairing in server user space, so counters cover all captured requests, not just filtered groups. Both phases require a root server and explicit root policy authorization. Upgrade client and server together before using these new fields.
+Completion mode requires a native 64-bit server/kernel ABI, kernel BTF plus supported `request`, `request_queue`, `gendisk` and raw block tracepoint layouts; unsupported kernels fail explicitly without guessing offsets. Pending requests occupy a bounded 16,384-entry hash; requests without final completion remain until collector teardown. `pairing_failures`, `unmatched_exits` (unmatched block completions here), and ring-buffer drops are reported through collection counters. Completion operation/device filters run after pairing in server user space, so counters cover all captured requests, not just filtered groups. Both phases require a root server and root query authorization (certificate policy, root account keys, or query-only delegation). Upgrade client and server together before using these new fields.
 
 Both disk phases expose `rwbs` for grouping: optional leading `F` means preflush, followed by operation `R`/`W`/`D`/`F`/`N` (`DE` is secure erase), then `F` (force-unit-access), `A` (readahead), `S` (sync) and `M` (metadata). For example, `FWFSM` is a preflush write with FUA, sync and metadata—not a flush operation. On supported BTF kernels, both phases reconstruct the string from issue flags using runtime BTF bit positions and expose raw `request_flags`. Entry falls back to the tracefs collector otherwise; it reads the C string only up to the first null, ignoring stale bytes after its terminator. `device_name` adds a best-effort sysfs name such as `nvme0n1` alongside the unchanged numeric device ID.
 
@@ -319,15 +429,15 @@ For probes not covered by a built-in event type, `tracepoint` attaches to a name
 
 ```sh
 ./portal monitor --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub \
+  --key operator --ca ca.pub --cert operator-cert.pub \
   --query 'tracepoint where event = sched:sched_wakeup and fields in (pid, target_cpu, prio) and field.target_cpu = 2'
 ```
 
 `common_pid` is supported via the eBPF current-task helper because the kernel hides the trace header from tracepoint programs. Other header fields (`common_type`, `common_flags`, and `common_preempt_count`) are rejected rather than returning invalid data. `common_pid` identifies the task/thread executing the tracepoint, not necessarily the application that originally requested the work. In particular, block I/O may be issued by kernel workers after asynchronous writeback or request merging; grouping `block:block_rq_issue` by `field.common_pid` is issuing-task attribution, not exact per-application disk accounting.
 
-The result has `tracepoint.event` (`sched:sched_wakeup`) and `tracepoint.fields` (a map of exact JSON integer values), alongside the UTC receipt `time`. The probe name is `category:name`; `fields in (...)` selects 1–16 names from `/sys/kernel/tracing/events/CATEGORY/NAME/format` (or debug tracing). Add `field.NAME = NUMBER` for equality filters on selected fields; negative decimal and `0x` hex numbers are accepted. Field names are case-sensitive to the kernel format and numeric filters are applied **on the server after eBPF collection**, before streaming; these filters do not reduce ring-buffer traffic. The running kernel must expose the tracepoint and support ring buffers. Pointer, array, bitfield and dynamic (`__data_loc`) fields are rejected, not decoded as arbitrary memory; no arbitrary ELF/eBPF programs or kprobe/uprobe/XDP hooks are loaded. This source requires a root server **and explicit `root` policy authorization** because tracepoints can expose other accounts' activity. It is event-only; on non-Linux servers it returns an unsupported-platform error.
+The result has `tracepoint.event` (`sched:sched_wakeup`) and `tracepoint.fields` (a map of exact JSON integer values), alongside the UTC receipt `time`. The probe name is `category:name`; `fields in (...)` selects 1–16 names from `/sys/kernel/tracing/events/CATEGORY/NAME/format` (or debug tracing). Add `field.NAME = NUMBER` for equality filters on selected fields; negative decimal and `0x` hex numbers are accepted. Field names are case-sensitive to the kernel format and numeric filters are applied **on the server after eBPF collection**, before streaming; these filters do not reduce ring-buffer traffic. The running kernel must expose the tracepoint and support ring buffers. Pointer, array, bitfield and dynamic (`__data_loc`) fields are rejected, not decoded as arbitrary memory; no arbitrary ELF/eBPF programs or kprobe/uprobe/XDP hooks are loaded. This source requires a root server **and root query authorization** (certificate policy, root account keys, or query-only delegation) because tracepoints can expose other accounts' activity. It is event-only; on non-Linux servers it returns an unsupported-platform error.
 
-The query DSL has the form `SOURCE [where FIELD = VALUE [and FIELD = VALUE ...]]`. Event sources are `process`, `packets`, `syscalls`, `disk`, and `tracepoint`. Process fields are `pid`, `name` and `action` (`start` or `exit`); `name` accepts exact names or a leading/trailing `*`. Packet fields are `protocol` (`tcp` or `udp`), `direction` (`incoming` or `outgoing`), `src.ip`, `dst.ip`, `src.port`, and `dst.port`. Syscall fields are `pid` and `syscall`; `syscall in (0, 1, 9)` selects several syscall IDs. Disk fields are `device` and `operation`. Tracepoint requires `event = CATEGORY:NAME` and `fields in (NAME, ...)`, with optional `field.NAME = NUMBER` filters. For example, `syscalls where pid = 1234 and syscall in (0, 1)` selects read/write entries for a process. The parser uses PeggySue. Keywords and condition names are case-insensitive; kernel tracepoint field names are case-sensitive. Quote values with spaces or quotes. All conditions are combined with `and`; `or`, negation, and ranges are not supported. Omit `where` to match all supported events from sources other than `tracepoint`. The Go API exposes `ParseMonitorQuery(query)` to produce a `MonitorRequest` for `Client.Monitor(ctx, request, callback)`. `--query` cannot be combined with source/filter flags; the existing flags remain available as an alternative.
+The query DSL has the form `SOURCE [where FIELD = VALUE [and FIELD = VALUE ...]]`. Event sources are `process`, `packets`, `syscalls`, `disk`, and `tracepoint`. Process fields are `pid`, `name` and `action` (`start` or `exit`); `name` accepts exact names or a leading/trailing `*`. Packet fields are `protocol` (`tcp` or `udp`), `direction` (`incoming` or `outgoing`), `src.ip`, `dst.ip`, `src.port`, and `dst.port`. Syscall fields are `pid` and `syscall`; `syscall in (0, 1, 9)` selects several syscall IDs. Disk fields are `device` and `operation`. Tracepoint requires `event = CATEGORY:NAME` and `fields in (NAME, ...)`, with optional `field.NAME = NUMBER` filters. For example, `syscalls where pid = 1234 and syscall in (0, 1)` selects read/write entries for a process. The parser uses PeggySue. Keywords and condition names are case-insensitive; kernel tracepoint field names are case-sensitive. Quote values with spaces or quotes. All conditions are combined with `and`; `or` and negation are not supported. `==` is a synonym for `=`. Numeric event comparisons and range bounds are described below. Omit `where` to match all supported events from sources other than `tracepoint`. The Go API exposes `ParseMonitorQuery(query)` to produce a `MonitorRequest` for `Client.Monitor(ctx, request, callback)`. `--query` cannot be combined with source/filter flags; the existing flags remain available as an alternative.
 
 Each packet JSON event contains `packet` with protocol, direction, source/destination IPs and ports, full frame length, and up to 2048 raw Ethernet-frame bytes in base64 `data`. This shows **individual packets**, not reassembled or decrypted TCP streams. It accepts Ethernet IPv4/IPv6 (including up to two VLAN tags); IPv6 extension headers and noninitial IPv4 fragments are not decoded. Capture is best-effort under load.
 
@@ -421,9 +531,40 @@ syscalls:completion where syscall in (:fsync, :fdatasync) {
 
 `let` defines a field alias or supported projection, not a general expression. Stack and file projections automatically request capture. Stack functions are `stack.user(...)` and `stack.kernel(...)`, with named options `offsets`, `from`, `until`, `top`, `drop_top`, and `drop_bottom`. Stack patterns use double-quoted literal names (including Go pointer methods) or explicit `glob("prefix*")` / `glob("*suffix")`; literal names beginning or ending with `*` are not supported. `from` accepts a list of alternatives. `path.prefix(file.path, N)` groups by the parent directory truncated to N components. Aliases become output grouping keys.
 
-The selector may be a bare source, `syscalls:entry` / `syscalls:completion`, `disk:entry` / `disk:completion`, `process:start` / `process:exit`, or `tracepoint:CATEGORY:NAME`. Tracepoints still require `where fields in (...)`. Predicates reuse existing server filters, supporting `=` / `==`, `in (...)` or `in [...]`, and `and`. Existing predicate glob semantics are unchanged. This syntax is case-sensitive, uses double-quoted strings, and does not support comments.
+The selector may be a bare source, `syscalls:entry` / `syscalls:completion`, `disk:entry` / `disk:completion`, `process:start` / `process:exit`, or `tracepoint:CATEGORY:NAME`. Selector/action tracepoints infer payload fields from `field.NAME` references in predicates, locals, grouping, and metrics. An explicit `where fields in (...)` is optional and is combined with inferred fields, deduplicating inferred references (maximum 16 selected fields). Count-only or identity/stack-only probes select no payload fields; task identity is still captured. Unsupported kernel fields still fail explicitly. The original DSL continues to require an explicit field list. Predicates reuse existing server filters, supporting `=` / `==`, `in (...)` or `in [...]`, and `and`. Existing predicate glob semantics are unchanged. This syntax is case-sensitive, uses double-quoted strings, and does not support comments.
 
-One selector and one named table are supported per query. Table groups use existing fields or local aliases; `[]` means ungrouped. Values are named aggregate functions, or a lone function such as `@traffic[src.ip] = sum(length)` (column name `value`). Available functions are `count()`, `sum`, `avg`, `min`, `max`, `count_distinct`, and `percentile`. Results use compact `aggregation.table`, `columns` with metric names, and `rows` with group keys and aligned values. Optional `order by METRIC desc` and `limit N` apply to output, not collection. CLI/MCP queries accept this syntax and the usual trailing jq stage. Both client and server must support this extension.
+Both syntaxes support numeric event comparisons `>`, `>=`, `<`, and `<=`. For example:
+
+```sh
+portal query --name node-a --query '
+disk:completion where device_name = "nvme0n1" and duration_ns > 5000000 {
+  @slow[name_group, rwbs] = {ops: count(), p99: percentile(duration_ns, 99)}
+} after 30s { emit @slow order by ops desc limit 15 }'
+```
+
+`duration_ns > 5000000 and duration_ns <= 20000000` selects operations longer than 5ms and at most 20ms. Comparisons accept available numeric event fields, including selected `field.NAME`, signed `return_value`, packet `length`, and completion `duration_ns`. Completion-only fields require a completion selector (or `phase = completion` in the original DSL). Missing optional values do not match. Thresholds are exact decimal integers/fractions or hexadecimal integers, at most 128 bytes, with no float rounding for full-width counters; leading-zero integers remain decimal. At most 16 comparisons can be combined with `and`. They run server-side after capture, before streaming/storage/reduction, and do not reduce kernel capture traffic. They are not supported for snapshots or sampled snapshot aggregates. API callers use `MonitorRequest.Comparisons`, containing `{Field, Op, Value}` predicates; these are signed and validated just like other filters. Syntax errors show a plain-language message, line/column, and source caret rather than internal parser rules.
+
+Scripts support up to eight selector/action blocks, with one named table per block and shared reporting blocks at the end. Table names must be unique across the script; locals are scoped to their selector. Table groups use existing fields, local aliases, or inline `ALIAS: FIELD/PROJECTION` entries; `[]` means ungrouped. For example, `@j[proc: process_name, caller: stack.user(offsets: false)]` names the output group keys without separate `let` statements. Aliases must be unique identifiers; a field cannot be grouped twice. Values are named aggregate functions, or a lone function such as `@traffic[src.ip] = sum(length)` (column name `value`). Available functions are `count()`, `sum`, `avg`, `min`, `max`, `count_distinct`, and `percentile`. Results use compact `aggregation.table`, `columns` with metric names, and `rows` with separate `group` and named `values` objects. Optional `order by METRIC asc` or `desc` and `limit N` apply to output, not collection. Ascending limits select the lowest values; nulls stay last in both directions and ties are deterministic. Without an explicit order, existing descending behavior is unchanged. API callers can set `AggregationRequest.Ascending` (default false). CLI/MCP queries accept this syntax and the usual trailing jq stage. Both client and server must support this extension.
+
+Named-table rows are shaped like:
+
+```json
+{"group":{"proc":"postgres"},"values":{"ops":724,"p99":3800000}}
+```
+
+Use `.aggregation.rows[] | {proc: .group.proc, ops: .values.ops, p99: .values.p99}` in a trailing jq stage, or `.windows[].rows[] | .values.ops` for periodic results. Names do not depend on declaration order; missing metrics remain explicit `null`, not zero. Group and metric names occupy separate objects, so a metric can have the same name as a group without collisions. Columns retain function/field/percentile metadata. A lone aggregate is addressed as `.values.value`.
+
+Original-DSL compact queries keep positional `values` arrays. Named selector/action tables now emit objects instead: update existing named-table jq expressions from `.values[INDEX]` to `.values.NAME`, and update both client and server. The Go API retains `AggregateRow.Values` aligned with `Columns`; its JSON decoder accepts either format. No duplicate positional array is emitted for named tables.
+
+```text
+tracepoint:jbd2:jbd2_handle_start {
+  @j[proc: process_name] = {
+    handles: count(), blocks: sum(field.requested_blocks)
+  }
+} after 30s { emit @j order by blocks asc limit 15 }
+```
+
+This infers `requested_blocks` from the body; no repeated field list is necessary.
 
 For finite periodic reports, keep one subscription open and clear the table between buckets:
 
@@ -439,7 +580,41 @@ disk:completion where operation = write {
 
 These are **non-overlapping buckets, returned together when the query finishes**, not live streaming or rolling windows. Results are in `Snapshot.Windows` / JSON `windows`; the last bucket is shortened if necessary. Empty buckets are included. Assignment uses server receipt time, not event timestamps. The final bucket carries subscription-wide collection counters, not per-bucket loss estimates. Periodic reports require event sources, an interval of at least 100ms, at most 64 buckets, and a total duration of at most one hour. All buckets/metrics share 4,096 retained metric groups and 65,536 retained values; output is capped at 7 MiB. Limits fail explicitly rather than silently truncating capture.
 
-Snapshot-only sources support one-shot action aggregates with their normal default sampling interval (for example `memory { @usage[] = avg(used) } after 5s { emit @usage }`), not periodic action reports. Process actions currently select lifecycle events. There is no arbitrary scripting, multiple probes/tables, cross-source joining, or persistent aggregate monitor. Actions lower to the same signed and validated requests and policy checks as the original DSL. API equivalents add `Table`, metric `Name`, `GroupAliases`, and `ReportEvery` to `AggregationRequest`; `ReportEvery` is separate from the existing snapshot sampling `Every`.
+Snapshot-only sources support one-shot action aggregates with their normal default sampling interval (for example `memory { @usage[] = avg(used) } after 5s { emit @usage }`), not periodic action reports. Process actions currently select lifecycle events. There is no arbitrary scripting, cross-source joining, shared-table accumulation across selectors, or persistent aggregate monitor. Actions lower to the same signed and validated requests and policy checks as the original DSL. API equivalents add `Table`, metric `Name`, `GroupAliases`, and `ReportEvery` to `AggregationRequest`; `ReportEvery` is separate from the existing snapshot sampling `Every`.
+
+#### Multiple sources in one script
+
+Compare file flushes and disk completions over the same observation window:
+
+```sh
+portal query --name node-a --query '
+syscalls:completion where syscall in (:fsync, :fdatasync) {
+  @flushes[proc: process_name] = {ops: count(), total_ns: sum(duration_ns)}
+}
+disk:completion where device_name = "nvme0n1" {
+  @io[io.cgroup.path, rwbs] = {ops: count(), sectors: sum(sectors), p99: percentile(duration_ns, 99)}
+}
+after 30s {
+  emit @flushes order by total_ns desc limit 15;
+  emit @io order by sectors desc limit 15
+}'
+```
+
+Each selector has its own filters, capture settings, subscription/sampler, and table. Sources run concurrently with exactly matching start/end and bucket boundaries; their kernel attachment times are not atomic, and this does not link individual syscalls to disk requests. Repeating a source with different selectors is allowed, but uses separate subscriptions. All selectors must pass validation and authorization before any collection starts. A source failure cancels the others and fails the whole query rather than returning partial tables.
+
+For periodic event buckets, replace the `after` block with:
+
+```text
+every 5s {
+  emit @flushes order by total_ns desc limit 15; clear @flushes;
+  emit @io order by sectors desc limit 15; clear @io
+}
+after 30s { stop }
+```
+
+Every table must be emitted once per report, and periodic reports must clear each emitted table. Tables share the same window and reporting interval; sorting and limits remain table-specific. One-shot scripts can mix events and sampled snapshot sources (for example, add `memory { @mem[] = avg(used) }` and `emit @mem`). Periodic scripts still require event sources only. Existing collection budgets apply independently to each selector; total script output is capped at 7 MiB, and the 4096-byte query limit remains.
+
+Multi-selector results are in `Snapshot.Tables` / JSON `tables`, in selector order. Each entry has its source and either `aggregation` or `windows`, with the table name and named metric objects. Use `.tables[].aggregation` for one-shot results or `.tables[].windows[]` for periodic results; a trailing jq filter such as `.tables[] | {source, result: .aggregation}` works normally. Single-selector and original-DSL results retain their existing shapes. API callers use `MonitorRequest{Source: "script", Mode: "aggregate", Aggregation: sharedTiming, Probes: selections}`: root aggregation contains only `Window`/`ReportEvery`, and each selection is a non-nested named aggregate with matching timing. The entire script is signed; syscall names resolve independently against the server architecture. Update both client and server for multi-selector support.
 
 ### Sampled snapshot aggregations
 
@@ -550,7 +725,7 @@ Query the inventory and run a command from the client:
 ```sh
 curl http://127.0.0.1:8080/servers/node-a
 ./portal client --name node-a --coordinator http://127.0.0.1:8080 \
-  --key operator --cert operator-cert.pub --user "$(id -un)" -- /usr/bin/id
+  --key operator --ca ca.pub --cert operator-cert.pub --user "$(id -un)" -- /usr/bin/id
 ```
 
 Each repeated `-label KEY=VALUE` adds an inventory label; omit the flags for no labels. Values may contain commas and `=`. Labels are advertised on check-in and returned as `"labels":{"role":"worker","region":"us-west"}` by `GET /servers/node-a`. They are metadata only, not authorization rules or connection addresses. Inventory lookup is public to anyone who can reach the coordinator, so do not put secrets in labels.
@@ -592,13 +767,13 @@ portal cert refresh --ca-url https://ca.example.com --ca ca.pub \
   --key ~/.config/portal/operator --cert ~/.config/portal/operator-cert.pub
 ```
 
-The CA requires a signature from that key, rotates the refresh token on each successful use, and returns a new 48-hour certificate. The token is bound to that key and expires **30 days after the most recent passkey approval**, not 30 days after each refresh. Schedule `cert refresh` before the certificate expires (for example, once daily); after 30 days, rerun `cert request` and approve in the browser to start another 30-day period. If the client loses the rotated token due to a crash or failed write, browser approval is required again. Keep the token file and private key together and restrict them to the client account; neither should be logged or committed.
+The CA requires a signature from that key, rotates the refresh token on each successful use, and returns a new 48-hour certificate. The token is bound to that key and expires **30 days after the most recent passkey approval**, not 30 days after each refresh. Clients configured with `ca_url` and `ca` automatically refresh before connections when the certificate has at most five minutes left or has expired; a separate renewal schedule is unnecessary. Manual `cert refresh` remains available and uses the same credential lock. After 30 days, rerun `cert request` and approve in the browser to start another 30-day period. If the client loses the rotated token due to a crash or failed write, browser approval is required again. Renewal requests never follow redirects, so the token is not forwarded to another origin. Keep the token file and private key together and restrict them to the client account; neither should be logged or committed.
 
 Approval requests expire after five minutes and are not durable across CA restarts. The CA keeps passkey credentials and hashed refresh tokens on disk, while challenges and pending certificates live in memory. This version does not include automatic scheduling, multiple users per CA instance, or revocation; a stolen private key and certificate can remain usable for up to 48 hours unless each server's policy is changed and reloaded or its trusted CA is rotated. Protect the enrollment token and avoid logging approval URLs. Do not mount the CA signing key into the public coordinator.
 
 ## Symbols and event stacks
 
-Linux servers support symbol lookup against the running kernel, an ELF binary on the server, or a live process. All symbol lookups and stack-enabled monitors require a root server and explicit root policy authorization (which also permits root commands).
+Linux servers support symbol lookup against the running kernel, an ELF binary on the server, or a live process. All symbol lookups and stack-enabled monitors require a root server and root query authorization: certificate root policy, root account keys, or query-only delegation via `--query-authorized-keys`. Only the first two also permit root commands.
 
 ```sh
 portal query --name node-a --query 'symbols where target = kernel and name = vfs_*'

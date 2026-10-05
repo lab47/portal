@@ -27,6 +27,20 @@ func TestClientConfigDefaultsAndOverrides(t *testing.T) {
 	if err != nil || c.KeyFile != "/explicit/key" || c.CertFile != "/explicit/cert" || c.CAFile != "/explicit/ca" || c.Principal != "admin" {
 		t.Fatalf("explicit credentials not preserved: %+v, %v", c, err)
 	}
+	if c.RefreshTokenFile != "/explicit/key.refresh" {
+		t.Fatal("default token path did not follow the overridden key")
+	}
+	if err := os.WriteFile(path, []byte(`{"key":"operator","ca":"ca.pub","ca_url":"https://ca.example","refresh_token":"tokens/operator"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = (Client{ConfigFile: path}).configured()
+	if err != nil || c.CAURL != "https://ca.example" || c.RefreshTokenFile != filepath.Join(dir, "tokens/operator") {
+		t.Fatalf("renewal config resolution: %+v, %v", c, err)
+	}
+	c, err = (Client{ConfigFile: path, CAURL: "https://override.example", RefreshTokenFile: "/explicit/token"}).configured()
+	if err != nil || c.CAURL != "https://override.example" || c.RefreshTokenFile != "/explicit/token" {
+		t.Fatalf("renewal overrides ignored: %+v, %v", c, err)
+	}
 	if _, err := LoadClientConfig(filepath.Join(dir, "missing")); err == nil {
 		t.Fatal("missing explicit config silently ignored")
 	}

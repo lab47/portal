@@ -57,11 +57,11 @@ func register(ctx context.Context, url, token string, reg registration) error {
 	return nil
 }
 
-func serve(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal string, policy policy) error {
-	return serveWithSource(ctx, ep, ca, principal, policy, monitorEvents)
+func serve(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy) error {
+	return serveWithSource(ctx, ep, auth, policy, monitorEvents)
 }
 
-func serveWithSource(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, principal string, policy policy, source eventSource) error {
+func serveWithSource(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy, source eventSource) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	store := newMonitorStore(ctx, source)
@@ -77,7 +77,7 @@ func serveWithSource(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, p
 			defer conn.CloseWithError(0, "")
 			stream, err := conn.AcceptStream(ctx)
 			if err == nil {
-				handleStream(ctx, stream, ca, principal, policy, source, store)
+				handleStream(ctx, stream, auth, policy, source, store)
 			} else {
 				log.Printf("accept stream: %v", err)
 			}
@@ -85,7 +85,7 @@ func serveWithSource(ctx context.Context, ep *iroh.Endpoint, ca ssh.PublicKey, p
 	}
 }
 
-func handleStream(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy, source eventSource, store *monitorStore) {
+func handleStream(ctx context.Context, stream *iroh.Stream, auth peerAuthenticator, policy policy, source eventSource, store *monitorStore) {
 	var opener [1]byte
 	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.ReadFull(stream, opener[:]); err != nil {
@@ -94,17 +94,17 @@ func handleStream(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, pr
 	}
 	switch opener[0] {
 	case 1:
-		handleCommand(ctx, stream, ca, principal, policy)
+		handleCommand(ctx, stream, auth, policy)
 	case 2:
-		handleMonitor(ctx, stream, ca, principal, policy, source)
+		handleMonitor(ctx, stream, auth, policy, source)
 	case 3:
-		handleRegisteredMonitor(ctx, stream, ca, principal, policy, store)
+		handleRegisteredMonitor(ctx, stream, auth, policy, store)
 	default:
 		stream.Close()
 	}
 }
 
-func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy) {
+func handleCommand(ctx context.Context, stream *iroh.Stream, auth peerAuthenticator, policy policy) {
 	defer stream.Close()
 	stream.SetDeadline(time.Now().Add(65 * time.Second))
 	nonce := make([]byte, 32)
@@ -119,7 +119,11 @@ func handleCommand(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		log.Printf("read command: %v", err)
 		return
 	}
-	cert, err := verifyCommand(ca, principal, nonce, req)
+	if len(req.Argv) == 0 {
+		writeResponse(stream, Result{Error: "command required"})
+		return
+	}
+	cert, policy, err := auth.verifyForAccount(req.Certificate, req.Signature, commandProof(nonce, req.User, req.Argv), req.User, policy)
 	if err != nil {
 		log.Printf("rejected command: %v", err)
 		writeResponse(stream, Result{Error: "authentication failed"})
@@ -199,7 +203,7 @@ func lookup(ctx context.Context, url, name string) (registration, error) {
 	return reg, err
 }
 
-func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate, user string, argv []string) (Result, error) {
+func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, user string, argv []string) (Result, error) {
 	id, err := key.ParseEndpointID(reg.EndpointID)
 	if err != nil {
 		return Result{}, err

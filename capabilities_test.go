@@ -25,7 +25,7 @@ import (
 )
 
 func TestCapabilityReference(t *testing.T) {
-	docs := describeCapabilities(policy{"reader": {"other-uid": true}}, &ssh.Certificate{KeyId: "reader"})
+	docs := describeCapabilities(policy{"reader": {"other-uid": true}}, "reader")
 	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 14 || len(docs.Aggregates) != 7 {
 		t.Fatalf("incomplete capability reference: %+v", docs)
 	}
@@ -200,14 +200,18 @@ func TestClientCapabilities(t *testing.T) {
 	if err := os.WriteFile(certPath, ssh.MarshalAuthorizedKey(cert), 0600); err != nil {
 		t.Fatal(err)
 	}
+	caPath := filepath.Join(filepath.Dir(keyPath), "ca.pub")
+	if err := os.WriteFile(caPath, ssh.MarshalAuthorizedKey(ca.PublicKey()), 0600); err != nil {
+		t.Fatal(err)
+	}
 	// reader may use another account, but NOT the server account or root.
 	// Docs must still be readable without granting access to the data sources.
 	p := policy{"reader": {"other-uid": true}, "operator": {fmt.Sprint(os.Geteuid()): true}}
-	go serveWithSource(ctx, server, ca.PublicKey(), "admin", p, func(context.Context, MonitorRequest, func(Event) error) error {
+	go serveWithSource(ctx, server, peerAuthenticator{ca: ca.PublicKey(), principal: "admin"}, p, func(context.Context, MonitorRequest, func(Event) error) error {
 		t.Error("capability discovery must not attach an event source")
 		return nil
 	})
-	client := Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: keyPath, CertFile: certPath}
+	client := Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: keyPath, CertFile: certPath, CAFile: caPath}
 	docs, err := client.Capabilities(ctx)
 	if err != nil || docs.Version != 1 || len(docs.Sources) != 14 {
 		t.Fatalf("capability request: %+v, %v", docs, err)
@@ -249,7 +253,7 @@ func TestClientCapabilities(t *testing.T) {
 	if err := os.WriteFile(certPath, ssh.MarshalAuthorizedKey(bad), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Capabilities(ctx); err == nil || !strings.Contains(err.Error(), "authentication failed") {
+	if _, err := client.Capabilities(ctx); err == nil || !strings.Contains(err.Error(), "untrusted certificate authority") {
 		t.Fatalf("untrusted certificate: %v", err)
 	}
 }

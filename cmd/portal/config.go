@@ -25,8 +25,10 @@ func clientConnectionFlags(fs *mflags.FlagSet) func() portal.Client {
 	config := fs.String("config", 0, "", "client config file (default: user config directory/portal/config.json)")
 	ca := fs.String("ca", 0, "", "trusted SSH CA public key file or HTTPS URL (overrides config)")
 	principal := fs.String("principal", 0, "", "expected SSH certificate principal (default: admin)")
+	caURL := fs.String("ca-url", 0, "", "CA HTTPS origin for automatic certificate renewal (overrides config)")
+	refreshToken := fs.String("refresh-token", 0, "", "refresh token file (default: <key>.refresh)")
 	return func() portal.Client {
-		return portal.Client{Name: *name, CoordinatorURL: *coordinator, KeyFile: *key, CertFile: *cert, ConfigFile: *config, CAFile: *ca, Principal: *principal}
+		return portal.Client{Name: *name, CoordinatorURL: *coordinator, KeyFile: *key, CertFile: *cert, ConfigFile: *config, CAFile: *ca, Principal: *principal, CAURL: *caURL, RefreshTokenFile: *refreshToken}
 	}
 }
 
@@ -35,7 +37,7 @@ func certificateConfigDefaults(fs *mflags.FlagSet, path string, fields map[strin
 	if err != nil {
 		return err
 	}
-	defaults := map[string]string{"key": config.Key, "cert": config.Cert, "ca": config.CA, "ca-url": config.CAURL, "principal": config.Principal}
+	defaults := map[string]string{"key": config.Key, "cert": config.Cert, "ca": config.CA, "ca-url": config.CAURL, "principal": config.Principal, "refresh-token": config.RefreshToken}
 	for name, field := range fields {
 		if !fs.Lookup(name).HasValue && defaults[name] != "" {
 			*field = defaults[name]
@@ -54,11 +56,15 @@ func registerConfigCommands(dispatcher *mflags.Dispatcher) {
 	ca := fs.String("ca", 0, "", "trusted SSH CA public key path or HTTPS URL")
 	coordinator := fs.String("coordinator", 0, "", "coordinator HTTP(S) URL")
 	cert := fs.String("cert", 0, "", "SSH certificate path (default: <key>-cert.pub)")
-	caURL := fs.String("ca-url", 0, "", "optional CA HTTPS origin for cert request/refresh")
+	caURL := fs.String("ca-url", 0, "", "CA HTTPS origin for certificate requests and automatic renewal")
+	refreshToken := fs.String("refresh-token", 0, "", "refresh token file (default: <key>.refresh)")
 	principal := fs.String("principal", 0, "admin", "expected certificate principal")
 	dispatcher.Dispatch("config init", mflags.NewCommand(fs, func(_ *mflags.FlagSet, _ []string) error {
-		if *key == "" || *ca == "" || *coordinator == "" || *principal == "" {
-			return errors.New("--key, --ca and --coordinator required (principal must not be empty)")
+		if *coordinator == "" || (*ca != "" && (*key == "" || *principal == "")) {
+			return errors.New("--coordinator required; certificate authentication also requires --key and a nonempty principal")
+		}
+		if *ca == "" && (*cert != "" || *caURL != "" || *refreshToken != "" || fs.Lookup("principal").HasValue) {
+			return errors.New("certificate settings require --ca")
 		}
 		for _, endpoint := range []string{*coordinator, *caURL} {
 			if endpoint == "" {
@@ -75,8 +81,11 @@ func registerConfigCommands(dispatcher *mflags.Dispatcher) {
 				return errors.New("CA origin requires HTTPS")
 			}
 		}
-		config := portal.ClientConfig{Key: *key, CA: *ca, Coordinator: *coordinator, Cert: *cert, CAURL: *caURL, Principal: *principal}
-		for _, field := range []*string{&config.Key, &config.CA, &config.Cert} {
+		config := portal.ClientConfig{Key: *key, CA: *ca, Coordinator: *coordinator, Cert: *cert, CAURL: *caURL, Principal: *principal, RefreshToken: *refreshToken}
+		if *ca == "" {
+			config.Principal = ""
+		}
+		for _, field := range []*string{&config.Key, &config.CA, &config.Cert, &config.RefreshToken} {
 			if field == &config.CA && strings.Contains(*field, "://") {
 				continue
 			}
@@ -119,19 +128,45 @@ func registerServerInitCommand(dispatcher *mflags.Dispatcher, ctx context.Contex
 	ca := fs.String("ca", 0, "", "CA public key file or HTTPS URL to fetch and embed")
 	identity := fs.String("identity", 0, "", "certificate identity to authorize")
 	principal := fs.String("principal", 0, "admin", "required certificate principal")
+	authorizedKeys := fs.String("authorized-keys", 0, "", "authorized_keys override for the server account only, without a CA; other target accounts use their own ~/.ssh/authorized_keys")
+	queryAuthorizedKeys := fs.String("query-authorized-keys", 0, "", "additional authorized_keys file for queries and monitors only, never commands (without a CA)")
 	var users []string
 	fs.StringArrayNoSplitVar(&users, "user", 0, nil, "allowed local account (repeatable; root must be explicit)")
 	dispatcher.Dispatch("server init", mflags.NewCommand(fs, func(_ *mflags.FlagSet, _ []string) error {
-		if *ca == "" || *identity == "" || len(users) == 0 {
-			return errors.New("--ca, --identity and --user are required")
-		}
-		caKey, err := portal.LoadCAPublicKey(ctx, *ca)
-		if err != nil {
-			return err
+		if *ca != "" && (*identity == "" || len(users) == 0) {
+			return errors.New("--identity and --user are required with --ca")
 		}
 		config := portal.ServerConfig{
-			Name: *name, Coordinator: *coordinator, CA: string(ssh.MarshalAuthorizedKey(caKey)),
-			Principal: *principal, Identities: map[string][]string{*identity: users},
+			Name: *name, Coordinator: *coordinator,
+		}
+		if *queryAuthorizedKeys != "" {
+			absolute, err := filepath.Abs(*queryAuthorizedKeys)
+			if err != nil {
+				return err
+			}
+			config.QueryAuthorizedKeys = absolute
+		}
+		if *ca == "" {
+			if *identity != "" || len(users) != 0 || fs.Lookup("principal").HasValue {
+				return errors.New("certificate identity, user and principal require --ca")
+			}
+			if *authorizedKeys != "" {
+				absolute, err := filepath.Abs(*authorizedKeys)
+				if err != nil {
+					return err
+				}
+				config.AuthorizedKeys = absolute
+			}
+		} else {
+			if *authorizedKeys != "" || *queryAuthorizedKeys != "" {
+				return errors.New("--authorized-keys and --query-authorized-keys cannot be combined with --ca")
+			}
+			caKey, err := portal.LoadCAPublicKey(ctx, *ca)
+			if err != nil {
+				return err
+			}
+			config.CA = string(ssh.MarshalAuthorizedKey(caKey))
+			config.Principal, config.Identities = *principal, map[string][]string{*identity: users}
 		}
 		if err := config.Validate(); err != nil {
 			return err

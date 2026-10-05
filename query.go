@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	p "github.com/lab47/peggysue"
 	"github.com/lab47/peggysue/toolkit"
@@ -35,7 +36,7 @@ var monitorQueryGrammar = newMonitorQueryGrammar()
 func newMonitorQueryGrammar() p.Rule {
 	token := toolkit.After(toolkit.WS)
 	bare := p.Plus(p.Rune(func(r rune) bool {
-		return !unicode.IsSpace(r) && !strings.ContainsRune(`=(),"'`, r)
+		return !unicode.IsSpace(r) && !strings.ContainsRune(`=<>(),"'`, r)
 	}))
 	word := token(p.Capture(bare))
 	keyword := func(s string) p.Rule {
@@ -60,8 +61,12 @@ func newMonitorQueryGrammar() p.Rule {
 		}
 		return copy
 	}
-	equals := p.Action(p.Seq(token(p.S("=")), p.Named("value", value)), func(v p.Values) any {
-		return queryCondition{op: "=", values: []string{v.Get("value").(string)}}
+	equals := p.Action(p.Seq(p.Named("op", token(p.Capture(p.Or(p.S(">="), p.S("<="), p.S("=="), p.S(">"), p.S("<"), p.S("="))))), p.Named("value", value)), func(v p.Values) any {
+		op := v.Get("op").(string)
+		if op == "==" {
+			op = "="
+		}
+		return queryCondition{op: op, values: []string{v.Get("value").(string)}}
 	})
 	list := p.Action(p.Seq(
 		keyword("in"), token(p.S("(")),
@@ -179,12 +184,41 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	}
 	value, matched, err := p.New().Parse(monitorQueryGrammar, query, p.WithErrors())
 	if err != nil {
-		return MonitorRequest{}, err
+		return MonitorRequest{}, querySyntaxError(err)
 	}
 	if !matched {
 		return MonitorRequest{}, errors.New("invalid monitor query")
 	}
 	return compileMonitorQuery(value.(parsedMonitorQuery))
+}
+
+func querySyntaxError(err error) error {
+	var parse *p.ParseError
+	if !errors.As(err, &parse) {
+		return err
+	}
+	pos := min(max(parse.MaxPos, 0), len(parse.Input))
+	start := strings.LastIndex(parse.Input[:pos], "\n") + 1
+	end := len(parse.Input)
+	if i := strings.IndexByte(parse.Input[pos:], '\n'); i >= 0 {
+		end = pos + i
+	}
+	line := strings.Count(parse.Input[:pos], "\n") + 1
+	column := utf8.RuneCountInString(parse.Input[start:pos]) + 1
+	message := "invalid query syntax; check the selector, predicates, action and report blocks"
+	// Give operator mistakes a concrete expectation without exposing PEG rules.
+	prefix := strings.Fields(parse.Input[:pos])
+	if len(prefix) >= 2 && (strings.EqualFold(prefix[len(prefix)-2], "where") || strings.EqualFold(prefix[len(prefix)-2], "and")) {
+		message = "expected =, ==, in, >, >=, < or <= after a field name"
+	}
+	preview := parse.Input[start:end]
+	padding := strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return '\t'
+		}
+		return ' '
+	}, parse.Input[start:pos])
+	return fmt.Errorf("line %d, column %d: %s\n  %s\n  %s^", line, column, message, preview, padding)
 }
 
 func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
@@ -205,13 +239,24 @@ func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
 	}
 	seen := make(map[string]bool)
 	for _, condition := range parsed.conditions {
-		if len(condition.values) == 0 {
+		if len(condition.values) == 0 && !(r.Source == "tracepoint" && condition.field == "fields" && condition.op == "in" && r.Aggregation != nil && r.Aggregation.Table != "") {
 			return MonitorRequest{}, fmt.Errorf("filter %q requires a value", condition.field)
 		}
-		if seen[condition.field] {
+		key := condition.field
+		if condition.op != "=" && condition.op != "in" {
+			key += condition.op
+		}
+		if seen[key] {
 			return MonitorRequest{}, fmt.Errorf("duplicate filter %q", condition.field)
 		}
-		seen[condition.field] = true
+		seen[key] = true
+		if condition.op != "=" && condition.op != "in" {
+			if len(condition.values) != 1 {
+				return MonitorRequest{}, errors.New("comparison requires one numeric value")
+			}
+			r.Comparisons = append(r.Comparisons, NumericComparison{Field: condition.field, Op: condition.op, Value: condition.values[0]})
+			continue
+		}
 		if condition.op == "in" {
 			if condition.field == "user.stack.from" || condition.field == "kernel.stack.from" {
 				if err := setQueryFilter(&r, condition.field, condition.values[0]); err != nil {
@@ -257,6 +302,9 @@ func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
 	}
 	if seen["file.depth"] && !r.Paths {
 		return MonitorRequest{}, errors.New("file.depth requires paths=true")
+	}
+	if r.Source == "tracepoint" && !seen["fields"] {
+		return MonitorRequest{}, errors.New("tracepoint requires fields in (...); selector/action queries infer fields automatically")
 	}
 	if err := r.validate(); err != nil {
 		return MonitorRequest{}, err

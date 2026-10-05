@@ -88,7 +88,7 @@ func TestPolicyValidation(t *testing.T) {
 			}
 		})
 	}
-	if err := (Server{PolicyFile: ""}).Serve(t.Context()); err == nil || !strings.Contains(err.Error(), "policy file") {
+	if err := (Server{CAFile: "ca.pub", PolicyFile: ""}).Serve(t.Context()); err == nil || !strings.Contains(err.Error(), "policy file") {
 		t.Fatalf("server allowed without policy: %v", err)
 	}
 }

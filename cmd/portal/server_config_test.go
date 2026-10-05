@@ -110,6 +110,10 @@ func TestServerInitAndConfigOnlyServing(t *testing.T) {
 	}
 	caHTTP.Close() // Startup must use the embedded key even with the CA offline.
 	http.DefaultClient = previousClient
+	clientCA := filepath.Join(dir, "client-ca.pub")
+	if err := os.WriteFile(clientCA, []byte(c.CA), 0600); err != nil {
+		t.Fatal(err)
+	}
 	// Only server.json is needed after initialization. Keep the CA private key
 	// for signing, but remove both imported files and leave a conflicting env var.
 	if err := os.Remove(ca + ".pub"); err != nil {
@@ -167,7 +171,7 @@ func TestServerInitAndConfigOnlyServing(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		return // Command below is Unix-specific; registration is cross-platform.
 	}
-	client := portal.Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: key, CertFile: cert}
+	client := portal.Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: key, CertFile: cert, CAFile: clientCA}
 	result, err := client.Run(ctx, []string{"/bin/echo", "single-config"})
 	if err != nil || result.Output != "single-config\n" || result.ExitCode != 0 || result.Error != "" {
 		t.Fatalf("config-only server command: %+v, %v", result, err)

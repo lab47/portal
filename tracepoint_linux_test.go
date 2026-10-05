@@ -36,6 +36,68 @@ format:
 	field:void *ptr; offset:56; size:8; signed:0;
 `
 
+func TestProbeTracepointFieldInferenceLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root tracepoints")
+	}
+	for _, query := range []string{
+		`tracepoint:sched:sched_switch { @switches[] = count() } after 400ms { emit @switches }`,
+		`tracepoint:sched:sched_switch { @switches[previous: field.prev_pid] = count() } after 400ms { emit @switches order by value asc limit 2 }`,
+	} {
+		r, err := ParseMonitorQuery(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := aggregateEvents(context.Background(), r, tracepointEvents)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Aggregation.Rows) == 0 || string(result.Aggregation.Rows[0].Values[0]) == "0" {
+			t.Fatalf("no live tracepoint events: %+v", result)
+		}
+		if len(r.Tracepoint.Fields) == 0 {
+			if len(result.Aggregation.Rows[0].Group) != 0 {
+				t.Fatal("count-only probe captured unexpected fields")
+			}
+		} else if _, ok := result.Aggregation.Rows[0].Group["previous"]; !ok {
+			t.Fatal("missing inferred aliased field")
+		}
+		t.Logf("fields=%v groups=%d first_count=%s", r.Tracepoint.Fields, len(result.Aggregation.Rows), result.Aggregation.Rows[0].Values[0])
+	}
+}
+
+func TestProbeScriptSourcesLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root tracepoints")
+	}
+	r, err := ParseMonitorQuery(`tracepoint:sched:sched_switch { @switches[] = count() }
+tracepoint:sched:sched_wakeup { @wakeups[] = count() }
+memory { @memory[] = avg(used) }
+after 1200ms { emit @switches; emit @wakeups; emit @memory }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := aggregateScript(context.Background(), r, monitorEvents, querySnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Tables) != 3 {
+		t.Fatalf("missing live sources: %+v", result)
+	}
+	first := result.Tables[0].Aggregation
+	for _, table := range result.Tables {
+		a := table.Aggregation
+		if a == nil || !a.Start.Equal(first.Start) || !a.End.Equal(first.End) || len(a.Rows) != 1 {
+			t.Fatalf("incorrect live table/timing: %+v", table)
+		}
+		value, err := strconv.ParseFloat(string(a.Rows[0].Values[0]), 64)
+		if err != nil || value <= 0 {
+			t.Fatalf("no live data for @%s: %+v", a.Table, a)
+		}
+		t.Logf("source=%s table=%s value=%s start=%s end=%s", table.Source, a.Table, a.Rows[0].Values[0], a.Start, a.End)
+	}
+}
+
 func TestGenericTracepointFormatAndRecord(t *testing.T) {
 	spec := TracepointFilter{Event: "sched:sched_wakeup", Fields: []string{"target_cpu", "pid", "timestamp", "prio"}, Equals: map[string]string{"target_cpu": "3", "prio": "-2"}}
 	fields, err := parseTracepointFormat(schedWakeupFormat, spec.Fields)

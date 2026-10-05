@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,11 +25,13 @@ import (
 
 // MonitorRequest selects a source and its server-side filters. Source is
 // "syscalls", "packets", "process", "disk", "tracepoint", or a snapshot-only source;
-// unrelated filters must be omitted.
+// unrelated filters must be omitted. "script" selects concurrent named aggregates
+// in Probes, with shared timing in Aggregation and no root-level filters.
 type MonitorRequest struct {
 	Source       string              `json:"source"`
 	Mode         string              `json:"mode,omitempty"` // empty for events, "snapshot" or "aggregate" for queries
 	Aggregation  *AggregationRequest `json:"aggregation,omitempty"`
+	Probes       []MonitorRequest    `json:"probes,omitempty"` // script: independent selections sharing aggregation timing
 	PID          uint32              `json:"pid,omitempty"`
 	Syscalls     []int               `json:"syscalls,omitempty"`
 	SyscallNames []string            `json:"syscall_names,omitempty"` // resolved against the server's native Linux ABI
@@ -41,11 +46,37 @@ type MonitorRequest struct {
 	Name         string              `json:"name,omitempty"`          // network interface or sensor key (exact or edge glob)
 	Path         string              `json:"path,omitempty"`          // cgroup path relative to the visible v2 mount (exact or edge glob)
 	EventFilters map[string]string   `json:"event_filters,omitempty"` // task-context event strings; AND, exact or one edge glob
+	Comparisons  []NumericComparison `json:"comparisons,omitempty"`   // event numeric predicates; AND, applied before delivery/reduction
 	FileDepth    int                 `json:"file_depth,omitempty"`    // aggregate file.dir prefix depth; zero retains full directory
+}
+
+// NumericComparison compares an event field to an exact numeric threshold.
+// Value is textual to preserve full-width integer precision in signed requests.
+type NumericComparison struct {
+	Field string `json:"field"`
+	Op    string `json:"op"` // >, >=, <, <=
+	Value string `json:"value"`
+}
+
+var comparisonNumber = regexp.MustCompile(`^-?(?:[0-9]+(?:\.[0-9]+)?|0[xX][0-9a-fA-F]+)$`)
+
+func comparisonValue(text string) (*big.Rat, bool) {
+	if len(text) > 128 || !comparisonNumber.MatchString(text) {
+		return nil, false
+	}
+	if !strings.Contains(text, ".") && !strings.ContainsAny(text, "xX") {
+		n, ok := new(big.Int).SetString(text, 10)
+		if !ok {
+			return nil, false
+		}
+		return new(big.Rat).SetInt(n), true
+	}
+	return new(big.Rat).SetString(text)
 }
 
 // TracepointFilter selects scalar fields from a Linux tracepoint. Equals values
 // use decimal or 0x notation; every filtered field must also be selected.
+// An empty selection captures task identity/stacks without reading payload fields.
 type TracepointFilter struct {
 	Event  string            `json:"event"` // category:name
 	Fields []string          `json:"fields"`
@@ -66,8 +97,8 @@ func (f TracepointFilter) validate() error {
 	if len(parts) != 2 || !tracepointIdentifier.MatchString(parts[0]) || !tracepointIdentifier.MatchString(parts[1]) || len(f.Event) > 128 {
 		return errors.New("tracepoint event must be category:name")
 	}
-	if len(f.Fields) == 0 || len(f.Fields) > 16 {
-		return errors.New("tracepoint requires 1 to 16 fields")
+	if len(f.Fields) > 16 {
+		return errors.New("tracepoint allows at most 16 fields")
 	}
 	seen := make(map[string]bool, len(f.Fields))
 	for _, name := range f.Fields {
@@ -170,6 +201,7 @@ type Snapshot struct {
 	GPUs         []GPUInfo            `json:"gpus,omitempty"`
 	Aggregation  *AggregationResult   `json:"aggregation,omitempty"`
 	Windows      []*AggregationResult `json:"windows,omitempty"` // finite periodic reports, returned together at query completion
+	Tables       []Snapshot           `json:"tables,omitempty"`  // multi-selector results in selector order
 	Capabilities *Capabilities        `json:"capabilities,omitempty"`
 	Symbols      *SymbolResult        `json:"symbols,omitempty"`
 }
@@ -315,7 +347,70 @@ type monitorFrame struct {
 	Error    string    `json:"error,omitempty"`
 }
 
+const maxScriptProbes = 8
+
+func validateScript(r MonitorRequest) error {
+	if r.Mode != "aggregate" || r.Aggregation == nil || len(r.Probes) == 0 || len(r.Probes) > maxScriptProbes {
+		return errors.New("script requires aggregate mode, shared timing and 1–8 probes")
+	}
+	selection := r
+	selection.Source, selection.Mode, selection.Aggregation, selection.Probes = "", "", nil, nil
+	if !reflect.DeepEqual(selection, MonitorRequest{}) || !reflect.DeepEqual(*r.Aggregation, AggregationRequest{Window: r.Aggregation.Window, ReportEvery: r.Aggregation.ReportEvery}) {
+		return errors.New("script filters and result controls belong to individual probes")
+	}
+	tables := make(map[string]bool)
+	for _, probe := range r.Probes {
+		if probe.Source == "script" || len(probe.Probes) != 0 || probe.Mode != "aggregate" || probe.Aggregation == nil {
+			return errors.New("script probes must be non-nested aggregates")
+		}
+		if err := probe.validate(); err != nil {
+			return fmt.Errorf("selector %s: %w", probe.Source, err)
+		}
+		a := probe.Aggregation
+		if a.Table == "" || tables[a.Table] {
+			return errors.New("script tables must have unique nonempty names")
+		}
+		tables[a.Table] = true
+		if a.Window != r.Aggregation.Window || a.ReportEvery != r.Aggregation.ReportEvery {
+			return errors.New("script tables must share the same window and reporting interval")
+		}
+	}
+	return nil
+}
+
 func (r MonitorRequest) validate() error {
+	if r.Source == "script" {
+		return validateScript(r)
+	}
+	if len(r.Probes) != 0 {
+		return errors.New("probes require a script query")
+	}
+	if len(r.Comparisons) != 0 {
+		if r.Mode == "snapshot" || sampledAggregation(r) || len(r.Comparisons) > 16 {
+			return errors.New("numeric comparisons require event sources and at most 16 predicates")
+		}
+		_, numeric, err := aggregateFields(r)
+		if err != nil {
+			return err
+		}
+		seen := make(map[string]bool)
+		for _, c := range r.Comparisons {
+			if !slices.Contains(numeric, c.Field) {
+				return fmt.Errorf("comparison requires an available numeric event field, got %q (duration_ns requires completion)", c.Field)
+			}
+			if c.Op != ">" && c.Op != ">=" && c.Op != "<" && c.Op != "<=" {
+				return fmt.Errorf("unsupported comparison operator %q; use >, >=, < or <=", c.Op)
+			}
+			if _, ok := comparisonValue(c.Value); !ok {
+				return fmt.Errorf("comparison field %q requires a decimal or hexadecimal number up to 128 bytes", c.Field)
+			}
+			key := c.Field + c.Op
+			if seen[key] {
+				return fmt.Errorf("duplicate comparison for %s %s", c.Field, c.Op)
+			}
+			seen[key] = true
+		}
+	}
 	if r.FileDepth < 0 || r.FileDepth > 32 || (r.FileDepth != 0 && (r.Source != "syscalls" || !r.Paths || r.Mode != "aggregate")) {
 		return errors.New("file.depth requires syscall path aggregation and must be between 0 and 32")
 	}
@@ -467,6 +562,42 @@ func (r MonitorRequest) matches(event Event) bool {
 	if event.Kind == "collection_stats" {
 		return true
 	}
+	if len(r.Comparisons) != 0 {
+		fields := eventGroupFields(event, nil)
+		for _, c := range r.Comparisons {
+			value, exists := fields[c.Field]
+			if !exists || value == nil {
+				return false
+			}
+			data, err := json.Marshal(value)
+			actual, ok := new(big.Rat).SetString(string(data))
+			threshold, valid := comparisonValue(c.Value)
+			if err != nil || !ok || !valid {
+				return false
+			}
+			order := actual.Cmp(threshold)
+			switch c.Op {
+			case ">":
+				if order <= 0 {
+					return false
+				}
+			case ">=":
+				if order < 0 {
+					return false
+				}
+			case "<":
+				if order >= 0 {
+					return false
+				}
+			case "<=":
+				if order > 0 {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+	}
 	if len(r.EventFilters) != 0 {
 		for field, pattern := range r.EventFilters {
 			var value string
@@ -603,7 +734,7 @@ func (c Client) Monitor(ctx context.Context, request MonitorRequest, onEvent fun
 	if onEvent == nil {
 		return errors.New("event callback required")
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (struct{}, error) {
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (struct{}, error) {
 		return struct{}{}, monitorRemote(ctx, ep, reg, signer, cert, request, onEvent)
 	})
 	return err
@@ -621,17 +752,17 @@ func (c Client) Query(ctx context.Context, request MonitorRequest) (Snapshot, er
 	if err := request.validate(); err != nil {
 		return Snapshot{}, err
 	}
-	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (Snapshot, error) {
+	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (Snapshot, error) {
 		return monitorRequestRemote(ctx, ep, reg, signer, cert, request, nil)
 	})
 }
 
-func monitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate, request MonitorRequest, onEvent func(Event) error) error {
+func monitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, request MonitorRequest, onEvent func(Event) error) error {
 	_, err := monitorRequestRemote(ctx, ep, reg, signer, cert, request, onEvent)
 	return err
 }
 
-func monitorRequestRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate, request MonitorRequest, onEvent func(Event) error) (Snapshot, error) {
+func monitorRequestRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, request MonitorRequest, onEvent func(Event) error) (Snapshot, error) {
 	id, err := key.ParseEndpointID(reg.EndpointID)
 	if err != nil {
 		return Snapshot{}, err
@@ -712,7 +843,7 @@ func monitorRequestRemote(ctx context.Context, ep *iroh.Endpoint, reg registrati
 
 type eventSource func(context.Context, MonitorRequest, func(Event) error) error
 
-func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy, source eventSource) {
+func handleMonitor(ctx context.Context, stream *iroh.Stream, auth peerAuthenticator, policy policy, source eventSource) {
 	defer stream.Close()
 	stream.SetDeadline(time.Now().Add(15 * time.Second))
 	nonce := make([]byte, 32)
@@ -727,12 +858,12 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		return
 	}
 	encoder := json.NewEncoder(stream)
-	cert, err := verifyMonitor(ca, principal, nonce, req)
+	cert, policy, err := auth.verifyQuery(req.Certificate, req.Signature, monitorProof(nonce, req.MonitorRequest), policy)
 	if err != nil {
 		writeMonitorError(stream, "authentication failed")
 		return
 	}
-	if err := authorizeMonitorRequest(policy, cert, req.MonitorRequest); err != nil {
+	if err := authorizeMonitorRequest(policy, cert.KeyId, req.MonitorRequest); err != nil {
 		writeMonitorError(stream, err.Error())
 		return
 	}
@@ -750,7 +881,7 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 		var snapshot Snapshot
 		var err error
 		if req.Source == "capabilities" {
-			docs := describeCapabilities(policy, cert)
+			docs := describeCapabilities(policy, cert.KeyId)
 			snapshot = Snapshot{Source: "capabilities", Time: time.Now().UTC(), Capabilities: &docs}
 		} else {
 			snapshot, err = querySnapshot(ctx, req.MonitorRequest)
@@ -778,7 +909,9 @@ func handleMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, p
 	if req.Mode == "aggregate" {
 		var result Snapshot
 		var err error
-		if sampledAggregation(req.MonitorRequest) {
+		if req.Source == "script" {
+			result, err = aggregateScript(monitorCtx, req.MonitorRequest, source, querySnapshot)
+		} else if sampledAggregation(req.MonitorRequest) {
 			result, err = aggregateSnapshots(monitorCtx, req.MonitorRequest, querySnapshot)
 		} else {
 			result, err = aggregateEvents(monitorCtx, req.MonitorRequest, source)

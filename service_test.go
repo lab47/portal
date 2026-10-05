@@ -109,7 +109,7 @@ func TestCoordinatorIrohCommand(t *testing.T) {
 		}
 	}
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, server, ca.PublicKey(), "admin", allowed) }()
+	go func() { done <- serve(ctx, server, peerAuthenticator{ca: ca.PublicKey(), principal: "admin"}, allowed) }()
 	client, err := iroh.Bind(ctx, iroh.WithRelayMode(mode), iroh.WithBindAddr(netip.MustParseAddrPort("127.0.0.1:0")))
 	if err != nil {
 		t.Fatal(err)

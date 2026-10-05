@@ -45,11 +45,11 @@ func TestCgroupQueriesAndProof(t *testing.T) {
 		t.Fatal("cgroup path filter not signed")
 	}
 	p := policy{"operator": {fmt.Sprint(os.Geteuid()): true}}
-	err = authorizeMonitorSource(p, cert, "cgroups")
+	err = authorizeMonitorSource(p, cert.KeyId, "cgroups")
 	if (os.Geteuid() == 0) != (err == nil) {
 		t.Fatalf("cgroup root authorization: %v", err)
 	}
-	if err := authorizeMonitorSource(policy{"operator": {"other-uid": true}}, cert, "cgroups"); err == nil {
+	if err := authorizeMonitorSource(policy{"operator": {"other-uid": true}}, cert.KeyId, "cgroups"); err == nil {
 		t.Fatal("cgroups exposed without root policy")
 	}
 	encoded, err := json.Marshal(Snapshot{Source: "cgroups"})

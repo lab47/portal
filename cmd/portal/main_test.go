@@ -6,7 +6,7 @@ import (
 )
 
 func TestClientCommandSeparator(t *testing.T) {
-	args := []string{"client", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert", "--user", "deploy"}
+	args := []string{"client", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--ca", "/missing-ca", "--cert", "/missing-cert", "--user", "deploy"}
 	withSeparator := append(append([]string{}, args...), "--", "/bin/echo", "--flag")
 	if err := run(withSeparator); err == nil || !strings.Contains(err.Error(), "/missing-key") {
 		t.Fatalf("command arguments after -- were not passed through: %v", err)
@@ -18,7 +18,7 @@ func TestClientCommandSeparator(t *testing.T) {
 }
 
 func TestCapabilitiesCommand(t *testing.T) {
-	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	for _, command := range [][]string{{"capabilities"}, {"query", "--query", "capabilities"}} {
 		if err := run(append(command, connection...)); err == nil || !strings.Contains(err.Error(), "/missing-key") {
 			t.Fatalf("capability command did not use client credentials: %v", err)
@@ -54,7 +54,7 @@ func TestServerLabels(t *testing.T) {
 }
 
 func TestMonitorPacketFlags(t *testing.T) {
-	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	valid := append(append([]string{}, base...), "--source", "packets", "--protocol", "tcp", "--direction", "outgoing", "--dst-port", "80")
 	if err := run(valid); err == nil || !strings.Contains(err.Error(), "/missing-key") {
 		t.Fatalf("packet monitor flags not accepted: %v", err)
@@ -71,7 +71,7 @@ func TestMonitorPacketFlags(t *testing.T) {
 }
 
 func TestMonitorQueryFlag(t *testing.T) {
-	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	valid := append(append([]string{}, base...), "--query", "packets where protocol = tcp and direction = outgoing and dst.port = 80")
 	if err := run(valid); err == nil || !strings.Contains(err.Error(), "/missing-key") {
 		t.Fatalf("query was not accepted: %v", err)
@@ -90,7 +90,7 @@ func TestMonitorQueryFlag(t *testing.T) {
 }
 
 func TestMonitorProcessFlags(t *testing.T) {
-	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	for _, flags := range [][]string{
 		{"--source", "process", "--process-name", "worker", "--process-action", "start"},
 		{"--query", "process where name = worker and action = start"},
@@ -111,7 +111,7 @@ func TestMonitorProcessFlags(t *testing.T) {
 }
 
 func TestMonitorDiskFlags(t *testing.T) {
-	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	base := []string{"monitor", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	for _, flags := range [][]string{
 		{"--source", "disk", "--device", "0x800", "--operation", "write"},
 		{"--query", "disk where operation = read"},
@@ -135,7 +135,7 @@ func TestMonitorDiskFlags(t *testing.T) {
 }
 
 func TestQuerySnapshotFlags(t *testing.T) {
-	base := []string{"query", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	base := []string{"query", "--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	for _, query := range []string{"process", "process where pid = 42 and name = worker*", "cpu", "memory", "network where name = eth*", "kernel", "sensors", "containers", "gpu where name = '*A100'", "syscalls where syscall = 2 count over 30s by pid", "process where action = start count over 1m by name", "packets sum(length) over 30s by dst.ip", "disk avg(sectors) over 30s", "process count_distinct(name) over 1m", "packets percentile(length,95) over 30s"} {
 		if err := run(append(append([]string{}, base...), "--query", query)); err == nil || !strings.Contains(err.Error(), "/missing-key") {
 			t.Fatalf("snapshot query %q rejected before connecting: %v", query, err)
@@ -149,7 +149,7 @@ func TestQuerySnapshotFlags(t *testing.T) {
 }
 
 func TestRegisteredMonitorFlags(t *testing.T) {
-	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key", "--cert", "/missing-cert"}
+	connection := []string{"--name", "node-a", "--coordinator", "http://localhost:8080", "--key", "/missing-key"}
 	for _, args := range [][]string{
 		{"monitor-register", "--query", "process where name = worker*"},
 		{"monitor-register", "--query", "process", "--ttl", "30m"},

@@ -39,18 +39,29 @@ type registeredMonitorFrame struct {
 	Oldest uint64         `json:"oldest,omitempty"`
 }
 
-func authorizeMonitorRequest(p policy, cert *ssh.Certificate, request MonitorRequest) error {
-	if request.Stacks != nil {
-		return authorizeMonitorSource(p, cert, "tracepoint")
+func authorizeMonitorRequest(p policy, identity string, request MonitorRequest) error {
+	if request.Source == "script" {
+		if err := request.validate(); err != nil {
+			return err
+		}
+		for _, probe := range request.Probes {
+			if err := authorizeMonitorRequest(p, identity, probe); err != nil {
+				return fmt.Errorf("selector %s: %w", probe.Source, err)
+			}
+		}
+		return nil
 	}
-	return authorizeMonitorSource(p, cert, request.Source)
+	if request.Stacks != nil {
+		return authorizeMonitorSource(p, identity, "tracepoint")
+	}
+	return authorizeMonitorSource(p, identity, request.Source)
 }
 
-func authorizeMonitorSource(p policy, cert *ssh.Certificate, source string) error {
+func authorizeMonitorSource(p policy, identity string, source string) error {
 	if source == "capabilities" {
 		// Any mapped identity may discover requirements, including when it
 		// cannot query the server's own account. Never expose policy contents.
-		if len(p[cert.KeyId]) == 0 {
+		if len(p[identity]) == 0 {
 			return errors.New("not authorized")
 		}
 		return nil
@@ -63,18 +74,18 @@ func authorizeMonitorSource(p policy, cert *ssh.Certificate, source string) erro
 	if privileged {
 		account = "root"
 	}
-	if _, err := p.authorize(cert.KeyId, account); err != nil {
+	if _, err := p.authorize(identity, account); err != nil {
 		return errors.New("not authorized")
 	}
 	return nil
 }
 
-func monitorOwner(cert *ssh.Certificate) string {
-	digest := sha256.Sum256(cert.Key.Marshal())
+func monitorOwner(key ssh.PublicKey) string {
+	digest := sha256.Sum256(key.Marshal())
 	return fmt.Sprintf("%x", digest)
 }
 
-func handleRegisteredMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.PublicKey, principal string, policy policy, store *monitorStore) {
+func handleRegisteredMonitor(ctx context.Context, stream *iroh.Stream, auth peerAuthenticator, policy policy, store *monitorStore) {
 	defer stream.Close()
 	stream.SetDeadline(time.Now().Add(15 * time.Second))
 	nonce := make([]byte, 32)
@@ -88,19 +99,19 @@ func handleRegisteredMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.Pu
 	if err := json.NewDecoder(io.LimitReader(stream, 64*1024)).Decode(&req); err != nil {
 		return
 	}
-	cert, err := verifyRegisteredMonitor(ca, principal, nonce, req)
+	cert, policy, err := auth.verifyQuery(req.Certificate, req.Signature, registeredMonitorProof(nonce, req.monitorAction), policy)
 	if err != nil {
 		writeRegisteredFrame(stream, registeredMonitorFrame{Error: "authentication failed"})
 		return
 	}
-	owner := monitorOwner(cert)
+	owner := monitorOwner(cert.Key)
 	switch req.Action {
 	case "create":
 		if req.ID != "" || req.After != 0 || req.AfterTimestamp != "" || req.Request == nil {
 			writeRegisteredFrame(stream, registeredMonitorFrame{Error: "invalid create request"})
 			return
 		}
-		if err := authorizeMonitorRequest(policy, cert, *req.Request); err != nil {
+		if err := authorizeMonitorRequest(policy, cert.KeyId, *req.Request); err != nil {
 			writeRegisteredFrame(stream, registeredMonitorFrame{Error: err.Error()})
 			return
 		}
@@ -123,7 +134,7 @@ func handleRegisteredMonitor(ctx context.Context, stream *iroh.Stream, ca ssh.Pu
 		}
 		m, err := store.get(req.ID, owner)
 		if err == nil {
-			err = authorizeMonitorRequest(policy, cert, m.request)
+			err = authorizeMonitorRequest(policy, cert.KeyId, m.request)
 		}
 		if err != nil {
 			writeRegisteredFrame(stream, registeredMonitorFrame{Error: err.Error()})
@@ -189,7 +200,7 @@ func (c Client) CreateMonitor(ctx context.Context, request MonitorRequest, ttl .
 	if request.Mode != "" {
 		return "", errors.New("registered monitors require event mode")
 	}
-	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (string, error) {
+	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
 		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "create", Request: &request, TTL: lifetime}, nil)
 	})
 }
@@ -201,7 +212,7 @@ func (c Client) ReadMonitor(ctx context.Context, id string, after uint64, onReco
 	if len(id) != 32 || onRecord == nil {
 		return errors.New("monitor ID and record callback required")
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (string, error) {
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
 		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "read", ID: id, After: after}, onRecord)
 	})
 	return err
@@ -217,7 +228,7 @@ func (c Client) ReadMonitorSince(ctx context.Context, id, timestamp string, onRe
 	if err := validateTAI64N(timestamp); err != nil {
 		return err
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (string, error) {
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
 		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "read", ID: id, AfterTimestamp: timestamp}, onRecord)
 	})
 	return err
@@ -228,13 +239,13 @@ func (c Client) DeleteMonitor(ctx context.Context, id string) error {
 	if len(id) != 32 {
 		return errors.New("monitor ID required")
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate) (string, error) {
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
 		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "delete", ID: id}, nil)
 	})
 	return err
 }
 
-func registeredMonitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert *ssh.Certificate, action monitorAction, onRecord func(MonitorRecord) error) (string, error) {
+func registeredMonitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, action monitorAction, onRecord func(MonitorRecord) error) (string, error) {
 	id, err := key.ParseEndpointID(reg.EndpointID)
 	if err != nil {
 		return "", err

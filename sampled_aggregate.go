@@ -283,6 +283,10 @@ func (r *aggregateReduction) addSample(fields map[string]any) error {
 // aggregateSnapshots samples immediately and then on the interval grid within
 // [start,end). Slow reads skip ticks, never overlap or generate catch-up bursts.
 func aggregateSnapshots(ctx context.Context, request MonitorRequest, collect func(context.Context, MonitorRequest) (Snapshot, error)) (Snapshot, error) {
+	return aggregateSnapshotsAt(ctx, request, collect, time.Now())
+}
+
+func aggregateSnapshotsAt(ctx context.Context, request MonitorRequest, collect func(context.Context, MonitorRequest) (Snapshot, error), start time.Time) (Snapshot, error) {
 	if err := request.validate(); err != nil {
 		return Snapshot{}, err
 	}
@@ -295,7 +299,6 @@ func aggregateSnapshots(ctx context.Context, request MonitorRequest, collect fun
 		interval = DefaultSampleInterval
 	}
 	a.Every = interval
-	start := time.Now()
 	end := start.Add(a.Window)
 	windowCtx, cancel := context.WithDeadline(ctx, end)
 	defer cancel()

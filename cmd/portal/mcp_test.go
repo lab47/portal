@@ -87,33 +87,33 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 	}
 
 	callParams, err := json.Marshal(mflags.ToolCallRequest{Name: "client", Arguments: map[string]any{
-		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "user": account.Username,
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub", "user": account.Username,
 		"arguments": []string{"--", "/bin/echo", "--mcp-arg"},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	capabilityParams, err := json.Marshal(mflags.ToolCallRequest{Name: "capabilities", Arguments: map[string]any{
-		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	queryParams, err := json.Marshal(mflags.ToolCallRequest{Name: "query", Arguments: map[string]any{
-		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub",
 		"query": fmt.Sprintf("process where pid = %d | .processes[0].pid", os.Getpid()),
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	aggregateParams, err := json.Marshal(mflags.ToolCallRequest{Name: "query", Arguments: map[string]any{
-		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub",
 		"query": fmt.Sprintf("process where pid = %d count, max(rss_bytes) over 300ms every 100ms by pid", os.Getpid()),
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := portal.Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: key, CertFile: cert}
+	client := portal.Client{Name: "node-a", CoordinatorURL: coordinator.URL, KeyFile: key, CertFile: cert, CAFile: ca + ".pub"}
 	monitorID, err := client.CreateMonitor(ctx, portal.MonitorRequest{Source: "process", Process: &portal.ProcessFilter{Name: "sleep", Action: "start"}}, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -125,14 +125,14 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 	defer func() { sleeper.Process.Kill(); sleeper.Wait() }()
 	time.Sleep(1200 * time.Millisecond) // Allow the lifecycle poll to buffer the start.
 	readParams, err := json.Marshal(mflags.ToolCallRequest{Name: "monitor-read", Arguments: map[string]any{
-		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert,
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub",
 		"id": monitorID, "duration": "200ms",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	deleteParams, err := json.Marshal(mflags.ToolCallRequest{Name: "monitor-delete", Arguments: map[string]any{
-		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "id": monitorID,
+		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub", "id": monitorID,
 	}})
 	if err != nil {
 		t.Fatal(err)

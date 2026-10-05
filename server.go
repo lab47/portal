@@ -14,7 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Server runs commands for clients authenticated by the SSH user CA.
+// Server authenticates clients using a user CA, or OpenSSH keys when no CA is configured.
 type Server struct {
 	Name, CoordinatorURL, Token   string
 	CAFile, Principal, PolicyFile string
@@ -22,6 +22,8 @@ type Server struct {
 	Identities                    map[string][]string // Optional inline account policy.
 	RelayURL, Listen              string              // Optional relay URL and UDP bind IP:port.
 	Labels                        map[string]string   // Optional inventory metadata advertised at each check-in.
+	AuthorizedKeysFile            string              // Optional authorized_keys override for the server account, not other target users.
+	QueryAuthorizedKeysFile       string              // Additional query/monitor-only keys, without a CA.
 }
 
 // Serve checks in with the coordinator and accepts commands until ctx is canceled.
@@ -31,24 +33,13 @@ func (s Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if s.Name == "" || s.CoordinatorURL == "" || s.Token == "" || (s.CAFile == "" && s.CAPublicKey == "") || (s.PolicyFile == "" && s.Identities == nil) {
+	if s.Name == "" || s.CoordinatorURL == "" || s.Token == "" || ((s.CAFile != "" || s.CAPublicKey != "") && s.PolicyFile == "" && s.Identities == nil) {
+		if s.CAFile == "" && s.CAPublicKey == "" {
+			return errors.New("server requires name, coordinator URL and registration token")
+		}
 		return errors.New("server requires name, coordinator URL, token, CA public key or CA file, and identities or policy file")
 	}
-	var policy policy
-	if s.PolicyFile != "" {
-		policy, err = loadPolicy(s.PolicyFile)
-	} else {
-		policy, err = compilePolicy(s.Identities)
-	}
-	if err != nil {
-		return err
-	}
-	var ca ssh.PublicKey
-	if s.CAFile != "" {
-		ca, err = LoadCAPublicKey(ctx, s.CAFile)
-	} else {
-		ca, _, _, _, err = ssh.ParseAuthorizedKey([]byte(s.CAPublicKey))
-	}
+	auth, policy, err := s.authentication(ctx)
 	if err != nil {
 		return err
 	}
@@ -104,5 +95,37 @@ func (s Server) Serve(ctx context.Context) error {
 			}
 		}
 	}()
-	return serve(ctx, ep, ca, s.Principal, policy)
+	return serve(ctx, ep, auth, policy)
+}
+
+func (s Server) authentication(ctx context.Context) (peerAuthenticator, policy, error) {
+	if s.CAFile == "" && s.CAPublicKey == "" {
+		if s.PolicyFile != "" || s.Identities != nil || s.Principal != "" {
+			return peerAuthenticator{}, nil, errors.New("certificate policy and principal require a configured CA")
+		}
+		return peerAuthenticator{openSSH: true, keyFile: s.AuthorizedKeysFile, queryKeyFile: s.QueryAuthorizedKeysFile}, nil, nil
+	}
+	if s.AuthorizedKeysFile != "" || s.QueryAuthorizedKeysFile != "" {
+		return peerAuthenticator{}, nil, errors.New("authorized_keys and query_authorized_keys cannot be combined with a CA")
+	}
+	if (s.CAFile == "" && s.CAPublicKey == "") || (s.PolicyFile == "" && s.Identities == nil) {
+		return peerAuthenticator{}, nil, errors.New("server requires CA public key or CA file, and identities or policy file")
+	}
+	var p policy
+	var err error
+	if s.PolicyFile != "" {
+		p, err = loadPolicy(s.PolicyFile)
+	} else {
+		p, err = compilePolicy(s.Identities)
+	}
+	if err != nil {
+		return peerAuthenticator{}, nil, err
+	}
+	var ca ssh.PublicKey
+	if s.CAFile != "" {
+		ca, err = LoadCAPublicKey(ctx, s.CAFile)
+	} else {
+		ca, _, _, _, err = ssh.ParseAuthorizedKey([]byte(s.CAPublicKey))
+	}
+	return peerAuthenticator{ca: ca, principal: s.Principal}, p, err
 }

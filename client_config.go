@@ -12,12 +12,13 @@ import (
 
 // ClientConfig contains paths and endpoints, never private key contents.
 type ClientConfig struct {
-	Key         string `json:"key"`
-	CA          string `json:"ca"`
-	Coordinator string `json:"coordinator"`
-	Cert        string `json:"cert,omitempty"`
-	CAURL       string `json:"ca_url,omitempty"`
-	Principal   string `json:"principal,omitempty"`
+	Key          string `json:"key,omitempty"`
+	CA           string `json:"ca,omitempty"`
+	Coordinator  string `json:"coordinator"`
+	Cert         string `json:"cert,omitempty"`
+	CAURL        string `json:"ca_url,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"` // File path, never token contents.
+	Principal    string `json:"principal,omitempty"`
 }
 
 func DefaultClientConfigPath() (string, error) {
@@ -64,7 +65,7 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 	if err := dec.Decode(new(any)); err != io.EOF {
 		return ClientConfig{}, errors.New("client config contains trailing data")
 	}
-	for _, field := range []*string{&config.Key, &config.CA, &config.Cert} {
+	for _, field := range []*string{&config.Key, &config.CA, &config.Cert, &config.RefreshToken} {
 		if field == &config.CA && strings.Contains(*field, "://") {
 			continue
 		}
@@ -84,16 +85,26 @@ func (c Client) configured() (Client, error) {
 		{&c.KeyFile, &config.Key}, {&c.CAFile, &config.CA},
 		{&c.CertFile, &config.Cert}, {&c.CoordinatorURL, &config.Coordinator},
 		{&c.Principal, &config.Principal},
+		{&c.CAURL, &config.CAURL}, {&c.RefreshTokenFile, &config.RefreshToken},
 	} {
 		if *pair[0] == "" {
 			*pair[0] = *pair[1]
 		}
+	}
+	if c.CAFile == "" {
+		if c.CertFile != "" || c.CAURL != "" || c.RefreshTokenFile != "" || c.Principal != "" {
+			return Client{}, errors.New("certificate settings require a configured CA")
+		}
+		return c, nil
 	}
 	if c.CertFile == "" && c.KeyFile != "" {
 		c.CertFile = c.KeyFile + "-cert.pub"
 	}
 	if c.Principal == "" {
 		c.Principal = "admin"
+	}
+	if c.RefreshTokenFile == "" && c.KeyFile != "" {
+		c.RefreshTokenFile = c.KeyFile + ".refresh"
 	}
 	return c, nil
 }

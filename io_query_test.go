@@ -8,8 +8,6 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
 func TestIOQueryFields(t *testing.T) {
@@ -40,7 +38,7 @@ func TestIOQueryFields(t *testing.T) {
 	if fields["file.path"] != "/data/test" || fields["file.fd"] != int32(7) {
 		t.Fatalf("file fields: %+v", fields)
 	}
-	for _, s := range describeCapabilities(policy{}, &ssh.Certificate{}).Sources {
+	for _, s := range describeCapabilities(policy{}, "").Sources {
 		if s.Name == "disk" && !slices.Contains(s.NumericFields, "duration_ns") {
 			t.Fatal("disk latency undiscoverable")
 		}
