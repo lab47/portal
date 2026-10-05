@@ -2,6 +2,7 @@ package portal
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -67,5 +68,33 @@ func TestSymbolAndStackProofs(t *testing.T) {
 		if _, err := verifyMonitor(ca.PublicKey(), "admin", nonce, proof); err == nil {
 			t.Fatal("modified capture/lookup passed signature check")
 		}
+	}
+}
+
+func TestStackCoverageDistinguishesCaptureAndSymbolization(t *testing.T) {
+	var coverage StackCoverage
+	for _, stack := range []*CapturedStack{
+		nil, {},
+		{CaptureErrorCode: -14, Error: "bpf_get_stackid failed: -14"},
+		{CaptureErrorCode: -14, Error: "bpf_get_stackid failed: -14"},
+		{CaptureErrorCode: -17, Error: "bpf_get_stackid failed: -17"},
+		{Error: "read captured stack: missing key"},
+		{Frames: []SymbolFrame{{Name: "a"}, {Name: "b"}}, DepthLimitReached: true},
+		{Frames: []SymbolFrame{{Name: "a"}, {Address: "0x12", Error: "no symbol"}}},
+		{Frames: []SymbolFrame{{Address: "0x1"}, {Address: "0x2"}, {Address: "0x3"}}, Error: "process exited before symbolization"},
+		{Frames: []SymbolFrame{{Address: "0x4", Module: "libc.so", FileOffset: new(uint64)}}},
+	} {
+		coverage.observe(stack, true)
+	}
+	want := StackCoverage{Events: 10, Missing: 1, Empty: 1, CaptureFailures: 4, LookupFailures: 1,
+		HelperErrors: map[string]uint64{"-14": 2, "-17": 1}, Captured: 4, DepthLimitReached: 1,
+		Frames: 8, NamedFrames: 3, UnresolvedFrames: 5, FullySymbolized: 1, PartiallySymbolized: 1, Unsymbolized: 2, SymbolizationFailures: 1}
+	if !reflect.DeepEqual(coverage, want) {
+		t.Fatalf("capture failures must not include successfully captured unnamed frames: %+v", coverage)
+	}
+	var disabled StackCoverage
+	disabled.observe(&CapturedStack{Frames: []SymbolFrame{{Address: "0x1"}, {Address: "0x2"}}}, false)
+	if disabled.Captured != 1 || disabled.Frames != 2 || disabled.SymbolizationDisabled != 1 || disabled.UnresolvedFrames != 0 || disabled.Unsymbolized != 0 {
+		t.Fatalf("disabled symbolization reported as failed resolution: %+v", disabled)
 	}
 }

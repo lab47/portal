@@ -123,6 +123,9 @@ func snapshotSampleFields(source string) []SampleField {
 	if source == "cgroups" {
 		fields = append(fields, SampleField{FieldCapability{Path: "cpu_percent", QueryField: "cpu_percent", Type: "number", Optional: true, Unit: "percent", Description: "100 × delta cpu_seconds / elapsed seconds, including descendants; 100% is one busy core, may exceed 100%. Not normalized to quota; needs consecutive observations of the same directory identity."}, "utilization"})
 	}
+	for i := range fields {
+		fields[i].Aggregatable = true // Scalars support distinct count; counters additionally support rate.
+	}
 	return fields
 }
 
@@ -188,6 +191,11 @@ type sampleObservation struct {
 	time   time.Time
 }
 
+type counterInterval struct {
+	delta      *big.Rat
+	start, end time.Time
+}
+
 func sampleNumber(value any) *big.Rat {
 	n, ok := value.(json.Number)
 	if !ok {
@@ -215,6 +223,7 @@ func deriveSample(fields map[string]any, previous sampleObservation, at time.Tim
 		}
 		delta := new(big.Rat).Sub(current, before)
 		deltas[field.Path] = delta
+		fields["__counter_delta."+field.Path] = counterInterval{delta, previous.time, at}
 		seconds := new(big.Rat).SetFrac(big.NewInt(int64(at.Sub(previous.time))), big.NewInt(int64(time.Second)))
 		rate := new(big.Rat).Quo(delta, seconds)
 		fields[field.Path+"_per_second"] = json.Number(rate.FloatString(18))

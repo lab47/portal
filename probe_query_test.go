@@ -170,6 +170,20 @@ disk:completion where device_name = "nvme0n1" {
 	}
 }
 
+func TestProbeUnemittedTableErrorsNameTable(t *testing.T) {
+	for _, tc := range []struct {
+		query, table string
+	}{
+		{`process { @a[] = count() } after 1s { stop }`, "@a"},
+		{`process { @a[] = count() } syscalls { @b[] = count() } after 1s { emit @a }`, "@b"},
+	} {
+		_, err := ParseMonitorQuery(tc.query)
+		if err == nil || !strings.Contains(err.Error(), tc.table) {
+			t.Fatalf("missing %s in error for %s: %v", tc.table, tc.query, err)
+		}
+	}
+}
+
 func TestProbeScriptSharedBuckets(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r, err := ParseMonitorQuery(`process:start where name = worker { @starts[] = count() }

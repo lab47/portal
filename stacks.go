@@ -30,8 +30,88 @@ type StackShape struct {
 }
 
 type CapturedStack struct {
-	Frames []SymbolFrame `json:"frames,omitempty"`
-	Error  string        `json:"error,omitempty"`
+	Frames            []SymbolFrame `json:"frames,omitempty"`
+	Error             string        `json:"error,omitempty"`
+	CaptureErrorCode  int64         `json:"capture_error_code,omitempty"`  // signed bpf_get_stackid result, not a symbolization error
+	DepthLimitReached bool          `json:"depth_limit_reached,omitempty"` // possibly truncated; exact-depth complete stacks are indistinguishable
+}
+
+// StackCoverage describes matching received events before shaping and output limits.
+// Kernel-wide failures (including undelivered events) remain in CollectionStats.
+type StackCoverage struct {
+	Events                uint64            `json:"events"`
+	Captured              uint64            `json:"captured"` // at least one raw frame, even if symbolization failed
+	Missing               uint64            `json:"missing"`
+	Empty                 uint64            `json:"empty"`
+	CaptureFailures       uint64            `json:"capture_failures"`
+	HelperErrors          map[string]uint64 `json:"helper_errors,omitempty"` // signed decimal error codes
+	LookupFailures        uint64            `json:"lookup_failures"`
+	DepthLimitReached     uint64            `json:"depth_limit_reached"`
+	Frames                uint64            `json:"frames"`
+	NamedFrames           uint64            `json:"named_frames"`
+	UnresolvedFrames      uint64            `json:"unresolved_frames"`
+	FullySymbolized       uint64            `json:"fully_symbolized"`
+	PartiallySymbolized   uint64            `json:"partially_symbolized"`
+	Unsymbolized          uint64            `json:"unsymbolized"`
+	SymbolizationFailures uint64            `json:"symbolization_failures"` // stack-level symbolizer errors; frame gaps are counted separately
+	SymbolizationDisabled uint64            `json:"symbolization_disabled"`
+}
+
+type StackCoverageReport struct {
+	User   *StackCoverage `json:"user,omitempty"`
+	Kernel *StackCoverage `json:"kernel,omitempty"`
+}
+
+func (c *StackCoverage) observe(stack *CapturedStack, symbolize bool) {
+	c.Events++
+	if stack == nil {
+		c.Missing++
+		return
+	}
+	if len(stack.Frames) == 0 {
+		if stack.CaptureErrorCode != 0 || stack.Error != "" {
+			c.CaptureFailures++
+			if stack.CaptureErrorCode != 0 {
+				if c.HelperErrors == nil {
+					c.HelperErrors = make(map[string]uint64)
+				}
+				c.HelperErrors[fmt.Sprint(stack.CaptureErrorCode)]++
+			} else {
+				c.LookupFailures++
+			}
+		} else {
+			c.Empty++
+		}
+		return
+	}
+	c.Captured++
+	c.Frames += uint64(len(stack.Frames))
+	if stack.DepthLimitReached {
+		c.DepthLimitReached++
+	}
+	if !symbolize {
+		c.SymbolizationDisabled++
+		return
+	}
+	if stack.Error != "" {
+		c.SymbolizationFailures++
+	}
+	var named uint64
+	for _, frame := range stack.Frames {
+		if frame.Name != "" {
+			named++
+		}
+	}
+	c.NamedFrames += named
+	c.UnresolvedFrames += uint64(len(stack.Frames)) - named
+	switch {
+	case named == uint64(len(stack.Frames)):
+		c.FullySymbolized++
+	case named == 0:
+		c.Unsymbolized++
+	default:
+		c.PartiallySymbolized++
+	}
 }
 
 func (s StackCapture) Validate() error {

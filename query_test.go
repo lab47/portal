@@ -196,6 +196,51 @@ func TestNumericEventComparisons(t *testing.T) {
 	})
 }
 
+func TestDurationComparisonLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  string
+	}{
+		{`syscalls where phase = completion and duration_ns > 5ms count over 1s`, "5000000"},
+		{`syscalls where phase = completion and DURATION_NS >= 1.5ms count over 1s`, "1500000"},
+		{`syscalls:completion where duration_ns < 2.5µs { @x[] = count() } after 1s { emit @x }`, "2500"},
+		{`disk:completion where duration_ns <= 2.5μs { @x[] = count() } after 1s { emit @x }`, "2500"},
+		{`disk:completion where duration_ns > 0x10 { @x[] = count() } after 1s { emit @x }`, "0x10"},
+	} {
+		r, err := ParseMonitorQuery(tc.query)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.query, err)
+		}
+		if got := r.Comparisons[0].Value; got != tc.want {
+			t.Fatalf("%s threshold = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+
+	r, err := ParseMonitorQuery(`syscalls:completion where duration_ns > 5ms { @x[] = count() } after 1s { emit @x }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		n    uint64
+		want bool
+	}{{4999999, false}, {5000000, false}, {5000001, true}} {
+		if got := r.matches(Event{DurationNS: &tc.n}); got != tc.want {
+			t.Fatalf("duration %d matched = %v, want %v", tc.n, got, tc.want)
+		}
+	}
+
+	for _, query := range []string{
+		`syscalls where phase = completion and duration_ns > 5watts count over 1s`,
+		`syscalls where phase = completion and duration_ns > 1e100s count over 1s`,
+		`syscalls where syscall > 5ms count over 1s`,
+		`tracepoint where event = custom:sample and fields in (Value) and field.Value > 5ms`,
+	} {
+		if _, err := ParseMonitorQuery(query); err == nil {
+			t.Fatalf("accepted invalid duration threshold: %s", query)
+		}
+	}
+}
+
 func TestReadableQuerySyntaxErrors(t *testing.T) {
 	for _, text := range []string{
 		"disk:completion where duration_ns ! 1 { @io[] = count() } after 1s { emit @io }",

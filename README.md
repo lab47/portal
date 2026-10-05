@@ -453,10 +453,24 @@ Append an aggregate followed by `over DURATION [every INTERVAL] [by FIELD, ...]`
 | --- | --- |
 | `count` | Number of matching events or observed snapshot records |
 | `sum(FIELD)` | Sum of numeric values |
-| `avg(FIELD)` | Arithmetic mean, rounded to 18 decimal places |
+| `avg(FIELD)` | Arithmetic mean, rounded to at most 18 decimal places, without trailing zeros |
 | `min(FIELD)` / `max(FIELD)` | Smallest / largest numeric value |
 | `count_distinct(FIELD)` | Exact number of distinct scalar values, including strings |
 | `percentile(FIELD, PERCENT)` | Exact nearest-rank percentile, with a finite percentage from 0 to 100 |
+| `hist(FIELD)` | Log-scale histogram of numeric values in the field's native units |
+| `rate(COUNTER)` | Sampled cumulative counter deltas per observed second |
+
+Numeric results are JSON numbers, not formatted strings. Integers remain exact; fractional reductions round to at most 18 decimal places and omit trailing zeros (for example `1618242`, not `1618242.000000000000000000`).
+
+`hist` returns `{count, zero_count, buckets: [{lower, upper, count}, ...]}` with only occupied buckets, sorted by lower bound. Bounds are exact, lower-inclusive and upper-exclusive, with four equal sub-buckets per power-of-two range; zero is counted separately. Signed and fractional fields work too. For `duration_ns`, 9.6ms and 14ms land in different buckets: [8388608, 10485760) and [12582912, 14680064) nanoseconds. An empty histogram has count zero and an empty bucket list. Each occupied bucket consumes one slot in the query-wide 65,536 retained-value budget. Sort/limit by a numeric sibling metric, not by the histogram object.
+
+```sh
+portal query --name node-a --query 'disk:completion where duration_ns > 5ms {
+  @slow[device: device_name] = {ops: count(), latency: hist(duration_ns)}
+} after 30s { emit @slow order by ops desc limit 10 }'
+
+portal query --name node-a --query 'cgroups rate(io.write_ios), rate(io.write_bytes), max(memory_bytes) over 30s every 1s by path'
+```
 
 ```sh
 # Linux x86-64: count legacy open(2) syscall entries by process for 30 seconds.
@@ -544,7 +558,9 @@ disk:completion where device_name = "nvme0n1" and duration_ns > 5000000 {
 
 `duration_ns > 5000000 and duration_ns <= 20000000` selects operations longer than 5ms and at most 20ms. Comparisons accept available numeric event fields, including selected `field.NAME`, signed `return_value`, packet `length`, and completion `duration_ns`. Completion-only fields require a completion selector (or `phase = completion` in the original DSL). Missing optional values do not match. Thresholds are exact decimal integers/fractions or hexadecimal integers, at most 128 bytes, with no float rounding for full-width counters; leading-zero integers remain decimal. At most 16 comparisons can be combined with `and`. They run server-side after capture, before streaming/storage/reduction, and do not reduce kernel capture traffic. They are not supported for snapshots or sampled snapshot aggregates. API callers use `MonitorRequest.Comparisons`, containing `{Field, Op, Value}` predicates; these are signed and validated just like other filters. Syntax errors show a plain-language message, line/column, and source caret rather than internal parser rules.
 
-Scripts support up to eight selector/action blocks, with one named table per block and shared reporting blocks at the end. Table names must be unique across the script; locals are scoped to their selector. Table groups use existing fields, local aliases, or inline `ALIAS: FIELD/PROJECTION` entries; `[]` means ungrouped. For example, `@j[proc: process_name, caller: stack.user(offsets: false)]` names the output group keys without separate `let` statements. Aliases must be unique identifiers; a field cannot be grouped twice. Values are named aggregate functions, or a lone function such as `@traffic[src.ip] = sum(length)` (column name `value`). Available functions are `count()`, `sum`, `avg`, `min`, `max`, `count_distinct`, and `percentile`. Results use compact `aggregation.table`, `columns` with metric names, and `rows` with separate `group` and named `values` objects. Optional `order by METRIC asc` or `desc` and `limit N` apply to output, not collection. Ascending limits select the lowest values; nulls stay last in both directions and ties are deterministic. Without an explicit order, existing descending behavior is unchanged. API callers can set `AggregationRequest.Ascending` (default false). CLI/MCP queries accept this syntax and the usual trailing jq stage. Both client and server must support this extension.
+Both syntaxes also accept duration literals specifically for `duration_ns`, for example `duration_ns > 5ms and duration_ns <= 1s`, `1.5ms`, or `250us`. Units are `ns`, `us`/`µs`/`μs`, `ms`, `s`, `m`, and `h`, using Go duration semantics and nanosecond resolution. The client converts these to integer nanoseconds before signing; API comparison values remain numeric. Unit literals are rejected for unrelated fields, so `length > 5ms` cannot accidentally mean five million bytes.
+
+Scripts support up to eight selector/action blocks, with one named table per block and shared reporting blocks at the end. Table names must be unique across the script; locals are scoped to their selector. Table groups use existing fields, local aliases, or inline `ALIAS: FIELD/PROJECTION` entries; `[]` means ungrouped. For example, `@j[proc: process_name, caller: stack.user(offsets: false)]` names the output group keys without separate `let` statements. Aliases must be unique identifiers; a field cannot be grouped twice. Values are named aggregate functions, or a lone function such as `@traffic[src.ip] = sum(length)` (column name `value`). Available functions are `count()`, `sum`, `avg`, `min`, `max`, `count_distinct`, `percentile`, `hist`, and `rate`. Results use compact `aggregation.table`, `columns` with metric names, and `rows` with separate `group` and named `values` objects. Optional `order by METRIC asc` or `desc` and `limit N` apply to output, not collection. Ascending limits select the lowest values; nulls stay last in both directions and ties are deterministic. Without an explicit order, existing descending behavior is unchanged. API callers can set `AggregationRequest.Ascending` (default false). CLI/MCP queries accept this syntax and the usual trailing jq stage. Both client and server must support this extension.
 
 Named-table rows are shaped like:
 
@@ -580,7 +596,7 @@ disk:completion where operation = write {
 
 These are **non-overlapping buckets, returned together when the query finishes**, not live streaming or rolling windows. Results are in `Snapshot.Windows` / JSON `windows`; the last bucket is shortened if necessary. Empty buckets are included. Assignment uses server receipt time, not event timestamps. The final bucket carries subscription-wide collection counters, not per-bucket loss estimates. Periodic reports require event sources, an interval of at least 100ms, at most 64 buckets, and a total duration of at most one hour. All buckets/metrics share 4,096 retained metric groups and 65,536 retained values; output is capped at 7 MiB. Limits fail explicitly rather than silently truncating capture.
 
-Snapshot-only sources support one-shot action aggregates with their normal default sampling interval (for example `memory { @usage[] = avg(used) } after 5s { emit @usage }`), not periodic action reports. Process actions currently select lifecycle events. There is no arbitrary scripting, cross-source joining, shared-table accumulation across selectors, or persistent aggregate monitor. Actions lower to the same signed and validated requests and policy checks as the original DSL. API equivalents add `Table`, metric `Name`, `GroupAliases`, and `ReportEvery` to `AggregationRequest`; `ReportEvery` is separate from the existing snapshot sampling `Every`.
+Snapshot-only sources support one-shot action aggregates with their normal default sampling interval (for example `memory { @usage[] = avg(used) } after 5s { emit @usage }`), not periodic action reports. Process actions currently select lifecycle events. There is no arbitrary scripting, event-level correlation, shared-table accumulation across selectors, or persistent aggregate monitor. Completed tables can be joined as described below. Actions lower to the same signed and validated requests and policy checks as the original DSL. API equivalents add `Table`, metric `Name`, `GroupAliases`, and `ReportEvery` to `AggregationRequest`; `ReportEvery` is separate from the existing snapshot sampling `Every`.
 
 #### Multiple sources in one script
 
@@ -616,6 +632,49 @@ Every table must be emitted once per report, and periodic reports must clear eac
 
 Multi-selector results are in `Snapshot.Tables` / JSON `tables`, in selector order. Each entry has its source and either `aggregation` or `windows`, with the table name and named metric objects. Use `.tables[].aggregation` for one-shot results or `.tables[].windows[]` for periodic results; a trailing jq filter such as `.tables[] | {source, result: .aggregation}` works normally. Single-selector and original-DSL results retain their existing shapes. API callers use `MonitorRequest{Source: "script", Mode: "aggregate", Aggregation: sharedTiming, Probes: selections}`: root aggregation contains only `Window`/`ReportEvery`, and each selection is a non-nested named aggregate with matching timing. The entire script is signed; syscall names resolve independently against the server architecture. Update both client and server for multi-selector support.
 
+#### Joining completed aggregate tables
+
+Join two tables by explicitly named output grouping columns:
+
+```sh
+portal query --name node-a --query '
+syscalls:completion where syscall in (:fsync, :fdatasync) {
+  @flush[proc: process_name] = {flushes: count(), flush_ns: sum(duration_ns)}
+}
+tracepoint:jbd2:jbd2_handle_start {
+  @journal[proc: process_name] = {handles: count(), blocks: sum(field.requested_blocks)}
+}
+after 30s {
+  emit @flush left join @journal on proc order by flush_ns desc limit 20
+}'
+```
+
+`inner join` retains matched keys only; `left join` also retains unmatched left rows; `full join` retains unmatched rows from both sides. `on proc, directory` joins on a composite key (1–4 keys). Each key must be a grouping column on both tables; inline aliases let different source fields share a column name. Numeric keys compare exactly, including full-width integers; strings and numbers remain distinct. Missing/null keys never match each other.
+
+Joins are **one-to-one**: duplicate non-null keys on either side fail the query, even if an inner join or a limit would hide them. Include more join keys or aggregate to fewer grouping columns rather than multiplying rows and inflating totals. Null-key rows remain unmatched. Non-key group columns are preserved as qualified keys such as `flush.device` and `journal.device`.
+
+Sorting and limits run **after** joining all captured aggregate rows. Use an unambiguous metric name (`flush_ns`) or a qualified name (`flush.flush_ns`); ambiguous names such as `ops` on both sides are rejected. Ascending and descending ordering keep null metrics last. Missing matches produce explicit null metrics, not zero. Metrics are namespaced by input table:
+
+```json
+{"group":{"proc":"postgres"},"values":{"flush":{"flushes":12,"flush_ns":60000000},"journal":{"handles":18,"blocks":144}}}
+```
+
+Join scripts return `tables` in **emit order**. Joined entries have `source: "join"`, an `aggregation.join` descriptor (left/right/kind/on and output controls), qualified column names, and rows with nested metric objects. For jq, use `.tables[].aggregation.rows[] | {proc: .group.proc, calls: .values.flush.flushes, handles: .values.journal.handles}`. Separate source diagnostics are retained in `aggregation.collections.TABLE`; they are never summed or represented as per-row loss. The `table` field retains the left table name. You can also emit an original table or reuse it in another pairwise join; joins do not mutate source rows. Chained joins and event-level correlation are not supported.
+
+For periodic reports, join **corresponding buckets only**, then clear both input tables:
+
+```text
+every 5s {
+  emit @flush full join @journal on proc order by flush.flush_ns desc limit 20;
+  clear @flush; clear @journal
+}
+after 30s { stop }
+```
+
+Every input table must participate in an emit or join; periodic scripts must clear each input exactly once per reporting block. Buckets still arrive together at completion, not streamed live. Up to eight output reports are supported. Existing per-selector collection limits and the 7 MiB script output cap remain; a full join may retain up to the sum of both input row counts. This compares aggregate activity in the same observation window, **not causal links** between syscalls, journal handles or disk requests. Process names are coarse identifiers; PIDs can be reused and task versus charged I/O cgroups have different attribution semantics.
+
+API callers set `MonitorRequest.Reports` to `[]AggregateReport{{Left: "flush", Right: "journal", Kind: "left", On: []string{"proc"}, Sort: "flush_ns", Limit: 20}}`. A report with only `Left` emits an original table. Input probes must have compact output and no pre-join row filtering/sorting/limits; source predicates remain supported. Joined JSON decodes to the existing column-aligned Go `AggregateRow.Values`. Reports are included in the signed request and validated on the server. Upgrade both client and server for join support; scripts without joins retain their existing syntax and output.
+
 ### Sampled snapshot aggregations
 
 CPU, memory, network, kernel, sensors, GPU, containers, cgroups, and process snapshots use the same functions and grouping mechanism:
@@ -632,7 +691,9 @@ portal query --name node-a --query 'process where name = worker* count_distinct(
 
 Snapshot-only sources default to `every 1s`. **Process requires explicit `every` to sample current processes**; without it, aggregation still collects process start/exit events. `action` is not available in process snapshots. Event-only sources reject `every`. Intervals must be at least 100 ms and no longer than the window; windows are limited to one hour. Sampling begins immediately, then follows the interval grid within `[start,end)`. Slow reads skip ticks instead of overlapping or catching up in bursts. The result's `aggregation.every` reports the effective interval in nanoseconds. At most 4,096 records per snapshot are accepted, in addition to the normal aggregate limits.
 
-`portal capabilities --name node-a` describes each source's `sampling.fields`, `numeric_fields`, `group_by_fields`, default interval, and minimum interval. Fields are record-relative paths such as `used`, `temperature_celsius`, or `counters.processes_running`. Gauges describe current values; CPU times, network traffic, and context switches are cumulative counters. Numeric reductions of raw counters are rejected: use derived `FIELD_per_second` rates, such as `bytes_recv_per_second` or `counters.context_switches_per_second`. CPU `utilization_percent` is 100 × (delta total − delta idle − delta iowait) / delta total per core, accounting for nice/IRQ/softIRQ time without double-counting guest time.
+`portal capabilities --name node-a` describes each source's `sampling.fields`, `numeric_fields`, `group_by_fields`, default interval, and minimum interval. Each output/sampling field includes `aggregatable`: true means it supports at least one field-taking aggregate, not that every aggregate is valid. Use `query_field` for its DSL name, `numeric_fields` for numeric gauges/derived values, and sampling `semantics: "counter"` for fields accepted by `rate`. Nested arrays and collection diagnostics are not scalar aggregate fields. Fields are record-relative paths such as `used`, `temperature_celsius`, or `counters.processes_running`. Gauges describe current values; CPU times, network traffic, and context switches are cumulative counters. Sum/avg/min/max/percentile/hist of raw counters are rejected: use `rate(COUNTER)` or derived `FIELD_per_second` rates, such as `bytes_recv_per_second` or `counters.context_switches_per_second`. CPU `utilization_percent` is 100 × (delta total − delta idle − delta iowait) / delta total per core, accounting for nice/IRQ/softIRQ time without double-counting guest time.
+
+`rate(COUNTER)` divides the sum of valid deltas by the union of their observed time intervals within each group, without extrapolating to the window edges. Concurrent counters grouped together contribute a combined rate, not a mean of their rates. Disjoint valid intervals contribute their durations without counting intervening gaps. It skips initial baselines, resets, missing values, identity changes and cgroup I/O device-set changes or per-device resets; no valid interval yields null. Units are the counter's units per second. This differs from `avg(FIELD_per_second)`, which weights each available sample equally rather than by elapsed time. Avoid summing parent and child cgroups, whose counters include descendants.
 
 Rates use actual elapsed collection time and consecutive observations of the same entity. The first observation establishes a baseline; counter resets, missing fields, and disappearing/reappearing entities restart it. Derived queries require a window longer than the interval. Missing optional metrics and unavailable derived values are skipped, **not treated as zero**. `avg` is an arithmetic mean of observed values, not a time-weighted mean; `sum` of a gauge sums observations, not elapsed-time usage. `count` counts observed records, not unique entities or average population. Source permissions and platform/hardware requirements are unchanged.
 
@@ -793,6 +854,14 @@ portal query --name node-a --query 'tracepoint where event = block:block_rq_issu
 ```
 
 Events gain `user_stack`/`kernel_stack`, each with frames containing raw addresses and best-effort names/modules/offsets. Capture or symbolization failures remain explicit without discarding the ordinary event. Aggregation groups by semicolon-separated full call paths (`module:function+offset`, with unresolved addresses and capture errors retained), not just the first function. Stack capture defaults to 32 frames; the Go API can request up to 64 or disable symbolization. Stack maps hold 16,384 entries; collisions/full maps report capture errors and collection counters rather than reusing IDs and silently misattributing buffered events. Larger maps reduce collisions but cannot eliminate them. Ring-buffer loss, missing frame pointers/unwind support, stripped non-Go objects, process exit/exec/PID reuse before resolution, namespaces, and kallsyms restrictions can limit results. Kernel symbols are cached for the monitor lifetime; restart a monitor after module changes. Stacks are resolved after capture, not an atomic historical mapping snapshot. A block-event kernel stack describes the issuing path, not the originating application's stack after asynchronous writeback.
+
+### Stack capture diagnostics
+
+Stack-enabled aggregate results include `aggregation.stack_coverage.user` and/or `.kernel`. Each enabled side reports matching received `events`, stacks `captured` (at least one raw frame), `missing`, `empty`, and `capture_failures`. `helper_errors` breaks failures down by signed `bpf_get_stackid` code, e.g. `{"-14": 12, "-17": 1}`; `lookup_failures` counts failures reading a captured stack from its map. Raw events also expose `capture_error_code` alongside the existing error text.
+
+Capture and symbolization are separate: `frames`, `named_frames`, `unresolved_frames`, `fully_symbolized`, `partially_symbolized`, `unsymbolized`, and `symbolization_failures` distinguish captured addresses from resolved function names. File/offset-only frames are unresolved, not named functions. Disabling symbolization increments `symbolization_disabled`, not unresolved/failure counts. `depth_limit_reached` counts stacks that filled the configured capture depth; they **may** be truncated, but an exactly-full complete stack is indistinguishable.
+
+Coverage is measured **before stack shaping and output limits**, once per event, not per metric. Periodic results have independent coverage in each `windows[]` bucket; joins retain separate input coverage under `stack_coverage_by_table.TABLE`. These counts describe only matching events received by the server. Existing `collection.stack_capture_failures`, collisions and ring-buffer loss remain subscription-wide kernel diagnostics, including events that may never arrive; they are not comparable per-bucket or per-group loss estimates.
 
 ### Stack shaping and folded output
 

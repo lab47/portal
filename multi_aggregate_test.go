@@ -169,7 +169,7 @@ func TestCgroupIOMultipleSampledAggregates(t *testing.T) {
 		if len(metrics) != 4 || metrics[0].Counts[0].Count != 4 {
 			t.Fatalf("count lost initial/optional samples: %+v", metrics)
 		}
-		for i, want := range []string{"43.333333333333333333", "35.000000000000000000", "53.333333333333333333"} {
+		for i, want := range []string{"43.333333333333333333", "35", "53.333333333333333333"} {
 			if len(metrics[i+1].Values) != 1 || string(metrics[i+1].Values[0].Value) != want {
 				t.Fatalf("metric %d: %+v, want %s", i+1, metrics[i+1].Values, want)
 			}
@@ -201,7 +201,7 @@ func TestCgroupIORatesGuardDeviceChangesAndHiddenResets(t *testing.T) {
 		}
 		got := sampledFixture(t, "cgroups avg(io.read_bytes_per_second) over 5s every 1s", snapshots)
 		// Only stable monotonic intervals count: 40 and 50 B/s.
-		if string(got.Aggregation.Values[0].Value) != "45.000000000000000000" {
+		if string(got.Aggregation.Values[0].Value) != "45" {
 			t.Fatalf("invalid I/O interval included: %+v", got.Aggregation.Values)
 		}
 	})
@@ -223,7 +223,7 @@ func TestCgroupIORatesDistinguishMissingEmptyAndNewDevice(t *testing.T) {
 		got := sampledFixture(t, "cgroups avg(io.read_bytes_per_second) over 5s every 1s", snapshots)
 		// Empty available I/O contributes zero; a new device starts a baseline.
 		// Only 0 and 25 B/s are usable, not the new device's historical 100 bytes.
-		if string(got.Aggregation.Values[0].Value) != "12.500000000000000000" {
+		if string(got.Aggregation.Values[0].Value) != "12.5" {
 			t.Fatalf("empty/missing/new device rates conflated: %+v", got.Aggregation.Values)
 		}
 	})

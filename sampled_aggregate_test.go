@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
@@ -107,9 +108,9 @@ func sampledFixture(t *testing.T, query string, snapshots []Snapshot) Snapshot {
 
 func TestSampledGaugeFunctions(t *testing.T) {
 	for _, tc := range []struct{ metric, want string }{
-		{"count", "3"}, {"avg(temperature_celsius)", "4.500000000000000000"},
-		{"sum(temperature_celsius)", "13.500000000000000000"}, {"min(temperature_celsius)", "1.250000000000000000"},
-		{"max(temperature_celsius)", "9.500000000000000000"}, {"percentile(temperature_celsius,50)", "2.750000000000000000"},
+		{"count", "3"}, {"avg(temperature_celsius)", "4.5"},
+		{"sum(temperature_celsius)", "13.5"}, {"min(temperature_celsius)", "1.25"},
+		{"max(temperature_celsius)", "9.5"}, {"percentile(temperature_celsius,50)", "2.75"},
 		{"count_distinct(temperature_celsius)", "3"},
 	} {
 		synctest.Test(t, func(t *testing.T) {
@@ -132,7 +133,7 @@ func TestSampledGaugeFunctions(t *testing.T) {
 	}
 	synctest.Test(t, func(t *testing.T) {
 		got := sampledFixture(t, "memory avg(used) over 2s", []Snapshot{{Memory: &MemoryInfo{Used: ^uint64(0) - 2}}, {Memory: &MemoryInfo{Used: ^uint64(0)}}})
-		if string(got.Aggregation.Values[0].Value) != "18446744073709551614.000000000000000000" {
+		if string(got.Aggregation.Values[0].Value) != "18446744073709551614" {
 			t.Fatal("lost full-width integer precision")
 		}
 	})
@@ -146,7 +147,7 @@ func TestSampledCPUUtilization(t *testing.T) {
 			{CPU: []CPUInfo{{Name: "cpu0", Total: 1030, Idle: 808, IOWait: 52}, {Name: "cpu1", Total: 2030, Idle: 1517, IOWait: 104}}},
 		})
 		values := got.Aggregation.Values
-		if len(values) != 2 || string(values[0].Group["name"]) != `"cpu0"` || string(values[0].Value) != "62.500000000000000000" || string(values[1].Value) != "25.000000000000000000" {
+		if len(values) != 2 || string(values[0].Group["name"]) != `"cpu0"` || string(values[0].Value) != "62.5" || string(values[1].Value) != "25" {
 			t.Fatalf("incorrect utilization or CPU identity: %+v", values)
 		}
 	})
@@ -168,8 +169,8 @@ func TestSampledProcessMetrics(t *testing.T) {
 			}})
 		}
 		for _, tc := range []struct{ metric, first, second string }{
-			{"avg(cpu_percent)", "175.000000000000000000", "50.000000000000000000"},
-			{"avg(rss_bytes)", "250.000000000000000000", "1125.000000000000000000"},
+			{"avg(cpu_percent)", "175", "50"},
+			{"avg(rss_bytes)", "250", "1125"},
 		} {
 			got := sampledFixture(t, "process "+tc.metric+" over 4s every 1s by pid,name", snapshots)
 			values := got.Aggregation.Values
@@ -217,7 +218,7 @@ func TestCounterRatesAndLifecycles(t *testing.T) {
 			{Network: []InterfaceInfo{{Name: "eth0", Index: 7, BytesRecv: 2}}}, // Reset is a new baseline.
 			{Network: []InterfaceInfo{{Name: "eth0", Index: 7, BytesRecv: 22}}},
 		})
-		if len(got.Aggregation.Values) != 1 || string(got.Aggregation.Values[0].Value) != "15.000000000000000000" {
+		if len(got.Aggregation.Values) != 1 || string(got.Aggregation.Values[0].Value) != "15" {
 			t.Fatalf("bad reset/missing semantics: %+v", got.Aggregation.Values)
 		}
 	})
@@ -227,7 +228,7 @@ func TestSampledMissingFailuresAndSlowReads(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		value := 40.0
 		got := sampledFixture(t, "gpu avg(utilization_percent) over 3s every 1s by uuid", []Snapshot{{GPUs: []GPUInfo{{UUID: "gpu-a"}}}, {GPUs: []GPUInfo{{UUID: "gpu-a", Utilization: &value}}}, {GPUs: []GPUInfo{{UUID: "gpu-a"}}}})
-		if string(got.Aggregation.Values[0].Value) != "40.000000000000000000" {
+		if string(got.Aggregation.Values[0].Value) != "40" {
 			t.Fatal("missing GPU metric counted as zero")
 		}
 		empty := sampledFixture(t, "cpu avg(utilization_percent) over 2s by name", []Snapshot{{}, {}})
@@ -261,8 +262,105 @@ func TestSampledMissingFailuresAndSlowReads(t *testing.T) {
 			}
 			return Snapshot{Source: "memory", Memory: &MemoryInfo{Used: 7}}, nil
 		})
-		if err != nil || !reflect.DeepEqual(calls, []time.Duration{0, 2 * time.Second, 4 * time.Second}) || string(got.Aggregation.Values[0].Value) != "7.000000000000000000" {
+		if err != nil || !reflect.DeepEqual(calls, []time.Duration{0, 2 * time.Second, 4 * time.Second}) || string(got.Aggregation.Values[0].Value) != "7" {
 			t.Fatalf("slow collection caused catch-up: %v, %v", calls, err)
+		}
+	})
+}
+
+func TestCounterRateObservedTimeAndGroupedTotals(t *testing.T) {
+	start := time.Unix(100, 0)
+	metadata := snapshotSampleFields("network")
+	a := AggregationRequest{Function: "rate", Field: "bytes_recv"}
+	reduction := newAggregateReduction(a)
+	previous := make(map[string]sampleObservation)
+	// Two counters share a group. Unequal intervals must be time-weighted,
+	// overlapping intervals must count time once, and gaps must not count.
+	for _, sample := range []struct {
+		second int
+		values []string
+	}{
+		{0, []string{"100", "1000"}},
+		{1, []string{"110", "1030"}},
+		{4, []string{"170", "1060"}},
+		{5, nil},
+		{7, []string{"500", "2000"}},
+		{9, []string{"520", "2030"}},
+	} {
+		current := make(map[string]sampleObservation)
+		at := start.Add(time.Duration(sample.second) * time.Second)
+		for i, value := range sample.values {
+			id := []string{"a", "b"}[i]
+			fields := map[string]any{"bytes_recv": json.Number(value)}
+			deriveSample(fields, previous[id], at, metadata)
+			if err := reduction.addSample(fields); err != nil {
+				t.Fatal(err)
+			}
+			current[id] = sampleObservation{fields, at}
+		}
+		previous = current
+	}
+	got := reduction.result("network", start, start.Add(10*time.Second)).Aggregation
+	// 40 + 90 + 50 bytes over 1 + 3 + 2 observed seconds = 30 B/s.
+	if string(got.Values[0].Value) != "30" {
+		t.Fatalf("rate must sum concurrent counters over actual valid time: %+v", got)
+	}
+	// Full-width integer deltas must not be rounded before subtraction.
+	fields := map[string]any{"bytes_recv": json.Number("18446744073709551615")}
+	deriveSample(fields, sampleObservation{map[string]any{"bytes_recv": json.Number("18446744073709551614")}, start}, start.Add(time.Second), metadata)
+	interval := fields["__counter_delta.bytes_recv"].(counterInterval)
+	if interval.delta.Cmp(big.NewRat(1, 1)) != 0 {
+		t.Fatal("counter delta lost integer precision")
+	}
+}
+
+func TestCounterRateResetsAndIdentity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got := sampledFixture(t, "network rate(bytes_recv), count over 7s every 1s by name", []Snapshot{
+			{Network: []InterfaceInfo{{Name: "eth0", Index: 1, BytesRecv: 100}}},
+			{Network: []InterfaceInfo{{Name: "eth0", Index: 1, BytesRecv: 110}}},
+			{Network: []InterfaceInfo{{Name: "eth0", Index: 2, BytesRecv: 1000}}}, // Recreated interface.
+			{Network: []InterfaceInfo{{Name: "eth0", Index: 2, BytesRecv: 2}}},    // Reset.
+			{},
+			{Network: []InterfaceInfo{{Name: "eth0", Index: 2, BytesRecv: 500}}}, // Reappearing baseline.
+			{Network: []InterfaceInfo{{Name: "eth0", Index: 2, BytesRecv: 520}}},
+		})
+		if string(got.Aggregation.Metrics[0].Values[0].Value) != "15" || got.Aggregation.Metrics[1].Counts[0].Count != 6 {
+			t.Fatalf("rate counted resets/identity changes/gaps or dropped count baselines: %+v", got.Aggregation)
+		}
+		empty := sampledFixture(t, "network rate(bytes_recv) over 2s every 1s", []Snapshot{{}, {}})
+		if string(empty.Aggregation.Values[0].Value) != "null" {
+			t.Fatal("unobserved rate must be null")
+		}
+	})
+	for _, query := range []string{
+		"syscalls rate(pid) over 2s", "memory rate(used) over 2s", "network rate(name) over 2s",
+		"network rate(bytes_recv_per_second) over 2s", "network rate(bytes_recv) over 1s every 1s",
+	} {
+		if _, err := ParseMonitorQuery(query); err == nil {
+			t.Fatalf("invalid counter rate accepted: %s", query)
+		}
+	}
+}
+
+func TestCgroupCounterRateGuardsDeviceResets(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var snapshots []Snapshot
+		for _, counters := range [][2]uint64{{100, 200}, {120, 220}, {5, 400}, {15, 440}, {1000, 2000}, {1010, 2020}} {
+			total := counters[0] + counters[1]
+			id := "1:2"
+			if counters[0] >= 1000 {
+				id = "1:3" // Recreated group with larger historical counters.
+			}
+			snapshots = append(snapshots, Snapshot{Cgroups: []CgroupInfo{{Path: "/writer", ID: id, IO: &CgroupIO{WriteIOs: &total, Devices: []CgroupIODevice{
+				{Device: "8:0", Counters: map[string]uint64{"wios": counters[0]}},
+				{Device: "8:1", Counters: map[string]uint64{"wios": counters[1]}},
+			}}}}})
+		}
+		got := sampledFixture(t, "cgroups rate(io.write_ios) over 6s every 1s by path", snapshots)
+		// Only 40, 50 and 30 operations over three valid seconds.
+		if string(got.Aggregation.Values[0].Value) != "40" {
+			t.Fatalf("hidden device reset or recreated cgroup counted: %+v", got.Aggregation)
 		}
 	})
 }

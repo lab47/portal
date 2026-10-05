@@ -29,6 +29,8 @@ type probeReport struct {
 	kind, duration, table, sort, limit string
 	clear, stop                        bool
 	ascending                          bool
+	joinKind, right                    string
+	on, clears                         []string
 }
 
 type probeProgram struct {
@@ -50,7 +52,7 @@ func newProbeGrammar() p.Rule {
 	token := toolkit.After(toolkit.WS)
 	sym := func(s string) p.Rule { return token(p.S(s)) }
 	id := token(p.Capture(p.Re(`[A-Za-z_][A-Za-z_0-9.]*`)))
-	word := token(p.Capture(p.Re(`(?:[A-Za-z_][A-Za-z_0-9.:]*|:[A-Za-z_][A-Za-z_0-9]*|-?[0-9][A-Za-z_0-9.]*)`)))
+	word := token(p.Capture(p.Re(`(?:[A-Za-z_][A-Za-z_0-9.:]*|:[A-Za-z_][A-Za-z_0-9]*|-?[0-9][A-Za-z_0-9.µμ]*)`)))
 	kw := func(s string) p.Rule { return token(p.Seq(p.S(s), p.Not(p.Re(`[A-Za-z_0-9.]`)))) }
 	expr := p.R("probe-expression")
 	collect := func(v []any) any {
@@ -156,8 +158,19 @@ func newProbeGrammar() p.Rule {
 	order := p.Action(p.Seq(kw("order"), kw("by"), p.Named("field", id), p.Named("ascending", p.Or(p.Transform(kw("asc"), func(string) any { return true }), p.Transform(kw("desc"), func(string) any { return false })))), func(v p.Values) any {
 		return probeReport{sort: v.Get("field").(string), ascending: v.Get("ascending").(bool)}
 	})
-	emit := p.Action(p.Seq(kw("emit"), sym("@"), p.Named("table", id), p.Named("sort", p.Maybe(order)), p.Named("limit", p.Maybe(p.Seq(kw("limit"), word)))), func(v p.Values) any {
+	join := p.Action(p.Seq(p.Named("kind", p.Or(p.Transform(kw("inner"), func(string) any { return "inner" }), p.Transform(kw("left"), func(string) any { return "left" }), p.Transform(kw("full"), func(string) any { return "full" }))), kw("join"), sym("@"), p.Named("right", id), kw("on"), p.Named("first", id), p.Named("rest", p.Many(p.Seq(sym(","), id), 0, -1, func(v []any) any { return v }))), func(v p.Values) any {
+		r := probeReport{joinKind: v.Get("kind").(string), right: v.Get("right").(string), on: []string{v.Get("first").(string)}}
+		for _, x := range v.Get("rest").([]any) {
+			r.on = append(r.on, x.(string))
+		}
+		return r
+	})
+	emit := p.Action(p.Seq(kw("emit"), sym("@"), p.Named("table", id), p.Named("join", p.Maybe(join)), p.Named("sort", p.Maybe(order)), p.Named("limit", p.Maybe(p.Seq(kw("limit"), word)))), func(v p.Values) any {
 		r := probeReport{table: v.Get("table").(string)}
+		if x := v.Get("join"); x != nil {
+			j := x.(probeReport)
+			r.joinKind, r.right, r.on = j.joinKind, j.right, j.on
+		}
 		if x := v.Get("sort"); x != nil {
 			sort := x.(probeReport)
 			r.sort, r.ascending = sort.sort, sort.ascending
@@ -168,17 +181,12 @@ func newProbeGrammar() p.Rule {
 		return r
 	})
 	clear := p.Seq(kw("clear"), sym("@"), id)
-	reportAction := p.Action(p.Seq(p.Named("action", p.Or(emit, p.Transform(kw("stop"), func(string) any { return probeReport{stop: true} }))), p.Maybe(sym(";")), p.Named("clear", p.Maybe(clear)), p.Maybe(sym(";"))), func(v p.Values) any {
+	reportAction := p.Action(p.Seq(p.Named("action", p.Or(emit, p.Transform(kw("stop"), func(string) any { return probeReport{stop: true} }))), p.Maybe(sym(";")), p.Named("clear", p.Many(p.Seq(clear, p.Maybe(sym(";"))), 0, -1, func(v []any) any { return v }))), func(v p.Values) any {
 		r := v.Get("action").(probeReport)
-		if x := v.Get("clear"); x != nil {
-			if r.stop {
-				r.stop = false
-			}
-			r.clear = x.(string) == r.table
-			if !r.clear {
-				r.table = ""
-			}
+		for _, x := range v.Get("clear").([]any) {
+			r.clears = append(r.clears, x.(string))
 		}
+		r.clear = slices.Contains(r.clears, r.table)
 		return r
 	})
 	report := p.Action(p.Seq(p.Named("kind", p.Or(p.Transform(kw("after"), func(string) any { return "after" }), p.Transform(kw("every"), func(string) any { return "every" }))), p.Named("duration", word), sym("{"), p.Named("actions", p.Many(reportAction, 1, -1, func(v []any) any { return append([]any(nil), v...) })), sym("}")), func(v p.Values) any {
@@ -227,6 +235,14 @@ func parseProbeQuery(text string) (MonitorRequest, error) {
 	script := v.(probeScript)
 	if script.reportBlocks == 2 && (script.reports[0].kind != "every" || script.reports[len(script.reports)-1].kind != "after") {
 		return MonitorRequest{}, errors.New("reporting requires one after block, optionally preceded by one every block")
+	}
+	if slices.ContainsFunc(script.reports, func(r probeReport) bool { return r.right != "" }) {
+		return compileJoinedScript(script)
+	}
+	for _, report := range script.reports {
+		if len(report.clears) > 1 || len(report.clears) == 1 && (report.stop || report.clears[0] != report.table) {
+			return MonitorRequest{}, errors.New("clear must name the emitted table")
+		}
 	}
 	if len(script.probes) == 1 {
 		script.probes[0].reports = script.reports
@@ -440,6 +456,16 @@ func compileProbe(program probeProgram) (MonitorRequest, error) {
 		return MonitorRequest{}, errors.New("aggregate table required")
 	}
 	a.Table, a.GroupAliases = table, aliases
+	emitted := false
+	for _, report := range program.reports {
+		if !report.stop && report.table == table {
+			emitted = true
+			break
+		}
+	}
+	if !emitted {
+		return MonitorRequest{}, fmt.Errorf("table @%s is not emitted", table)
+	}
 	if parsed.source == "tracepoint" {
 		for _, c := range parsed.conditions {
 			if c.field == "fields" {

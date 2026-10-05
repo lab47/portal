@@ -32,7 +32,7 @@ type AggregateMetric struct {
 type AggregationRequest struct {
 	Window       time.Duration     `json:"window"` // nanoseconds
 	GroupBy      []string          `json:"group_by,omitempty"`
-	Function     string            `json:"function,omitempty"` // count, sum, avg, min, max, count_distinct, percentile
+	Function     string            `json:"function,omitempty"` // count, sum, avg, min, max, count_distinct, percentile, hist, rate
 	Field        string            `json:"field,omitempty"`
 	Percentile   float64           `json:"percentile,omitempty"` // 0–100, only for percentile
 	Every        time.Duration     `json:"every,omitempty"`      // Snapshot sampling interval; zero defaults to 1s for snapshot-only sources.
@@ -54,7 +54,21 @@ type AggregateCount struct {
 
 type AggregateValue struct {
 	Group map[string]json.RawMessage `json:"group"`
-	Value json.RawMessage            `json:"value"` // JSON number (avg rounded to 18 decimal places), or null
+	Value json.RawMessage            `json:"value"` // JSON number, histogram object, or null
+}
+
+// Histogram bounds are in the field's native units, lower inclusive/upper exclusive.
+// Zero is counted separately; only occupied buckets are returned.
+type HistogramBucket struct {
+	Lower json.Number `json:"lower"`
+	Upper json.Number `json:"upper"`
+	Count uint64      `json:"count"`
+}
+
+type Histogram struct {
+	Count     uint64            `json:"count"`
+	ZeroCount uint64            `json:"zero_count"`
+	Buckets   []HistogramBucket `json:"buckets"`
 }
 
 type AggregateRow struct {
@@ -64,22 +78,26 @@ type AggregateRow struct {
 
 // AggregationResult describes a half-open server ingestion window [Start, End).
 type AggregationResult struct {
-	Table             string               `json:"table,omitempty"`
-	Start             time.Time            `json:"start"`
-	End               time.Time            `json:"end"`
-	GroupBy           []string             `json:"group_by"`
-	Counts            []AggregateCount     `json:"counts,omitempty"`
-	Function          string               `json:"function,omitempty"`
-	Field             string               `json:"field,omitempty"`
-	Percentile        float64              `json:"percentile,omitempty"`
-	Values            []AggregateValue     `json:"values,omitempty"`
-	Every             time.Duration        `json:"every,omitempty"`
-	Collection        *CollectionStats     `json:"collection,omitempty"`
-	Metrics           []*AggregationResult `json:"metrics,omitempty"` // In request order; each has the same window/grouping. Single queries retain their old shape.
-	Columns           []AggregateMetric    `json:"columns,omitempty"`
-	Rows              []AggregateRow       `json:"rows,omitempty"`
-	TotalGroups       int                  `json:"total_groups,omitempty"`
-	OmittedZeroGroups int                  `json:"omitted_zero_groups,omitempty"`
+	Table                string                          `json:"table,omitempty"`
+	Join                 *AggregateReport                `json:"join,omitempty"`
+	Start                time.Time                       `json:"start"`
+	End                  time.Time                       `json:"end"`
+	GroupBy              []string                        `json:"group_by"`
+	Counts               []AggregateCount                `json:"counts,omitempty"`
+	Function             string                          `json:"function,omitempty"`
+	Field                string                          `json:"field,omitempty"`
+	Percentile           float64                         `json:"percentile,omitempty"`
+	Values               []AggregateValue                `json:"values,omitempty"`
+	Every                time.Duration                   `json:"every,omitempty"`
+	Collection           *CollectionStats                `json:"collection,omitempty"`
+	Collections          map[string]*CollectionStats     `json:"collections,omitempty"` // join: separate source diagnostics, never summed
+	StackCoverage        *StackCoverageReport            `json:"stack_coverage,omitempty"`
+	StackCoverageByTable map[string]*StackCoverageReport `json:"stack_coverage_by_table,omitempty"` // join: preserve each source's received-event coverage
+	Metrics              []*AggregationResult            `json:"metrics,omitempty"`                 // In request order; each has the same window/grouping. Single queries retain their old shape.
+	Columns              []AggregateMetric               `json:"columns,omitempty"`
+	Rows                 []AggregateRow                  `json:"rows,omitempty"`
+	TotalGroups          int                             `json:"total_groups,omitempty"`
+	OmittedZeroGroups    int                             `json:"omitted_zero_groups,omitempty"`
 }
 
 // Keep the selected result collection visible even for an empty grouped window.
@@ -93,26 +111,38 @@ func (a AggregationResult) MarshalJSON() ([]byte, error) {
 				if len(row.Values) != len(a.Columns) {
 					return nil, errors.New("aggregate row values must align with columns")
 				}
-				values := make(map[string]json.RawMessage, len(a.Columns))
+				values := make(map[string]any, len(a.Columns))
 				for i, column := range a.Columns {
-					values[column.Name] = row.Values[i]
+					if a.Join == nil {
+						values[column.Name] = row.Values[i]
+					} else {
+						table, metric, _ := strings.Cut(column.Name, ".")
+						if values[table] == nil {
+							values[table] = make(map[string]json.RawMessage)
+						}
+						values[table].(map[string]json.RawMessage)[metric] = row.Values[i]
+					}
 				}
 				named = append(named, map[string]any{"group": row.Group, "values": values})
 			}
 			rows = named
 		}
 		return json.Marshal(struct {
-			Table             string            `json:"table,omitempty"`
-			Start             time.Time         `json:"start"`
-			End               time.Time         `json:"end"`
-			GroupBy           []string          `json:"group_by"`
-			Every             time.Duration     `json:"every,omitempty"`
-			Collection        *CollectionStats  `json:"collection,omitempty"`
-			Columns           []AggregateMetric `json:"columns"`
-			Rows              any               `json:"rows"`
-			TotalGroups       int               `json:"total_groups"`
-			OmittedZeroGroups int               `json:"omitted_zero_groups,omitempty"`
-		}{a.Table, a.Start, a.End, a.GroupBy, a.Every, a.Collection, a.Columns, rows, a.TotalGroups, a.OmittedZeroGroups})
+			Table                string                          `json:"table,omitempty"`
+			Join                 *AggregateReport                `json:"join,omitempty"`
+			Start                time.Time                       `json:"start"`
+			End                  time.Time                       `json:"end"`
+			GroupBy              []string                        `json:"group_by"`
+			Every                time.Duration                   `json:"every,omitempty"`
+			Collection           *CollectionStats                `json:"collection,omitempty"`
+			Collections          map[string]*CollectionStats     `json:"collections,omitempty"`
+			StackCoverage        *StackCoverageReport            `json:"stack_coverage,omitempty"`
+			StackCoverageByTable map[string]*StackCoverageReport `json:"stack_coverage_by_table,omitempty"`
+			Columns              []AggregateMetric               `json:"columns"`
+			Rows                 any                             `json:"rows"`
+			TotalGroups          int                             `json:"total_groups"`
+			OmittedZeroGroups    int                             `json:"omitted_zero_groups,omitempty"`
+		}{a.Table, a.Join, a.Start, a.End, a.GroupBy, a.Every, a.Collection, a.Collections, a.StackCoverage, a.StackCoverageByTable, a.Columns, rows, a.TotalGroups, a.OmittedZeroGroups})
 	}
 	if len(a.Metrics) != 0 {
 		return json.Marshal(fields(a))
@@ -153,6 +183,19 @@ func (a *AggregationResult) UnmarshalJSON(data []byte) error {
 			var named map[string]json.RawMessage
 			if err := json.Unmarshal(raw.Values, &named); err != nil {
 				return err
+			}
+			if result.Join != nil {
+				flat := make(map[string]json.RawMessage)
+				for table, data := range named {
+					var metrics map[string]json.RawMessage
+					if err := json.Unmarshal(data, &metrics); err != nil {
+						return err
+					}
+					for metric, value := range metrics {
+						flat[table+"."+metric] = value
+					}
+				}
+				named = flat
 			}
 			if len(named) != len(result.Columns) {
 				return errors.New("named aggregate row must match columns")
@@ -236,8 +279,17 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 	if a.Table != "" && (!tracepointIdentifier.MatchString(a.Table) || len(a.Table) > 64 || !a.Compact) {
 		return errors.New("named tables require compact output and an identifier up to 64 bytes")
 	}
-	if a.ReportEvery != 0 && (sampledAggregation(r) || a.ReportEvery < 100*time.Millisecond || a.ReportEvery > a.Window || (a.Window-1)/a.ReportEvery+1 > 64) {
-		return errors.New("periodic reports require an event source, interval >=100ms, and at most 64 buckets within the observation window")
+	if a.ReportEvery != 0 {
+		switch {
+		case sampledAggregation(r):
+			return fmt.Errorf("periodic reports require an event source; %s is a sampled snapshot source", r.Source)
+		case a.ReportEvery < 100*time.Millisecond:
+			return errors.New("periodic reporting interval must be at least 100ms")
+		case a.ReportEvery > a.Window:
+			return errors.New("periodic reporting interval cannot exceed the observation window")
+		case (a.Window-1)/a.ReportEvery+1 > 64:
+			return errors.New("periodic reports exceed the maximum of 64 buckets")
+		}
 	}
 	names := make(map[string]bool)
 	for _, field := range a.GroupBy {
@@ -262,6 +314,9 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 		return errors.New("result limit must be 0–4096 and sort_metric must select an existing zero-based metric")
 	}
 	if len(a.Metrics) != 0 {
+		if (a.Limit != 0 || a.Ascending || a.SortMetric != 0) && a.Metrics[a.SortMetric].Function == "hist" {
+			return errors.New("histograms cannot be used as a sort metric; select a numeric metric")
+		}
 		if len(a.Metrics) > maxAggregateMetrics {
 			return errors.New("aggregation supports at most 8 metrics")
 		}
@@ -291,7 +346,7 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 			seen[metric] = true
 			one := a
 			one.Metrics = nil
-			one.SortMetric = 0
+			one.SortMetric, one.Limit, one.Ascending = 0, 0, false
 			one.Function, one.Field, one.Percentile = metric.Function, metric.Field, metric.Percentile
 			if err := one.validate(r); err != nil {
 				return err
@@ -314,7 +369,7 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 			return errors.New("sampling interval must be at least 100ms and no greater than the window")
 		}
 		for _, field := range snapshotSampleFields(r.Source) {
-			if (field.Path == a.Field || slices.Contains(a.GroupBy, field.Path)) && (field.Semantics == "rate" || field.Semantics == "utilization") && interval >= a.Window {
+			if (field.Path == a.Field || slices.Contains(a.GroupBy, field.Path)) && (field.Semantics == "rate" || field.Semantics == "utilization" || a.Function == "rate") && interval >= a.Window {
 				return errors.New("derived metrics require a window longer than the sampling interval")
 			}
 		}
@@ -334,9 +389,16 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 		if !slices.Contains(fields, a.Field) {
 			return fmt.Errorf("invalid distinct field %q", a.Field)
 		}
-	case "sum", "avg", "min", "max", "percentile":
+	case "rate":
+		if !sampledAggregation(r) || !slices.ContainsFunc(snapshotSampleFields(r.Source), func(f SampleField) bool { return f.Path == a.Field && f.Semantics == "counter" }) {
+			return fmt.Errorf("rate requires a cumulative counter on a sampled source, got %q", a.Field)
+		}
+	case "sum", "avg", "min", "max", "percentile", "hist":
 		if !slices.Contains(numeric, a.Field) {
 			return fmt.Errorf("aggregation requires a numeric gauge or derived field, got %q", a.Field)
+		}
+		if a.Function == "hist" && (a.Limit != 0 || a.Ascending) {
+			return errors.New("histograms cannot be used as a sort metric; select a numeric metric")
 		}
 	default:
 		return fmt.Errorf("unsupported aggregation function %q", a.Function)
@@ -441,14 +503,34 @@ func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
 
 type aggregateAccumulator struct {
 	AggregateCount
-	sum      big.Rat
-	min, max *big.Rat
-	distinct map[string]struct{}
-	samples  []*big.Rat
+	sum         big.Rat
+	min, max    *big.Rat
+	distinct    map[string]struct{}
+	samples     []*big.Rat
+	histogram   map[string]*HistogramBucket
+	zeroCount   uint64
+	rateEnd     time.Time
+	rateCovered time.Duration
 }
 
 func (e *aggregateAccumulator) add(a AggregationRequest, value any, retained *int) error {
 	if a.Function == "" || a.Function == "count" {
+		e.Count++
+		return nil
+	}
+	if a.Function == "rate" {
+		interval := value.(counterInterval)
+		e.sum.Add(&e.sum, interval.delta)
+		// Records arrive in observation order. Merge overlapping intervals so
+		// multiple counters grouped together contribute a total, not a mean.
+		if interval.end.After(e.rateEnd) {
+			start := interval.start
+			if e.rateEnd.After(start) {
+				start = e.rateEnd
+			}
+			e.rateCovered += interval.end.Sub(start)
+			e.rateEnd = interval.end
+		}
 		e.Count++
 		return nil
 	}
@@ -489,6 +571,24 @@ func (e *aggregateAccumulator) add(a AggregationRequest, value any, retained *in
 			}
 			e.samples = append(e.samples, n)
 			*retained += 1
+		case "hist":
+			if n.Sign() == 0 {
+				e.zeroCount++
+				break
+			}
+			bucket := histogramBucket(n)
+			if e.histogram == nil {
+				e.histogram = make(map[string]*HistogramBucket)
+			}
+			key := bucket.Lower.String()
+			if e.histogram[key] == nil {
+				if *retained >= maxAggregateValues {
+					return errors.New("aggregation exceeds 65536 retained values")
+				}
+				e.histogram[key] = &bucket
+				*retained += 1
+			}
+			e.histogram[key].Count++
 		}
 	}
 	e.Count++
@@ -500,7 +600,11 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 		if n.IsInt() {
 			return n.Num().String()
 		}
-		return n.FloatString(18)
+		value := strings.TrimRight(strings.TrimRight(n.FloatString(18), "0"), ".")
+		if value == "-0" {
+			value = "0"
+		}
+		return value
 	}
 	var value string
 	switch a.Function {
@@ -508,6 +612,24 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 		value = number(&e.sum)
 	case "count_distinct":
 		value = fmt.Sprint(len(e.distinct))
+	case "hist":
+		h := Histogram{Count: e.Count, ZeroCount: e.zeroCount, Buckets: make([]HistogramBucket, 0, len(e.histogram))}
+		for _, bucket := range e.histogram {
+			h.Buckets = append(h.Buckets, *bucket)
+		}
+		slices.SortFunc(h.Buckets, func(x, y HistogramBucket) int {
+			a, _ := new(big.Rat).SetString(x.Lower.String())
+			b, _ := new(big.Rat).SetString(y.Lower.String())
+			return a.Cmp(b)
+		})
+		data, _ := json.Marshal(h)
+		return data
+	case "rate":
+		if e.rateCovered == 0 {
+			return json.RawMessage("null")
+		}
+		seconds := new(big.Rat).SetFrac(big.NewInt(int64(e.rateCovered)), big.NewInt(int64(time.Second)))
+		value = number(new(big.Rat).Quo(&e.sum, seconds))
 	default:
 		if e.Count == 0 {
 			return json.RawMessage("null")
@@ -515,7 +637,7 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 		switch a.Function {
 		case "avg":
 			mean := new(big.Rat).Quo(&e.sum, new(big.Rat).SetInt(new(big.Int).SetUint64(e.Count)))
-			value = mean.FloatString(18)
+			value = number(mean)
 		case "min":
 			value = number(e.min)
 		case "max":
@@ -537,13 +659,46 @@ func (e *aggregateAccumulator) value(a AggregationRequest) json.RawMessage {
 	return json.RawMessage(value)
 }
 
+// Four equal sub-buckets per power-of-two range, including fractions and
+// negative values. Bounds are exact dyadic rationals, never float approximations.
+func histogramBucket(n *big.Rat) HistogramBucket {
+	abs := new(big.Rat).Abs(n)
+	exponent := abs.Num().BitLen() - abs.Denom().BitLen()
+	power := new(big.Rat)
+	if exponent >= 0 {
+		power.SetInt(new(big.Int).Lsh(big.NewInt(1), uint(exponent)))
+	} else {
+		power.SetFrac(big.NewInt(1), new(big.Int).Lsh(big.NewInt(1), uint(-exponent)))
+	}
+	if abs.Cmp(power) < 0 {
+		power.Quo(power, big.NewRat(2, 1))
+	}
+	position := new(big.Rat).Quo(abs, power)
+	position.Sub(position, big.NewRat(1, 1)).Mul(position, big.NewRat(4, 1))
+	index := new(big.Int).Quo(position.Num(), position.Denom()).Int64()
+	if n.Sign() < 0 && position.IsInt() {
+		index-- // Negative boundaries belong to the bucket on their right.
+		if index < 0 {
+			power.Quo(power, big.NewRat(2, 1))
+			index = 3
+		}
+	}
+	lower := new(big.Rat).Mul(power, big.NewRat(4+index, 4))
+	upper := new(big.Rat).Mul(power, big.NewRat(5+index, 4))
+	if n.Sign() < 0 {
+		lower, upper = new(big.Rat).Neg(upper), new(big.Rat).Neg(lower)
+	}
+	return HistogramBucket{Lower: json.Number(lower.FloatString(lower.Denom().BitLen() - 1)), Upper: json.Number(upper.FloatString(upper.Denom().BitLen() - 1))}
+}
+
 // aggregateReduction is shared by event windows and sampled snapshots.
 type aggregateReduction struct {
-	request      AggregationRequest
-	groups       map[string]*aggregateAccumulator
-	retained     *int // Shared across metrics: the storage cap is per query, not per function.
-	metrics      []*aggregateReduction
-	seriesGroups *int // periodic queries share a bounded group budget across buckets/metrics
+	request       AggregationRequest
+	groups        map[string]*aggregateAccumulator
+	retained      *int // Shared across metrics: the storage cap is per query, not per function.
+	metrics       []*aggregateReduction
+	seriesGroups  *int // periodic queries share a bounded group budget across buckets/metrics
+	stackCoverage *StackCoverageReport
 }
 
 func newAggregateReduction(a AggregationRequest) *aggregateReduction {
@@ -581,7 +736,11 @@ func (r *aggregateReduction) add(fields map[string]any) error {
 	var value any
 	if r.request.Field != "" {
 		var ok bool
-		value, ok = fields[r.request.Field]
+		field := r.request.Field
+		if r.request.Function == "rate" {
+			field = "__counter_delta." + field
+		}
+		value, ok = fields[field]
 		// Optional metrics use available observations, just like sampled
 		// snapshots. Do not turn a missing numeric value into a zero.
 		if !ok || value == nil {
@@ -791,6 +950,13 @@ func aggregateScript(ctx context.Context, request MonitorRequest, source eventSo
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
+	if len(request.Reports) != 0 {
+		var err error
+		result.Tables, err = reportScriptTables(request, result.Tables)
+		if err != nil {
+			return Snapshot{}, err
+		}
+	}
 	if data, err := json.Marshal(result); err != nil {
 		return Snapshot{}, err
 	} else if len(data) > 7<<20 {
@@ -826,6 +992,17 @@ func aggregateEventsAt(ctx context.Context, request MonitorRequest, source event
 			reductions = append(reductions, r)
 		}
 	}
+	if request.Stacks != nil {
+		for _, reduction := range reductions {
+			reduction.stackCoverage = &StackCoverageReport{}
+			if request.Stacks.User {
+				reduction.stackCoverage.User = &StackCoverage{}
+			}
+			if request.Stacks.Kernel {
+				reduction.stackCoverage.Kernel = &StackCoverage{}
+			}
+		}
+	}
 	var collection *CollectionStats
 	var mu sync.Mutex
 	// Sources receive only the event selection, not the query mode.
@@ -856,6 +1033,14 @@ func aggregateEventsAt(ctx context.Context, request MonitorRequest, source event
 		if interval := request.Aggregation.ReportEvery; interval != 0 {
 			bucket = int(now.Sub(start) / interval)
 		}
+		if coverage := reductions[bucket].stackCoverage; coverage != nil {
+			if coverage.User != nil {
+				coverage.User.observe(event.UserStack, request.Stacks.Symbolize)
+			}
+			if coverage.Kernel != nil {
+				coverage.Kernel.observe(event.KernelStack, request.Stacks.Symbolize)
+			}
+		}
 		return reductions[bucket].add(fields)
 	})
 	if ctx.Err() != nil {
@@ -873,6 +1058,7 @@ func aggregateEventsAt(ctx context.Context, request MonitorRequest, source event
 	if request.Aggregation.ReportEvery == 0 {
 		result := reductions[0].result(request.Source, start, end)
 		result.Aggregation.Collection = collection
+		result.Aggregation.StackCoverage = reductions[0].stackCoverage
 		return result, nil
 	}
 	result := Snapshot{Source: request.Source, Time: end.UTC()}
@@ -883,6 +1069,7 @@ func aggregateEventsAt(ctx context.Context, request MonitorRequest, source event
 			finish = end
 		}
 		window := reduction.result(request.Source, begin, finish).Aggregation
+		window.StackCoverage = reduction.stackCoverage
 		result.Windows = append(result.Windows, window)
 	}
 	// Collection counters remain subscription-wide, not per-bucket loss estimates.

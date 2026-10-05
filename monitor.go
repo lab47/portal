@@ -31,7 +31,8 @@ type MonitorRequest struct {
 	Source       string              `json:"source"`
 	Mode         string              `json:"mode,omitempty"` // empty for events, "snapshot" or "aggregate" for queries
 	Aggregation  *AggregationRequest `json:"aggregation,omitempty"`
-	Probes       []MonitorRequest    `json:"probes,omitempty"` // script: independent selections sharing aggregation timing
+	Probes       []MonitorRequest    `json:"probes,omitempty"`  // script: independent selections sharing aggregation timing
+	Reports      []AggregateReport   `json:"reports,omitempty"` // script: post-aggregation emits, including joins
 	PID          uint32              `json:"pid,omitempty"`
 	Syscalls     []int               `json:"syscalls,omitempty"`
 	SyscallNames []string            `json:"syscall_names,omitempty"` // resolved against the server's native Linux ABI
@@ -354,7 +355,7 @@ func validateScript(r MonitorRequest) error {
 		return errors.New("script requires aggregate mode, shared timing and 1–8 probes")
 	}
 	selection := r
-	selection.Source, selection.Mode, selection.Aggregation, selection.Probes = "", "", nil, nil
+	selection.Source, selection.Mode, selection.Aggregation, selection.Probes, selection.Reports = "", "", nil, nil, nil
 	if !reflect.DeepEqual(selection, MonitorRequest{}) || !reflect.DeepEqual(*r.Aggregation, AggregationRequest{Window: r.Aggregation.Window, ReportEvery: r.Aggregation.ReportEvery}) {
 		return errors.New("script filters and result controls belong to individual probes")
 	}
@@ -375,15 +376,15 @@ func validateScript(r MonitorRequest) error {
 			return errors.New("script tables must share the same window and reporting interval")
 		}
 	}
-	return nil
+	return validateAggregateReports(r)
 }
 
 func (r MonitorRequest) validate() error {
 	if r.Source == "script" {
 		return validateScript(r)
 	}
-	if len(r.Probes) != 0 {
-		return errors.New("probes require a script query")
+	if len(r.Probes) != 0 || len(r.Reports) != 0 {
+		return errors.New("probes and reports require a script query")
 	}
 	if len(r.Comparisons) != 0 {
 		if r.Mode == "snapshot" || sampledAggregation(r) || len(r.Comparisons) > 16 {

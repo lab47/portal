@@ -99,7 +99,7 @@ func newMonitorQueryGrammar() p.Rule {
 		return fields
 	})
 	metric := p.Action(p.Seq(
-		p.Named("function", token(p.Capture(p.Re("(?i:sum|avg|min|max|count_distinct)")))),
+		p.Named("function", token(p.Capture(p.Re("(?i:sum|avg|min|max|count_distinct|hist|rate)")))),
 		token(p.S("(")), p.Named("field", word), token(p.S(")")),
 	), func(v p.Values) any {
 		return &AggregationRequest{Function: strings.ToLower(v.Get("function").(string)), Field: queryField(v.Get("field").(string))}
@@ -254,7 +254,15 @@ func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
 			if len(condition.values) != 1 {
 				return MonitorRequest{}, errors.New("comparison requires one numeric value")
 			}
-			r.Comparisons = append(r.Comparisons, NumericComparison{Field: condition.field, Op: condition.op, Value: condition.values[0]})
+			value := condition.values[0]
+			if condition.field == "duration_ns" {
+				// Preserve raw numeric thresholds exactly. ParseDuration requires a
+				// unit, so only duration literals are converted to nanoseconds.
+				if duration, err := time.ParseDuration(value); err == nil {
+					value = strconv.FormatInt(int64(duration), 10)
+				}
+			}
+			r.Comparisons = append(r.Comparisons, NumericComparison{Field: condition.field, Op: condition.op, Value: value})
 			continue
 		}
 		if condition.op == "in" {

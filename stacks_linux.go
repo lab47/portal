@@ -122,7 +122,7 @@ func (s *stackCaptureState) decode(ctx context.Context, raw []byte, event *Event
 
 func (s *stackCaptureState) stack(ctx context.Context, id int64, user bool, pid uint32) *CapturedStack {
 	if id < 0 {
-		return &CapturedStack{Error: fmt.Sprintf("bpf_get_stackid failed: %d", id)}
+		return &CapturedStack{Error: fmt.Sprintf("bpf_get_stackid failed: %d", id), CaptureErrorCode: id}
 	}
 	addresses := make([]uint64, s.spec.depth())
 	key := uint32(id)
@@ -136,7 +136,7 @@ func (s *stackCaptureState) stack(ctx context.Context, id int64, user bool, pid 
 	for i, address := range addresses {
 		frames[i].Address = symbolHex(address)
 	}
-	result := &CapturedStack{Frames: frames}
+	result := &CapturedStack{Frames: frames, DepthLimitReached: len(addresses) == s.spec.depth()}
 	if !s.spec.Symbolize || len(addresses) == 0 {
 		return result
 	}

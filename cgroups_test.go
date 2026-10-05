@@ -76,8 +76,8 @@ func TestCgroupSampledMetrics(t *testing.T) {
 			snapshots = append(snapshots, Snapshot{Cgroups: []CgroupInfo{{Path: "/web", ID: id, CPUSeconds: &cpu[i], MemoryBytes: &memory[i]}}})
 		}
 		for _, tc := range []struct{ metric, want string }{
-			{"avg(cpu_percent)", "200.000000000000000000"},
-			{"avg(memory_bytes)", "18446744073709551612.000000000000000000"},
+			{"avg(cpu_percent)", "200"},
+			{"avg(memory_bytes)", "18446744073709551612"},
 		} {
 			got := sampledFixture(t, "cgroups "+tc.metric+" over 4s every 1s by path", snapshots)
 			if len(got.Aggregation.Values) != 1 || string(got.Aggregation.Values[0].Value) != tc.want || string(got.Aggregation.Values[0].Group["path"]) != `"/web"` {

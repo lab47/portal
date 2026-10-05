@@ -28,6 +28,7 @@ func TestDecodeSignedStackCaptureFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if event.PID != 123 || event.TID != 456 || event.UserStack == nil || event.KernelStack == nil ||
+		event.UserStack.CaptureErrorCode != -14 || event.KernelStack.CaptureErrorCode != -12 ||
 		!strings.Contains(event.UserStack.Error, "-14") || !strings.Contains(event.KernelStack.Error, "-12") {
 		t.Fatalf("signed helper failures were not preserved: %+v", event)
 	}

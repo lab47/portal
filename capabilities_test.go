@@ -26,7 +26,7 @@ import (
 
 func TestCapabilityReference(t *testing.T) {
 	docs := describeCapabilities(policy{"reader": {"other-uid": true}}, "reader")
-	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 14 || len(docs.Aggregates) != 7 {
+	if docs.Version != 1 || docs.OS != runtime.GOOS || docs.Arch != runtime.GOARCH || len(docs.Sources) != 14 || len(docs.Aggregates) != 9 {
 		t.Fatalf("incomplete capability reference: %+v", docs)
 	}
 	if docs.Limits.AggregateMetrics != 8 {
@@ -43,6 +43,13 @@ func TestCapabilityReference(t *testing.T) {
 			}
 		}
 		if source.Name == "syscalls" || source.Name == "tracepoint" {
+			for _, path := range []string{"user_stack.capture_error_code", "kernel_stack.depth_limit_reached"} {
+				if !slices.ContainsFunc(source.Fields, func(f FieldCapability) bool {
+					return f.Path == path && !f.Aggregatable && f.Description != ""
+				}) {
+					t.Fatalf("stack diagnostic not documented: %s.%s", source.Name, path)
+				}
+			}
 			for _, prefix := range []string{"user.stack", "kernel.stack"} {
 				for _, suffix := range []string{"offsets", "top", "drop_bottom", "drop_top", "from", "until"} {
 					if !slices.ContainsFunc(source.Filters, func(f FilterCapability) bool {
@@ -109,32 +116,32 @@ func TestCapabilityReference(t *testing.T) {
 				t.Fatal("packet lengths must be numeric, addresses must not be")
 			}
 			for _, field := range []FieldCapability{
-				{Path: "packet.length", Type: "integer", QueryField: "length", Unit: "bytes"},
+				{Path: "packet.length", Type: "integer", QueryField: "length", Unit: "bytes", Aggregatable: true},
 				{Path: "packet.data", Type: "base64"},
-				{Path: "packet.destination_ip", Type: "string", QueryField: "dst.ip"},
-				{Path: "packet.source_port", Type: "integer", QueryField: "src.port", Optional: true},
+				{Path: "packet.destination_ip", Type: "string", QueryField: "dst.ip", Aggregatable: true},
+				{Path: "packet.source_port", Type: "integer", QueryField: "src.port", Optional: true, Aggregatable: true},
 			} {
 				if !slices.Contains(source.Fields, field) {
 					t.Fatalf("missing packet schema field: %+v", field)
 				}
 			}
 		case "cpu":
-			if !slices.Contains(source.Fields, FieldCapability{Path: "cpu[].name", Type: "string", QueryField: "name"}) ||
-				!slices.Contains(source.Fields, FieldCapability{Path: "cpu[].idle", Type: "number", QueryField: "idle", Unit: "seconds"}) || source.Sampling == nil ||
+			if !slices.Contains(source.Fields, FieldCapability{Path: "cpu[].name", Type: "string", QueryField: "name", Aggregatable: true}) ||
+				!slices.Contains(source.Fields, FieldCapability{Path: "cpu[].idle", Type: "number", QueryField: "idle", Unit: "seconds", Aggregatable: true}) || source.Sampling == nil ||
 				slices.Contains(source.Sampling.NumericFields, "idle") || !slices.Contains(source.Sampling.NumericFields, "utilization_percent") {
 				t.Fatal("CPU raw counters must be separate from derived utilization")
 			}
 		case "gpu":
-			if !slices.Contains(source.Fields, FieldCapability{Path: "gpus[].memory_used_mib", Type: "integer", QueryField: "memory_used_mib", Optional: true, Unit: "MiB"}) {
+			if !slices.Contains(source.Fields, FieldCapability{Path: "gpus[].memory_used_mib", Type: "integer", QueryField: "memory_used_mib", Optional: true, Unit: "MiB", Aggregatable: true}) {
 				t.Fatal("missing optional GPU metric units/type")
 			}
 		case "kernel":
-			if !slices.Contains(source.Fields, FieldCapability{Path: "kernel.counters.processes_running", Type: "integer", Optional: true}) {
+			if !slices.Contains(source.Fields, FieldCapability{Path: "kernel.counters.processes_running", Type: "integer", QueryField: "counters.processes_running", Optional: true, Aggregatable: true}) {
 				t.Fatal("missing nested optional kernel field")
 			}
 		}
 	}
-	for _, function := range []string{"count", "sum", "avg", "min", "max", "count_distinct", "percentile"} {
+	for _, function := range []string{"count", "sum", "avg", "min", "max", "count_distinct", "percentile", "hist", "rate"} {
 		if !slices.ContainsFunc(docs.Aggregates, func(a AggregateCapability) bool { return a.Name == function }) {
 			t.Fatalf("missing aggregate %s", function)
 		}
@@ -255,5 +262,40 @@ func TestClientCapabilities(t *testing.T) {
 	}
 	if _, err := client.Capabilities(ctx); err == nil || !strings.Contains(err.Error(), "untrusted certificate authority") {
 		t.Fatalf("untrusted certificate: %v", err)
+	}
+}
+
+func TestCapabilityAggregationFlags(t *testing.T) {
+	docs := describeCapabilities(nil, "reader")
+	for _, source := range docs.Sources {
+		for _, field := range source.Fields {
+			if !field.Aggregatable {
+				continue
+			}
+			groupable := slices.Contains(source.GroupByFields, field.QueryField)
+			if source.Sampling != nil {
+				groupable = groupable || slices.Contains(source.Sampling.GroupByFields, field.QueryField)
+			}
+			if field.QueryField == "" || !groupable {
+				t.Fatalf("advertised aggregate field cannot be selected: %s.%s", source.Name, field.Path)
+			}
+			if strings.Contains(field.Path, "frames[]") || strings.HasPrefix(field.Path, "collection.") || strings.Contains(field.Path, "devices[]") {
+				t.Fatalf("nested/diagnostic field incorrectly aggregatable: %s", field.Path)
+			}
+		}
+		if source.Sampling == nil {
+			continue
+		}
+		for _, field := range source.Sampling.Fields {
+			if !field.Aggregatable {
+				t.Fatalf("sampled scalar missing aggregate flag: %s.%s", source.Name, field.Path)
+			}
+			if field.Semantics == "counter" {
+				query := source.Name + " rate(" + field.Path + ") over 2s every 100ms"
+				if _, err := ParseMonitorQuery(query); err != nil {
+					t.Fatalf("documented counter rate rejected: %s: %v", query, err)
+				}
+			}
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
@@ -205,7 +206,7 @@ func aggregateFixture(t *testing.T, query string, events []Event) Snapshot {
 func TestAggregateFunctions(t *testing.T) {
 	for _, tc := range []struct{ metric, first, second string }{
 		{"sum(field.value)", "17", "12"},
-		{"avg(field.value)", "3.400000000000000000", "6.000000000000000000"},
+		{"avg(field.value)", "3.4", "6"},
 		{"min(field.value)", "-5", "3"},
 		{"max(field.value)", "18", "9"},
 		{"count_distinct(field.value)", "4", "2"},
@@ -238,7 +239,7 @@ func TestAggregatePrecision(t *testing.T) {
 		input        []string
 	}{
 		{"sum(field.x)", "36893488147419103230", []string{"18446744073709551615", "18446744073709551615"}},
-		{"avg(field.x)", "18446744073709551614.500000000000000000", []string{"18446744073709551615", "18446744073709551614"}},
+		{"avg(field.x)", "18446744073709551614.5", []string{"18446744073709551615", "18446744073709551614"}},
 		{"min(field.x)", "9007199254740992", []string{"9007199254740993", "9007199254740992"}},
 		{"max(field.x)", "9007199254740993", []string{"9007199254740992", "9007199254740993"}},
 		{"avg(field.x)", "0.333333333333333333", []string{"0", "0", "1"}},
@@ -374,4 +375,197 @@ func TestCompletionAggregatesAndFinalCollectionStats(t *testing.T) {
 			t.Fatalf("identity query rejected: %s: %v", query, err)
 		}
 	}
+}
+
+func TestHistogramBoundsAndBudget(t *testing.T) {
+	// Explicit edges distinguish half-open boundaries, signed values and
+	// full-width integers from a floating-point or rounded implementation.
+	for _, tc := range []struct{ input, lower, upper string }{
+		{"1", "1", "1.25"}, {"1.249", "1", "1.25"}, {"1.25", "1.25", "1.5"},
+		{"2", "2", "2.5"}, {"0.125", "0.125", "0.15625"},
+		{"-1", "-1", "-0.875"}, {"-1.001", "-1.25", "-1"},
+		{"-1.25", "-1.25", "-1"}, {"-2", "-2", "-1.75"},
+		{"9600000", "8388608", "10485760"}, {"14000000", "12582912", "14680064"},
+		{"18446744073709551615", "16140901064495857664", "18446744073709551616"},
+	} {
+		n, _ := new(big.Rat).SetString(tc.input)
+		bucket := histogramBucket(n)
+		lower, _ := new(big.Rat).SetString(bucket.Lower.String())
+		upper, _ := new(big.Rat).SetString(bucket.Upper.String())
+		wantLower, _ := new(big.Rat).SetString(tc.lower)
+		wantUpper, _ := new(big.Rat).SetString(tc.upper)
+		if lower.Cmp(wantLower) != 0 || upper.Cmp(wantUpper) != 0 || lower.Cmp(n) > 0 || upper.Cmp(n) <= 0 {
+			t.Fatalf("histogram(%s) = %+v, want [%s, %s)", tc.input, bucket, tc.lower, tc.upper)
+		}
+	}
+	var accumulator aggregateAccumulator
+	retained := maxAggregateValues - 1
+	a := AggregationRequest{Function: "hist", Field: "pid"}
+	for _, value := range []int{0, 1, 1} {
+		if err := accumulator.add(a, value, &retained); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if retained != maxAggregateValues {
+		t.Fatal("zero/repeated buckets must not retain extra slots")
+	}
+	if err := accumulator.add(a, 2, &retained); err == nil {
+		t.Fatal("histogram escaped the shared retention budget")
+	}
+	if got := string(accumulator.value(a)); got != `{"count":3,"zero_count":1,"buckets":[{"lower":1,"upper":1.25,"count":2}]}` {
+		t.Fatalf("histogram result: %s", got)
+	}
+}
+
+func TestHistogramQueryAndSorting(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var events []Event
+		for _, value := range []string{"-1", "0", "1", "1", "2"} {
+			events = append(events, Event{Tracepoint: &TracepointEvent{Event: "custom:sample", Fields: map[string]json.Number{"value": json.Number(value)}}})
+		}
+		got := aggregateFixture(t, "tracepoint where event = custom:sample and fields in (value) hist(field.value), count over 1s", events)
+		var h Histogram
+		if err := json.Unmarshal(got.Aggregation.Metrics[0].Values[0].Value, &h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Count != 5 || h.ZeroCount != 1 || len(h.Buckets) != 3 || h.Buckets[0].Count != 1 || h.Buckets[1].Count != 2 || h.Buckets[2].Count != 1 || got.Aggregation.Metrics[1].Counts[0].Count != 5 {
+			t.Fatalf("wrong sorted histogram or sibling count: %+v", got.Aggregation)
+		}
+		empty := aggregateFixture(t, "syscalls hist(pid) over 1s", nil)
+		if string(empty.Aggregation.Values[0].Value) != `{"count":0,"zero_count":0,"buckets":[]}` {
+			t.Fatal("empty histogram must not be null")
+		}
+	})
+	for _, query := range []string{
+		`disk:completion { @h[] = {latency: hist(duration_ns), ops: count()} } after 1s { emit @h order by ops desc limit 10 }`,
+		`disk:completion { @h[] = hist(duration_ns) } every 100ms { emit @h; clear @h } after 1s { stop }`,
+	} {
+		if _, err := ParseMonitorQuery(query); err != nil {
+			t.Fatalf("valid histogram query: %v", err)
+		}
+	}
+	for _, query := range []string{
+		`disk:completion { @h[] = hist(duration_ns) } after 1s { emit @h order by value desc limit 10 }`,
+		`syscalls where result.limit = 1 hist(pid), count over 1s`,
+	} {
+		if _, err := ParseMonitorQuery(query); err == nil || !strings.Contains(err.Error(), "sort metric") {
+			t.Fatalf("histogram sort should fail explicitly: %v", err)
+		}
+	}
+}
+
+func TestPeriodicValidationNamesFailedConstraint(t *testing.T) {
+	for _, tc := range []struct {
+		source           string
+		window, interval time.Duration
+		want             string
+	}{
+		{"cgroups", time.Second, time.Second, "cgroups is a sampled snapshot source"},
+		{"syscalls", time.Second, 99 * time.Millisecond, "at least 100ms"},
+		{"syscalls", time.Second, 2 * time.Second, "cannot exceed"},
+		{"syscalls", 6500 * time.Millisecond, 100 * time.Millisecond, "maximum of 64 buckets"},
+	} {
+		a := AggregationRequest{Window: tc.window, ReportEvery: tc.interval}
+		err := a.validate(MonitorRequest{Source: tc.source})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: expected %q, got %v", tc.source, tc.want, err)
+		}
+	}
+	if err := (AggregationRequest{Window: 6400 * time.Millisecond, ReportEvery: 100 * time.Millisecond}).validate(MonitorRequest{Source: "syscalls"}); err != nil {
+		t.Fatalf("exactly 64 buckets rejected: %v", err)
+	}
+}
+
+func TestAggregateStackCoverageAcrossBuckets(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, err := ParseMonitorQuery("syscalls where syscall = 2 and stacks = both count, sum(pid) over 3s by pid, user.stack")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Aggregation.ReportEvery, r.Aggregation.Limit = time.Second, 1
+		r.Stacks.UserShape = &StackShape{Top: 1}
+		got, err := aggregateEvents(context.Background(), r, func(ctx context.Context, _ MonitorRequest, emit func(Event) error) error {
+			for _, event := range []Event{
+				{PID: 1, Syscall: 2, UserStack: &CapturedStack{Error: "failed", CaptureErrorCode: -14}, KernelStack: &CapturedStack{Frames: []SymbolFrame{{Name: "kernel"}}}},
+				{PID: 2, Syscall: 2, UserStack: &CapturedStack{Frames: []SymbolFrame{{Name: "caller"}, {Address: "0x2"}}, DepthLimitReached: true}, KernelStack: &CapturedStack{Error: "collision", CaptureErrorCode: -17}},
+				{PID: 99, Syscall: 3}, // rejected by the predicate
+				{Kind: "collection_stats", Collection: &CollectionStats{StackCaptureFailures: 50}},
+			} {
+				if err := emit(event); err != nil {
+					return err
+				}
+			}
+			time.Sleep(time.Second)
+			if err := emit(Event{PID: 3, Syscall: 2, UserStack: &CapturedStack{Frames: []SymbolFrame{{Name: "one"}, {Name: "two"}}}}); err != nil {
+				return err
+			}
+			time.Sleep(2 * time.Second)
+			if err := emit(Event{PID: 4, Syscall: 2}); err != nil { // excluded at the end boundary
+				return err
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []*StackCoverageReport{
+			{User: &StackCoverage{Events: 2, Captured: 1, CaptureFailures: 1, HelperErrors: map[string]uint64{"-14": 1}, DepthLimitReached: 1, Frames: 2, NamedFrames: 1, UnresolvedFrames: 1, PartiallySymbolized: 1},
+				Kernel: &StackCoverage{Events: 2, Captured: 1, CaptureFailures: 1, HelperErrors: map[string]uint64{"-17": 1}, Frames: 1, NamedFrames: 1, FullySymbolized: 1}},
+			{User: &StackCoverage{Events: 1, Captured: 1, Frames: 2, NamedFrames: 2, FullySymbolized: 1}, Kernel: &StackCoverage{Events: 1, Missing: 1}},
+			{User: &StackCoverage{}, Kernel: &StackCoverage{}},
+		}
+		if len(got.Windows) != len(want) || len(got.Windows[0].Rows) != 1 || got.Windows[0].TotalGroups != 2 {
+			t.Fatalf("expected limited multi-metric buckets: %+v", got)
+		}
+		data, err := json.Marshal(got)
+		var decoded Snapshot
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		for i, window := range decoded.Windows {
+			if !reflect.DeepEqual(window.StackCoverage, want[i]) {
+				t.Fatalf("bucket %d coverage duplicated/lost or shaped: %+v", i, window.StackCoverage)
+			}
+		}
+		if decoded.Windows[0].Collection != nil || decoded.Windows[2].Collection.StackCaptureFailures != 50 {
+			t.Fatal("subscription-wide capture counters must remain separate from received-event coverage")
+		}
+	})
+}
+
+func TestOneShotStackCoverageWireFormats(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, query := range []string{
+			"syscalls where stacks = user count over 1s",
+			"syscalls where stacks = user count, sum(pid) over 1s",
+			`syscalls { @s[caller: stack.user(top: 1)] = {ops: count()} } after 1s { emit @s }`,
+		} {
+			got := aggregateFixture(t, query, []Event{{PID: 7, UserStack: &CapturedStack{Frames: []SymbolFrame{{Name: "a"}, {Address: "0x1"}}}}})
+			data, err := json.Marshal(got)
+			var decoded Snapshot
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			want := &StackCoverageReport{User: &StackCoverage{Events: 1, Captured: 1, Frames: 2, NamedFrames: 1, UnresolvedFrames: 1, PartiallySymbolized: 1}}
+			if !reflect.DeepEqual(decoded.Aggregation.StackCoverage, want) {
+				t.Fatalf("%s lost user-only coverage: %+v", query, decoded.Aggregation.StackCoverage)
+			}
+			for _, metric := range decoded.Aggregation.Metrics {
+				if metric.StackCoverage != nil {
+					t.Fatal("coverage must not be duplicated per metric")
+				}
+			}
+		}
+		plain := aggregateFixture(t, "syscalls count over 1s", nil)
+		if plain.Aggregation.StackCoverage != nil {
+			t.Fatal("stack coverage should be omitted when capture is disabled")
+		}
+	})
 }
