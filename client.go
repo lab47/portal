@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
-	"github.com/tmc/go-iroh/netaddr"
-	"github.com/tmc/go-iroh/relay"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -16,9 +14,11 @@ import (
 type Client struct {
 	Name, CoordinatorURL          string
 	KeyFile, CertFile             string
-	ConfigFile, CAFile, Principal string // Config defaults; a CA selects certificate authentication.
-	CAURL, RefreshTokenFile       string // Headless renewal; token defaults to <key>.refresh.
-	User                          string // Optional local account on the server; empty uses the server process's account.
+	ConfigFile, CAFile, Principal string           // Config defaults; a CA selects certificate authentication.
+	CAURL, RefreshTokenFile       string           // Headless renewal; token defaults to <key>.refresh.
+	User                          string           // Optional local account on the server; empty uses the server process's account.
+	Transport                     *ClientTransport // Optional long-lived transport, owned by the caller.
+	NetworkDebug                  bool             // Log selected iroh paths to stderr without affecting protocol output.
 }
 
 // Run returns the remote output and status. A nonzero remote exit is in Result,
@@ -29,12 +29,12 @@ func (c Client) Run(ctx context.Context, argv []string) (Result, error) {
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 80*time.Second)
 	defer cancel()
-	return withClient(c, requestCtx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (Result, error) {
-		return runRemote(requestCtx, ep, reg, signer, cert, c.User, argv)
+	return withClient(c, requestCtx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (Result, error) {
+		return runRemote(requestCtx, ep, reg, signer, cert, c.User, argv, conn)
 	})
 }
 
-func withClient[T any](c Client, ctx context.Context, use func(*iroh.Endpoint, registration, ssh.Signer, ssh.PublicKey) (T, error)) (T, error) {
+func withClient[T any](c Client, ctx context.Context, use func(*iroh.Endpoint, registration, ssh.Signer, ssh.PublicKey, *iroh.Conn) (T, error)) (T, error) {
 	var zero T
 	var err error
 	c, err = c.configured()
@@ -66,17 +66,19 @@ func withClient[T any](c Client, ctx context.Context, use func(*iroh.Endpoint, r
 	if err != nil {
 		return zero, err
 	}
-	relayURL, err := netaddr.ParseRelayURL(reg.RelayURL)
-	if err != nil || relayURL.URL().Host == "" {
-		return zero, errors.New("invalid relay URL in inventory")
+	transport := c.Transport
+	if transport == nil {
+		transport = NewClientTransport(ctx)
+		defer transport.Close()
 	}
-	ep, err := iroh.Bind(ctx, iroh.WithRelayMode(relay.ModeCustomURLs(relayURL)))
+	ep, conn, release, err := transport.acquire(ctx, reg)
 	if err != nil {
 		return zero, err
 	}
-	defer ep.Shutdown(context.Background())
-	if err := ep.Online(ctx); err != nil {
-		return zero, err
+	defer release()
+	if c.NetworkDebug {
+		logNetworkReport(ep)
+		defer watchConnectionPaths(ctx, conn)()
 	}
-	return use(ep, reg, signer, cert)
+	return use(ep, reg, signer, cert, conn)
 }

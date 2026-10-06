@@ -952,6 +952,31 @@ The command protocol remains `adminhelper/2` for wire compatibility; upgrade cli
 
 By default the server selects a number0 production relay. To use a relay you operate, pass `-relay https://relay.example.com/` to the server; the client learns that relay through inventory. The relay must accept both endpoints. For a directly reachable interface, the server can use `-listen SERVER_IP:PORT` to offer that address to iroh's in-band path discovery (not to coordinator inventory). The default bind uses an OS-assigned dual-stack port; direct upgrades depend on iroh discovering routable candidates and network/firewall reachability. A short command may finish before the upgrade and remain relayed. The coordinator is still reached via HTTP(S) for check-in and lookup; only the command channel uses iroh. Registrations expire after 90 seconds without a refresh and disappear on coordinator restart; servers re-register at their next check-in. The lookup endpoint is read-only and public to anyone who can access the coordinator; registration requires the shared token.
 
+With a wildcard UDP bind, both endpoints advertise addresses from active local
+interfaces, including private IPv4 and IPv6 ULA addresses, so peers on the same
+LAN or VPN can connect directly. Loopback, link-local, down interfaces and
+addresses incompatible with the bind's family are excluded. A concrete `-listen`
+address does not advertise other interfaces. Candidates use the actual bound
+UDP port and are exchanged with the peer by iroh, never stored in coordinator
+inventory. Server candidates refresh on check-in; cached client candidates
+refresh on each request. Public address discovery uses iroh's QAD service on
+UDP port 7842 (not STUN); a custom HTTP relay alone does not supply QAD. Allow
+outbound relay HTTPS, QAD UDP and peer UDP traffic for direct upgrades.
+
+Use `--network-debug` on the server or a client command to log the selected
+relay/direct path, validation status, RTT when known, and the current network
+report. Diagnostics go to stderr, leaving JSON/MCP stdout untouched. Being
+online with a relay does not prove direct UDP connectivity.
+
+The MCP server reuses endpoints and connections across calls (up to 16 cached
+peers), giving path discovery time to establish a direct route. Every request
+still reloads credentials and inventory and authenticates a fresh stream;
+canceling one request does not close sibling streams. Closed connections are
+replaced on the next call; failed operations are not automatically replayed.
+Upgrade both client and server for multi-request connection reuse. Go library
+users can share a `NewClientTransport(ctx)` through `Client.Transport` and must
+close it when done. Ordinary CLI invocations release their transport on exit.
+
 **Security:** Serve the coordinator over HTTPS (or behind a trusted TLS reverse proxy) outside a local test; otherwise inventory and the registration token can be intercepted or changed. Protect the token, policy file, and CA signing key. The client trusts inventory returned by that coordinator for the server endpoint identity, while iroh verifies the connected endpoint matches that identity. The server verifies the CA signature, expiry, explicit principal, and proof of possession of the certificate's private key before applying its policy. Limit the server process's OS privileges appropriately: an authorized certificate can run arbitrary executables as an allowed user. This is a bounded-output (1 MiB), 60-second command facility, not an interactive shell or job supervisor.
 
 Run tests with `go test ./... -count=1`.

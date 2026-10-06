@@ -24,6 +24,7 @@ type Server struct {
 	Labels                        map[string]string   // Optional inventory metadata advertised at each check-in.
 	AuthorizedKeysFile            string              // Optional authorized_keys override for the server account, not other target users.
 	QueryAuthorizedKeysFile       string              // Additional query/monitor-only keys, without a CA.
+	NetworkDebug                  bool                // Log selected iroh paths to stderr.
 }
 
 // Serve checks in with the coordinator and accepts commands until ctx is canceled.
@@ -64,11 +65,16 @@ func (s Server) Serve(ctx context.Context) error {
 		return err
 	}
 	defer ep.Shutdown(context.Background())
+	var local []netip.AddrPort
 	checkIn := func() error {
+		local = advertiseLocalInterfaces(ep, local)
 		requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		if err := ep.Online(requestCtx); err != nil {
 			return err
+		}
+		if s.NetworkDebug {
+			logNetworkReport(ep)
 		}
 		urls := ep.Addr().RelayURLs()
 		if len(urls) == 0 {
@@ -95,7 +101,7 @@ func (s Server) Serve(ctx context.Context) error {
 			}
 		}
 	}()
-	return serve(ctx, ep, auth, policy)
+	return serve(ctx, ep, auth, policy, s.NetworkDebug)
 }
 
 func (s Server) authentication(ctx context.Context) (peerAuthenticator, policy, error) {

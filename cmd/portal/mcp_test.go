@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -88,7 +89,8 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 
 	callParams, err := json.Marshal(mflags.ToolCallRequest{Name: "client", Arguments: map[string]any{
 		"name": "node-a", "coordinator": coordinator.URL, "key": key, "cert": cert, "ca": ca + ".pub", "user": account.Username,
-		"arguments": []string{"--", "/bin/echo", "--mcp-arg"},
+		"network-debug": true,
+		"arguments":     []string{"--", "/bin/echo", "--mcp-arg"},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -158,9 +160,14 @@ func TestMCPToolRunsRemoteCommand(t *testing.T) {
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPHelperProcess$")
 	cmd.Env = append(os.Environ(), "PORTAL_MCP_TEST_PROCESS=1")
 	cmd.Stdin = strings.NewReader(requests.String())
+	var diagnostics bytes.Buffer
+	cmd.Stderr = &diagnostics
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("MCP process: %v, output: %s", err, out)
+	}
+	if !strings.Contains(diagnostics.String(), "iroh selected path:") || !strings.Contains(diagnostics.String(), "iroh network report:") || bytes.Contains(out, []byte("iroh selected path:")) {
+		t.Fatalf("network diagnostics missing or leaked to MCP stdout: stderr=%s stdout=%s", &diagnostics, out)
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(out)))
 	var response struct {

@@ -17,7 +17,7 @@ import (
 )
 
 // All client commands resolve defaults in portal.Client, after parsing flags.
-func clientConnectionFlags(fs *mflags.FlagSet) func() portal.Client {
+func clientConnectionFlags(fs *mflags.FlagSet, transports ...*portal.ClientTransport) func() portal.Client {
 	name := fs.String("name", 0, "", "inventory name")
 	coordinator := fs.String("coordinator", 0, "", "coordinator HTTP(S) URL (overrides config)")
 	key := fs.String("key", 0, "", "SSH private key file (overrides config)")
@@ -27,8 +27,13 @@ func clientConnectionFlags(fs *mflags.FlagSet) func() portal.Client {
 	principal := fs.String("principal", 0, "", "expected SSH certificate principal (default: admin)")
 	caURL := fs.String("ca-url", 0, "", "CA HTTPS origin for automatic certificate renewal (overrides config)")
 	refreshToken := fs.String("refresh-token", 0, "", "refresh token file (default: <key>.refresh)")
+	networkDebug := fs.Bool("network-debug", 0, false, "log selected iroh paths to stderr")
 	return func() portal.Client {
-		return portal.Client{Name: *name, CoordinatorURL: *coordinator, KeyFile: *key, CertFile: *cert, ConfigFile: *config, CAFile: *ca, Principal: *principal, CAURL: *caURL, RefreshTokenFile: *refreshToken}
+		client := portal.Client{Name: *name, CoordinatorURL: *coordinator, KeyFile: *key, CertFile: *cert, ConfigFile: *config, CAFile: *ca, Principal: *principal, CAURL: *caURL, RefreshTokenFile: *refreshToken, NetworkDebug: *networkDebug}
+		if len(transports) != 0 {
+			client.Transport = transports[0]
+		}
+		return client
 	}
 }
 

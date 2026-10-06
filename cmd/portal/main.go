@@ -27,6 +27,12 @@ func main() {
 func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	mcpMode := len(args) > 0 && args[0] == "mcp-server"
+	var transport *portal.ClientTransport
+	if mcpMode {
+		transport = portal.NewClientTransport(ctx)
+		defer transport.Close()
+	}
 	dispatcher := mflags.NewDispatcher("portal")
 
 	coordinatorFlags := mflags.NewFlagSet("coordinator")
@@ -61,6 +67,7 @@ func run(args []string) error {
 	token := serverFlags.String("token", 0, "", "legacy registration-token override (prefer config)")
 	relayURL := serverFlags.String("relay", 0, "", "iroh relay URL (default: number0 production relays)")
 	listen := serverFlags.String("listen", 0, "", "optional UDP bind IP:port for direct paths (default: OS-assigned dual-stack port)")
+	networkDebug := serverFlags.Bool("network-debug", 0, false, "log selected iroh paths to stderr")
 	serverConfig := serverFlags.String("config", 0, "", "server config file (default: user config directory/portal/server.json)")
 	caFile := serverFlags.String("ca", 0, "", "trusted SSH user CA public key file or HTTPS URL (overrides embedded key)")
 	policyFile := serverFlags.String("policy", 0, "", "JSON authorization policy file (overrides embedded policy)")
@@ -85,11 +92,12 @@ func run(args []string) error {
 			Name: *name, CoordinatorURL: *coordinatorURL, Token: *token,
 			ConfigFile: *serverConfig, CAFile: *caFile, Principal: *principal, PolicyFile: *policyFile, RelayURL: *relayURL, Listen: *listen, Labels: labels,
 			AuthorizedKeysFile: *authorizedKeys, QueryAuthorizedKeysFile: *queryAuthorizedKeys,
+			NetworkDebug: *networkDebug,
 		}).Serve(ctx)
 	}, mflags.WithUsage("Check in and serve authenticated commands")))
 
 	clientFlags := mflags.NewFlagSet("client")
-	clientOptions := clientConnectionFlags(clientFlags)
+	clientOptions := clientConnectionFlags(clientFlags, transport)
 	user := clientFlags.String("user", 0, "", "local account to run the command as on the server")
 	var command []string
 	clientFlags.Rest(&command, "command and arguments")
@@ -111,7 +119,7 @@ func run(args []string) error {
 	}, mflags.WithUsage("Look up a server and run a command (MCP arguments: prefix the command array with -- to preserve remote flags)"))
 	dispatcher.Dispatch("client", clientCommand)
 	monitorFlags := mflags.NewFlagSet("monitor")
-	monitorOptions := clientConnectionFlags(monitorFlags)
+	monitorOptions := clientConnectionFlags(monitorFlags, transport)
 	monitorQuery := monitorFlags.String("query", 0, "", "event query (for example: packets where protocol = tcp and dst.port = 80)")
 	monitorSource := monitorFlags.String("source", 0, "syscalls", "event source (syscalls, packets, process or disk; use --query for tracepoint)")
 	monitorPID := monitorFlags.Int("pid", 0, 0, "filter by process ID (0 matches all)")
@@ -181,7 +189,7 @@ func run(args []string) error {
 		})
 	}, mflags.WithUsage("Stream authenticated server-side eBPF events as JSON lines")))
 	registerFlags := mflags.NewFlagSet("monitor-register")
-	registerOptions := clientConnectionFlags(registerFlags)
+	registerOptions := clientConnectionFlags(registerFlags, transport)
 	registerQuery := registerFlags.String("query", 0, "", "event query for the persistent monitor")
 	registerTTL := registerFlags.Duration("ttl", 0, portal.DefaultMonitorTTL, "idle lifetime, reset on reads (for example: 30m)")
 	dispatcher.Dispatch("monitor-register", mflags.NewCommand(registerFlags, func(_ *mflags.FlagSet, _ []string) error {
@@ -200,11 +208,10 @@ func run(args []string) error {
 		return nil
 	}, mflags.WithUsage("Register a server-owned monitor and print its ID")))
 	readFlags := mflags.NewFlagSet("monitor-read")
-	readOptions := clientConnectionFlags(readFlags)
+	readOptions := clientConnectionFlags(readFlags, transport)
 	readID := readFlags.String("id", 0, "", "registered monitor ID")
 	readAfter := readFlags.String("after", 0, "0", "last processed sequence (0 starts from beginning)")
 	readTimestamp := readFlags.String("after-timestamp", 0, "", "last event TAI64N timestamp (best-effort resume)")
-	mcpMode := len(args) > 0 && args[0] == "mcp-server"
 	readDefaultDuration := time.Duration(0)
 	if mcpMode {
 		readDefaultDuration = 5 * time.Second
@@ -244,13 +251,13 @@ func run(args []string) error {
 		return finish(readOptions().ReadMonitor(readCtx, *readID, cursor, onRecord))
 	}, mflags.WithUsage("Replay records after a sequence, then follow the monitor as JSON lines")))
 	deleteFlags := mflags.NewFlagSet("monitor-delete")
-	deleteOptions := clientConnectionFlags(deleteFlags)
+	deleteOptions := clientConnectionFlags(deleteFlags, transport)
 	deleteID := deleteFlags.String("id", 0, "", "registered monitor ID")
 	dispatcher.Dispatch("monitor-delete", mflags.NewCommand(deleteFlags, func(_ *mflags.FlagSet, _ []string) error {
 		return deleteOptions().DeleteMonitor(ctx, *deleteID)
 	}, mflags.WithUsage("Stop a registered monitor and discard its history")))
 	queryFlags := mflags.NewFlagSet("query")
-	queryOptions := clientConnectionFlags(queryFlags)
+	queryOptions := clientConnectionFlags(queryFlags, transport)
 	queryText := queryFlags.String("query", 0, "", "snapshot or aggregation query, optionally followed by | JQ_EXPRESSION")
 	queryFormat := queryFlags.String("format", 0, "json", "query output: json (compact aggregates in MCP), legacy, or folded (flame graph stacks)")
 	foldedStack := queryFlags.String("folded-stack", 0, "user.stack", "stack grouping to export: user.stack or kernel.stack")
@@ -292,7 +299,7 @@ func run(args []string) error {
 		return writeQueryResult(ctx, os.Stdout, snapshot, filter)
 	}, mflags.WithUsage("Query server state or aggregates, with optional client-side jq processing")))
 	capabilityFlags := mflags.NewFlagSet("capabilities")
-	capabilityOptions := clientConnectionFlags(capabilityFlags)
+	capabilityOptions := clientConnectionFlags(capabilityFlags, transport)
 	dispatcher.Dispatch("capabilities", mflags.NewCommand(capabilityFlags, func(_ *mflags.FlagSet, _ []string) error {
 		docs, err := capabilityOptions().Capabilities(ctx)
 		if err != nil {

@@ -18,8 +18,6 @@ import (
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
-	"github.com/tmc/go-iroh/key"
-	"github.com/tmc/go-iroh/netaddr"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -735,8 +733,8 @@ func (c Client) Monitor(ctx context.Context, request MonitorRequest, onEvent fun
 	if onEvent == nil {
 		return errors.New("event callback required")
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (struct{}, error) {
-		return struct{}{}, monitorRemote(ctx, ep, reg, signer, cert, request, onEvent)
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (struct{}, error) {
+		return struct{}{}, monitorRemote(ctx, ep, reg, signer, cert, request, onEvent, conn)
 	})
 	return err
 }
@@ -753,36 +751,32 @@ func (c Client) Query(ctx context.Context, request MonitorRequest) (Snapshot, er
 	if err := request.validate(); err != nil {
 		return Snapshot{}, err
 	}
-	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (Snapshot, error) {
-		return monitorRequestRemote(ctx, ep, reg, signer, cert, request, nil)
+	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (Snapshot, error) {
+		return monitorRequestRemote(ctx, ep, reg, signer, cert, request, nil, conn)
 	})
 }
 
-func monitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, request MonitorRequest, onEvent func(Event) error) error {
-	_, err := monitorRequestRemote(ctx, ep, reg, signer, cert, request, onEvent)
+func monitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, request MonitorRequest, onEvent func(Event) error, existing ...*iroh.Conn) error {
+	_, err := monitorRequestRemote(ctx, ep, reg, signer, cert, request, onEvent, existing...)
 	return err
 }
 
-func monitorRequestRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, request MonitorRequest, onEvent func(Event) error) (Snapshot, error) {
-	id, err := key.ParseEndpointID(reg.EndpointID)
+func monitorRequestRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, request MonitorRequest, onEvent func(Event) error, existing ...*iroh.Conn) (Snapshot, error) {
+	conn, release, err := remoteConnection(ctx, ep, reg, existing)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	relayURL, err := netaddr.ParseRelayURL(reg.RelayURL)
-	if err != nil || relayURL.URL().Host == "" {
-		return Snapshot{}, errors.New("invalid relay URL in inventory")
-	}
-	conn, err := ep.Connect(ctx, netaddr.NewEndpointAddr(id).WithRelayURL(relayURL), alpn)
-	if err != nil {
-		return Snapshot{}, err
-	}
-	defer conn.CloseWithError(0, "")
+	defer release()
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	defer stream.Close()
-	stop := context.AfterFunc(ctx, func() { stream.Close() })
+	defer stream.CancelRead(0)
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	})
 	defer stop()
 	stream.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := stream.Write([]byte{2}); err != nil {

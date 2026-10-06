@@ -14,8 +14,6 @@ import (
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
-	"github.com/tmc/go-iroh/key"
-	"github.com/tmc/go-iroh/netaddr"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -57,11 +55,11 @@ func register(ctx context.Context, url, token string, reg registration) error {
 	return nil
 }
 
-func serve(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy) error {
-	return serveWithSource(ctx, ep, auth, policy, monitorEvents)
+func serve(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy, networkDebug ...bool) error {
+	return serveWithSource(ctx, ep, auth, policy, monitorEvents, networkDebug...)
 }
 
-func serveWithSource(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy, source eventSource) error {
+func serveWithSource(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy, source eventSource, networkDebug ...bool) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	store := newMonitorStore(ctx, source)
@@ -75,11 +73,19 @@ func serveWithSource(ctx context.Context, ep *iroh.Endpoint, auth peerAuthentica
 		}
 		go func() {
 			defer conn.CloseWithError(0, "")
-			stream, err := conn.AcceptStream(ctx)
-			if err == nil {
-				handleStream(ctx, stream, auth, policy, source, store)
-			} else {
-				log.Printf("accept stream: %v", err)
+			connectionCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			stop := context.AfterFunc(conn.Context(), cancel)
+			defer stop()
+			if len(networkDebug) != 0 && networkDebug[0] {
+				defer watchConnectionPaths(connectionCtx, conn)()
+			}
+			for {
+				stream, err := conn.AcceptStream(connectionCtx)
+				if err != nil {
+					return
+				}
+				go handleStream(connectionCtx, stream, auth, policy, source, store)
 			}
 		}()
 	}
@@ -137,6 +143,13 @@ func handleCommand(ctx context.Context, stream *iroh.Stream, auth peerAuthentica
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
+	// A pooled connection outlives requests. Cancel only this command when
+	// its client closes the request stream, not commands on sibling streams.
+	go func() {
+		io.Copy(io.Discard, stream)
+		cancel()
+	}()
+	defer stream.CancelRead(0)
 	cmd := exec.CommandContext(cmdCtx, req.Argv[0], req.Argv[1:]...)
 	if req.User != "" {
 		if err := setCommandUser(cmd, account); err != nil {
@@ -203,25 +216,23 @@ func lookup(ctx context.Context, url, name string) (registration, error) {
 	return reg, err
 }
 
-func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, user string, argv []string) (Result, error) {
-	id, err := key.ParseEndpointID(reg.EndpointID)
+func runRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, user string, argv []string, existing ...*iroh.Conn) (Result, error) {
+	conn, release, err := remoteConnection(ctx, ep, reg, existing)
 	if err != nil {
 		return Result{}, err
 	}
-	relayURL, err := netaddr.ParseRelayURL(reg.RelayURL)
-	if err != nil || relayURL.URL().Host == "" {
-		return Result{}, errors.New("invalid relay URL in inventory")
-	}
-	conn, err := ep.Connect(ctx, netaddr.NewEndpointAddr(id).WithRelayURL(relayURL), alpn)
-	if err != nil {
-		return Result{}, err
-	}
-	defer conn.CloseWithError(0, "")
+	defer release()
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return Result{}, err
 	}
 	defer stream.Close()
+	defer stream.CancelRead(0)
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	})
+	defer stop()
 	stream.SetDeadline(time.Now().Add(70 * time.Second))
 	if _, err := stream.Write([]byte{1}); err != nil {
 		return Result{}, err

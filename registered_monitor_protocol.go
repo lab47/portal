@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/tmc/go-iroh/iroh"
-	"github.com/tmc/go-iroh/key"
-	"github.com/tmc/go-iroh/netaddr"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -200,8 +198,8 @@ func (c Client) CreateMonitor(ctx context.Context, request MonitorRequest, ttl .
 	if request.Mode != "" {
 		return "", errors.New("registered monitors require event mode")
 	}
-	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
-		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "create", Request: &request, TTL: lifetime}, nil)
+	return withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (string, error) {
+		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "create", Request: &request, TTL: lifetime}, nil, conn)
 	})
 }
 
@@ -212,8 +210,8 @@ func (c Client) ReadMonitor(ctx context.Context, id string, after uint64, onReco
 	if len(id) != 32 || onRecord == nil {
 		return errors.New("monitor ID and record callback required")
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
-		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "read", ID: id, After: after}, onRecord)
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (string, error) {
+		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "read", ID: id, After: after}, onRecord, conn)
 	})
 	return err
 }
@@ -228,8 +226,8 @@ func (c Client) ReadMonitorSince(ctx context.Context, id, timestamp string, onRe
 	if err := validateTAI64N(timestamp); err != nil {
 		return err
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
-		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "read", ID: id, AfterTimestamp: timestamp}, onRecord)
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (string, error) {
+		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "read", ID: id, AfterTimestamp: timestamp}, onRecord, conn)
 	})
 	return err
 }
@@ -239,32 +237,28 @@ func (c Client) DeleteMonitor(ctx context.Context, id string) error {
 	if len(id) != 32 {
 		return errors.New("monitor ID required")
 	}
-	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey) (string, error) {
-		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "delete", ID: id}, nil)
+	_, err := withClient(c, ctx, func(ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, conn *iroh.Conn) (string, error) {
+		return registeredMonitorRemote(ctx, ep, reg, signer, cert, monitorAction{Action: "delete", ID: id}, nil, conn)
 	})
 	return err
 }
 
-func registeredMonitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, action monitorAction, onRecord func(MonitorRecord) error) (string, error) {
-	id, err := key.ParseEndpointID(reg.EndpointID)
+func registeredMonitorRemote(ctx context.Context, ep *iroh.Endpoint, reg registration, signer ssh.Signer, cert ssh.PublicKey, action monitorAction, onRecord func(MonitorRecord) error, existing ...*iroh.Conn) (string, error) {
+	conn, release, err := remoteConnection(ctx, ep, reg, existing)
 	if err != nil {
 		return "", err
 	}
-	relayURL, err := netaddr.ParseRelayURL(reg.RelayURL)
-	if err != nil || relayURL.URL().Host == "" {
-		return "", errors.New("invalid relay URL in inventory")
-	}
-	conn, err := ep.Connect(ctx, netaddr.NewEndpointAddr(id).WithRelayURL(relayURL), alpn)
-	if err != nil {
-		return "", err
-	}
-	defer conn.CloseWithError(0, "")
+	defer release()
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer stream.Close()
-	stop := context.AfterFunc(ctx, func() { stream.Close() })
+	defer stream.CancelRead(0)
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	})
 	defer stop()
 	stream.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := stream.Write([]byte{3}); err != nil {
