@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lab47/portal/query"
 	"github.com/tmc/go-iroh/iroh"
 	"github.com/tmc/go-iroh/netaddr"
 	"github.com/tmc/go-iroh/relay"
@@ -72,7 +73,7 @@ func TestMonitorProofAndFilters(t *testing.T) {
 		{Event{PID: 43, Syscall: 9}, false},
 		{Event{PID: 42, Syscall: 8}, false},
 	} {
-		if got := request.matches(tc.event); got != tc.want {
+		if got := request.Matches(tc.event); got != tc.want {
 			t.Fatalf("matches(%+v) = %v, want %v", tc.event, got, tc.want)
 		}
 	}
@@ -82,7 +83,7 @@ func TestMonitorProofAndFilters(t *testing.T) {
 		{Source: "process", Mode: "unknown"}, {Source: "process", Mode: "snapshot", Process: &ProcessFilter{Action: "start"}},
 		{Source: "network", Mode: "snapshot", PID: 1}, {Source: "gpu", Mode: "snapshot", Name: "*"},
 	} {
-		if err := bad.validate(); err == nil {
+		if err := bad.Validate(); err == nil {
 			t.Fatalf("accepted %+v", bad)
 		}
 	}
@@ -121,10 +122,13 @@ func TestScriptValidationAuthorizationAndProof(t *testing.T) {
 		}
 		mutate(&bad)
 		called := false
-		_, err := aggregateScript(context.Background(), bad, func(context.Context, MonitorRequest, func(Event) error) error {
-			called = true
-			return errors.New("unexpected collection")
-		}, nil)
+		err := bad.Validate()
+		if err == nil {
+			_, err = (query.Engine{Events: func(context.Context, MonitorRequest, func(Event) error) error {
+				called = true
+				return errors.New("unexpected collection")
+			}}).Query(context.Background(), bad)
+		}
 		if err == nil || called {
 			t.Fatalf("invalid script reached collection: %+v, %v", bad, err)
 		}
@@ -200,7 +204,7 @@ func TestMonitorStream(t *testing.T) {
 	ca, signer := testSigner(t), testSigner(t)
 	cert := testCertificate(t, signer, ca, "operator", "admin", time.Now().Add(time.Hour))
 	allowed := policy{"operator": {fmt.Sprint(os.Geteuid()): true}}
-	stopped := make(chan struct{}, maxScriptProbes)
+	stopped := make(chan struct{}, 8)
 	source := func(ctx context.Context, request MonitorRequest, emit func(Event) error) error {
 		if request.PID == 99 || request.Source == "packets" || request.Source == "disk" {
 			return errors.New("eBPF unavailable")
@@ -444,17 +448,16 @@ process:start { @starts[] = count() } after 50ms { emit @starts; emit @calls }`)
 			t.Fatal("numeric aggregation parameters were not signed")
 		}
 	}
-	current, err := snapshotProcesses(ctx)
+	current, err := (query.Engine{}).Query(ctx, MonitorRequest{Source: "process", PID: uint32(os.Getpid())})
 	if err != nil {
 		t.Fatal(err)
 	}
-	self := current[uint32(os.Getpid())]
-	if self.name == "" {
+	if len(current.Processes) != 1 || current.Processes[0].Name == "" {
 		t.Fatal("current test process not visible")
 	}
-	snapshotRequest := MonitorRequest{Source: "process", Mode: "snapshot", PID: uint32(os.Getpid()), Process: &ProcessFilter{Name: self.name}}
+	snapshotRequest := MonitorRequest{Source: "process", Mode: "snapshot", PID: uint32(os.Getpid()), Process: &ProcessFilter{Name: current.Processes[0].Name}}
 	snapshot, err := monitorRequestRemote(ctx, client, reg, signer, cert, snapshotRequest, nil)
-	if err != nil || len(snapshot.Processes) != 1 || snapshot.Processes[0].PID != uint32(os.Getpid()) || snapshot.Processes[0].Name != self.name || snapshot.Processes[0].Started.IsZero() || snapshot.Time.IsZero() {
+	if err != nil || len(snapshot.Processes) != 1 || snapshot.Processes[0].PID != uint32(os.Getpid()) || snapshot.Processes[0].Name != current.Processes[0].Name || snapshot.Processes[0].Started.IsZero() || snapshot.Time.IsZero() {
 		t.Fatalf("filtered snapshot: %+v, %v", snapshot, err)
 	}
 	snapshotRequest.Process.Name = "no-such-process-name-xyz"
@@ -462,7 +465,7 @@ process:start { @starts[] = count() } after 50ms { emit @starts; emit @calls }`)
 	if err != nil || snapshot.Processes == nil || len(snapshot.Processes) != 0 {
 		t.Fatalf("empty snapshot: %+v, %v", snapshot, err)
 	}
-	snapshotRequest.Process.Name = self.name
+	snapshotRequest.Process.Name = current.Processes[0].Name
 	for _, source := range []string{"memory", "network", "cpu", "kernel"} {
 		got, err := monitorRequestRemote(ctx, client, reg, signer, cert, MonitorRequest{Source: source, Mode: "snapshot"}, nil)
 		if err != nil || got.Source != source || got.Time.IsZero() {
@@ -537,9 +540,9 @@ process:start { @starts[] = count() } after 50ms { emit @starts; emit @calls }`)
 		} else if got, err := monitorRequestRemote(ctx, client, reg, signer, cert, r, nil); err != nil || got.Symbols == nil || len(got.Symbols.Symbols) != 1 || got.Symbols.Symbols[0].Name != "github.com/lab47/portal.TestMonitorStream" {
 			t.Fatalf("remote process symbol name lookup: %+v, %v", got.Symbols, err)
 		}
-		if _, err := readCgroups(ctx, "/"); err == nil {
-			for _, query := range []string{"cgroups where path = /", "cgroups where path = / avg(cpu_percent) over 300ms every 100ms by path"} {
-				r, err := ParseMonitorQuery(query)
+		if _, err := (query.Engine{}).Query(ctx, MonitorRequest{Source: "cgroups", Path: "/"}); err == nil {
+			for _, text := range []string{"cgroups where path = /", "cgroups where path = / avg(cpu_percent) over 300ms every 100ms by path"} {
+				r, err := ParseMonitorQuery(text)
 				if err != nil {
 					t.Fatal(err)
 				}

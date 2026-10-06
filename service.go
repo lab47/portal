@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/lab47/portal/query"
 	"github.com/tmc/go-iroh/iroh"
 	"golang.org/x/crypto/ssh"
 )
@@ -56,7 +57,7 @@ func register(ctx context.Context, url, token string, reg registration) error {
 }
 
 func serve(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy, networkDebug ...bool) error {
-	return serveWithSource(ctx, ep, auth, policy, monitorEvents, networkDebug...)
+	return serveWithSource(ctx, ep, auth, policy, query.CollectEvents, networkDebug...)
 }
 
 func serveWithSource(ctx context.Context, ep *iroh.Endpoint, auth peerAuthenticator, policy policy, source eventSource, networkDebug ...bool) error {

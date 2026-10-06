@@ -39,7 +39,7 @@ type registeredMonitorFrame struct {
 
 func authorizeMonitorRequest(p policy, identity string, request MonitorRequest) error {
 	if request.Source == "script" {
-		if err := request.validate(); err != nil {
+		if err := request.Validate(); err != nil {
 			return err
 		}
 		for _, probe := range request.Probes {
@@ -192,7 +192,7 @@ func (c Client) CreateMonitor(ctx context.Context, request MonitorRequest, ttl .
 	if err != nil {
 		return "", err
 	}
-	if err := request.validate(); err != nil {
+	if err := request.Validate(); err != nil {
 		return "", err
 	}
 	if request.Mode != "" {

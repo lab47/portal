@@ -88,12 +88,16 @@ func TestCapabilityReference(t *testing.T) {
 				r.Tracepoint = &TracepointFilter{Event: "custom:sample", Fields: []string{"NAME"}}
 			}
 			for _, f := range source.GroupByFields {
-				if err := (AggregationRequest{Window: 2 * time.Second, GroupBy: []string{f}}).validate(r); err != nil {
+				r.Mode = "aggregate"
+				r.Aggregation = &AggregationRequest{Window: 2 * time.Second, GroupBy: []string{f}}
+				if err := r.Validate(); err != nil {
 					t.Fatalf("documented group field %s.%s is rejected: %v", source.Name, f, err)
 				}
 			}
 			for _, f := range source.NumericFields {
-				if err := (AggregationRequest{Window: 2 * time.Second, Function: "sum", Field: f}).validate(r); err != nil {
+				r.Mode = "aggregate"
+				r.Aggregation = &AggregationRequest{Window: 2 * time.Second, Function: "sum", Field: f}
+				if err := r.Validate(); err != nil {
 					t.Fatalf("documented numeric field %s.%s is rejected: %v", source.Name, f, err)
 				}
 			}
@@ -158,8 +162,19 @@ func TestCapabilityReference(t *testing.T) {
 			t.Fatalf("accepted invalid capability query %q", query)
 		}
 	}
-	if err := (MonitorRequest{Source: "capabilities"}).validate(); err == nil {
+	if err := (MonitorRequest{Source: "capabilities"}).Validate(); err == nil {
 		t.Fatal("capabilities must not attach an event monitor")
+	}
+}
+
+func TestIOCapabilities(t *testing.T) {
+	for _, source := range describeCapabilities(policy{}, "").Sources {
+		if source.Name == "disk" && !slices.Contains(source.NumericFields, "duration_ns") {
+			t.Fatal("disk latency undiscoverable")
+		}
+		if source.Name == "syscalls" && !slices.Contains(source.GroupByFields, "file.path") {
+			t.Fatal("paths undiscoverable")
+		}
 	}
 }
 

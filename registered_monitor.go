@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/lab47/portal/query"
 )
 
 const monitorRingSize = 1024
@@ -65,7 +67,7 @@ func (m *registeredMonitor) notify() {
 }
 
 func (m *registeredMonitor) append(event Event) error {
-	if !m.request.matches(event) {
+	if !m.request.Matches(event) {
 		return nil
 	}
 	m.mu.Lock()
@@ -193,13 +195,13 @@ func (s *monitorStore) create(owner string, request MonitorRequest, ttl ...time.
 	if err != nil {
 		return "", err
 	}
-	if err := request.validate(); err != nil {
+	if err := request.Validate(); err != nil {
 		return "", err
 	}
 	if request.Mode != "" {
 		return "", errors.New("registered monitors require event mode")
 	}
-	request, err = resolveSyscallNames(request, runtime.GOARCH)
+	request, err = query.ResolveSyscallNames(request, runtime.GOARCH)
 	if err != nil {
 		return "", err
 	}

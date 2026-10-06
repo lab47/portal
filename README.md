@@ -6,6 +6,36 @@ Requires outbound access to an iroh relay from both server and client. Inventory
 
 The importable `github.com/lab47/portal` package exposes `NewCoordinator(token)` as an HTTP handler, `Server.Serve(ctx)` for registration and command serving, and `Client.Run(ctx, argv)` for lookup and execution. `Client.Run` returns a `Result` containing output and remote exit status; the CLI in `cmd/portal` uses `miren.dev/mflags` for subcommands and flags. Use `--` before the remote command to pass flag-like arguments through unchanged.
 
+## Standalone query engine
+
+Import `github.com/lab47/portal/query` to use the same DSL, validation,
+collectors, aggregations, and report processing locally, without importing
+Portal's iroh transport or authentication code:
+
+```go
+request, err := query.ParseMonitorQuery("memory")
+if err != nil {
+    return err
+}
+snapshot, err := (query.Engine{}).Query(ctx, request)
+```
+
+The zero-value `query.Engine` uses the built-in local collectors.
+`Engine.Query` executes snapshots, event or sampled aggregates, and scripts;
+`Engine.Monitor` streams matching events until cancellation or a callback error.
+To supply your product's own data, set `Engine.Events` and/or `Engine.Snapshots`
+to callbacks using the shared request/event/snapshot models. Collectors must
+honor context cancellation and propagate callback errors. Event predicates
+are applied by the engine; snapshot collectors apply their source selections.
+
+Local queries run with the calling process's OS privileges. Linux/eBPF and
+other collector requirements still apply; the engine does not authenticate or
+authorize callers, so an embedding product must enforce its own access policy.
+The `capabilities` source remains Portal-specific because its response describes
+the authenticated caller's permissions. Existing `portal.Client.Query`,
+`portal.Client.Monitor`, models, and DSL entry point remain compatible and use
+the extracted engine behind the same signed, authorized protocol.
+
 ## Using existing SSH keys
 
 When no CA is configured, Portal automatically uses ordinary SSH keys instead of

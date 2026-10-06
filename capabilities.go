@@ -8,80 +8,9 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/lab47/portal/query"
 )
-
-// Capabilities is a versioned, server-generated query reference. Authorization
-// is evaluated for the requesting certificate; runtime dependencies are not probed.
-type Capabilities struct {
-	Version     int                   `json:"version"`
-	OS          string                `json:"os"`
-	Arch        string                `json:"arch"`
-	Syntax      string                `json:"syntax"`
-	Notes       []string              `json:"notes"`
-	Sources     []SourceCapability    `json:"sources"`
-	Aggregates  []AggregateCapability `json:"aggregates"`
-	Limits      CapabilityLimits      `json:"limits"`
-	EventFields []FieldCapability     `json:"event_fields"`
-}
-
-type SourceCapability struct {
-	Name              string              `json:"name"`
-	Description       string              `json:"description"`
-	Modes             []string            `json:"modes"` // events, snapshot, aggregate
-	PlatformSupported bool                `json:"platform_supported"`
-	Authorized        bool                `json:"authorized"`
-	UnavailableReason string              `json:"unavailable_reason,omitempty"`
-	Requirements      []string            `json:"requirements"`
-	Fields            []FieldCapability   `json:"fields"`
-	Filters           []FilterCapability  `json:"filters"`
-	GroupByFields     []string            `json:"group_by_fields"`
-	NumericFields     []string            `json:"numeric_fields"`
-	Examples          []string            `json:"examples"`
-	Sampling          *SamplingCapability `json:"sampling,omitempty"`
-}
-
-// FieldCapability describes an output JSON path, not necessarily a DSL field.
-type FieldCapability struct {
-	Path         string `json:"path"`
-	Type         string `json:"type"`
-	QueryField   string `json:"query_field,omitempty"` // DSL alias when filterable/groupable.
-	Optional     bool   `json:"optional,omitempty"`
-	Unit         string `json:"unit,omitempty"`
-	Description  string `json:"description,omitempty"`
-	Aggregatable bool   `json:"aggregatable"` // At least one field-taking aggregate; numeric_fields/semantics constrain which.
-}
-
-type FilterCapability struct {
-	Field       string   `json:"field"`
-	Type        string   `json:"type"`
-	Operators   []string `json:"operators"`
-	Values      []string `json:"values,omitempty"`
-	Modes       []string `json:"modes"`
-	Description string   `json:"description"`
-}
-
-type AggregateCapability struct {
-	Name        string `json:"name"`
-	Syntax      string `json:"syntax"`
-	FieldType   string `json:"field_type"` // none, scalar, number (event metrics remain integers)
-	Description string `json:"description"`
-}
-
-type CapabilityLimits struct {
-	QueryBytes              int    `json:"query_bytes"`
-	MaxWindow               string `json:"max_window"`
-	GroupByFields           int    `json:"group_by_fields"`
-	Groups                  int    `json:"groups"`
-	RetainedAggregateValues int    `json:"retained_aggregate_values"`
-	AggregateMetrics        int    `json:"aggregate_metrics"`
-	TracepointFields        int    `json:"tracepoint_fields"`
-	SyscallFilters          int    `json:"syscall_filters"`
-	PacketCaptureBytes      int    `json:"packet_capture_bytes"`
-	DefaultMonitorTTL       string `json:"default_monitor_ttl"`
-	RegisteredMonitors      int    `json:"registered_monitors"`
-	MonitorRingEvents       int    `json:"monitor_ring_events"`
-	MonitorEventBytes       int    `json:"monitor_event_bytes"`
-}
 
 // Capabilities requests the server's reference using the signed query protocol.
 func (c Client) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -183,9 +112,9 @@ func describeCapabilities(p policy, identity string) Capabilities {
 	}
 	for i := range sources {
 		s := &sources[i]
-		if _, ok := sampledSources[s.Name]; ok {
-			groups, numeric := sampledFields(s.Name)
-			s.Sampling = &SamplingCapability{DefaultInterval: DefaultSampleInterval.String(), MinInterval: MinSampleInterval.String(), Fields: snapshotSampleFields(s.Name), GroupByFields: groups, NumericFields: numeric}
+		metadata, _ := query.Metadata(MonitorRequest{Source: s.Name})
+		if metadata.Sampled {
+			s.Sampling = &SamplingCapability{DefaultInterval: metadata.DefaultInterval, MinInterval: metadata.MinimumInterval, Fields: metadata.SampleFields, GroupByFields: metadata.SampleGroupByFields, NumericFields: metadata.SampleNumericFields}
 			if !slices.Contains(s.Modes, "aggregate") {
 				s.Modes = append(append([]string{}, s.Modes...), "aggregate")
 			}
@@ -223,7 +152,7 @@ func describeCapabilities(p policy, identity string) Capabilities {
 		if s.Filters == nil {
 			s.Filters = []FilterCapability{}
 		}
-		if sampledAggregation(MonitorRequest{Source: s.Name}) {
+		if metadata.Sampled && s.Name != "process" {
 			for j := range s.Filters {
 				s.Filters[j].Modes = []string{"snapshot", "aggregate"}
 			}
@@ -258,7 +187,8 @@ func describeCapabilities(p policy, identity string) Capabilities {
 				r.Phase = "completion"
 			}
 			r.Paths = s.Name == "syscalls"
-			s.GroupByFields, s.NumericFields, _ = aggregateFields(r)
+			fields, _ := query.Metadata(r)
+			s.GroupByFields, s.NumericFields = fields.GroupByFields, fields.NumericFields
 		} else {
 			s.GroupByFields = append(s.GroupByFields, "pid", "tid", "name", "process_name", "name_group", "cgroup.path")
 			s.NumericFields = append(s.NumericFields, "pid", "tid")
@@ -437,17 +367,17 @@ func describeCapabilities(p policy, identity string) Capabilities {
 		},
 		Sources: sources,
 		Aggregates: []AggregateCapability{
-			{"count", "count over DURATION [every INTERVAL] [by FIELD, ...]", "none", "Number of matching events or observed snapshot records; no field argument."},
-			{"sum", "sum(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Sum; integers remain exact, decimal results round to 18 places. Empty ungrouped window returns 0."},
-			{"avg", "avg(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Arithmetic sample mean rounded to 18 decimal places, not time-weighted; empty ungrouped window returns null."},
-			{"min", "min(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Minimum; empty ungrouped window returns null."},
-			{"max", "max(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Maximum; empty ungrouped window returns null."},
-			{"count_distinct", "count_distinct(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "scalar", "Exact distinct count of any groupable field, including strings; empty ungrouped window returns 0."},
-			{"percentile", "percentile(FIELD, PERCENT) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Exact nearest-rank percentile of samples; finite PERCENT from 0 to 100 inclusive; empty ungrouped window returns null."},
-			{"hist", "hist(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", "number", "Log-scale histogram with four equal sub-buckets per power-of-two range; exact lower-inclusive/upper-exclusive native-unit bounds. Returns count, zero_count and sorted occupied buckets. Supports signed/fractional values; empty ungrouped histogram has zero count and no buckets. Each occupied bucket uses one retained-value slot. Sort/limit by a numeric sibling metric, not the histogram."},
-			{"rate", "rate(COUNTER) over DURATION [every INTERVAL] [by FIELD, ...]", "counter", "Sampled cumulative counters only. Sum of valid counter deltas divided by union of observed interval seconds within each group; sums concurrent counters, not averages. Requires at least two consecutive observations; skips resets, identity changes, missing counters and changing cgroup I/O device sets. Empty/unobserved rate is null; no extrapolation to window edges. Units are counter units/second."},
+			{Name: "count", Syntax: "count over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "none", Description: "Number of matching events or observed snapshot records; no field argument."},
+			{Name: "sum", Syntax: "sum(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "number", Description: "Sum; integers remain exact, decimal results round to 18 places. Empty ungrouped window returns 0."},
+			{Name: "avg", Syntax: "avg(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "number", Description: "Arithmetic sample mean rounded to 18 decimal places, not time-weighted; empty ungrouped window returns null."},
+			{Name: "min", Syntax: "min(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "number", Description: "Minimum; empty ungrouped window returns null."},
+			{Name: "max", Syntax: "max(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "number", Description: "Maximum; empty ungrouped window returns null."},
+			{Name: "count_distinct", Syntax: "count_distinct(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "scalar", Description: "Exact distinct count of any groupable field, including strings; empty ungrouped window returns 0."},
+			{Name: "percentile", Syntax: "percentile(FIELD, PERCENT) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "number", Description: "Exact nearest-rank percentile of samples; finite PERCENT from 0 to 100 inclusive; empty ungrouped window returns null."},
+			{Name: "hist", Syntax: "hist(FIELD) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "number", Description: "Log-scale histogram with four equal sub-buckets per power-of-two range; exact lower-inclusive/upper-exclusive native-unit bounds. Returns count, zero_count and sorted occupied buckets. Supports signed/fractional values; empty ungrouped histogram has zero count and no buckets. Each occupied bucket uses one retained-value slot. Sort/limit by a numeric sibling metric, not the histogram."},
+			{Name: "rate", Syntax: "rate(COUNTER) over DURATION [every INTERVAL] [by FIELD, ...]", FieldType: "counter", Description: "Sampled cumulative counters only. Sum of valid counter deltas divided by union of observed interval seconds within each group; sums concurrent counters, not averages. Requires at least two consecutive observations; skips resets, identity changes, missing counters and changing cgroup I/O device sets. Empty/unobserved rate is null; no extrapolation to window edges. Units are counter units/second."},
 		},
-		Limits:      CapabilityLimits{QueryBytes: 4096, MaxWindow: "1h", GroupByFields: 4, Groups: maxAggregateGroups, RetainedAggregateValues: maxAggregateValues, AggregateMetrics: maxAggregateMetrics, TracepointFields: 16, SyscallFilters: 256, PacketCaptureBytes: 2048, DefaultMonitorTTL: DefaultMonitorTTL.String(), RegisteredMonitors: maxRegisteredMonitors, MonitorRingEvents: monitorRingSize, MonitorEventBytes: maxMonitorEventSize},
+		Limits:      CapabilityLimits{QueryBytes: 4096, MaxWindow: "1h", GroupByFields: 4, Groups: query.MaxAggregateGroups, RetainedAggregateValues: query.MaxAggregateValues, AggregateMetrics: query.MaxAggregateMetrics, TracepointFields: 16, SyscallFilters: 256, PacketCaptureBytes: 2048, DefaultMonitorTTL: DefaultMonitorTTL.String(), RegisteredMonitors: maxRegisteredMonitors, MonitorRingEvents: monitorRingSize, MonitorEventBytes: maxMonitorEventSize},
 		EventFields: []FieldCapability{{Path: "time", Type: "timestamp", Description: "UTC receipt time"}, {Path: "tai64n", Type: "string", Description: "TAI64N timestamp/cursor for resuming monitor reads"}},
 	}
 }

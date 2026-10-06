@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/lab47/portal/query"
 )
 
 func TestSymbolicSyscallQueries(t *testing.T) {
@@ -33,7 +35,7 @@ func TestSymbolicSyscallQueries(t *testing.T) {
 		{Source: "syscalls", SyscallNames: []string{":fsync"}},
 		{Source: "syscalls", Syscalls: make([]int, 256), SyscallNames: []string{"fsync"}},
 	} {
-		if err := r.validate(); err == nil {
+		if err := r.Validate(); err == nil {
 			t.Fatalf("accepted invalid request: %+v", r)
 		}
 	}
@@ -50,11 +52,11 @@ func TestResolveSyscallNamesServerArchitecture(t *testing.T) {
 		{"386", []int{0, 118, 148}},
 		{"arm", []int{0, 118, 148}},
 	} {
-		got, err := resolveSyscallNames(request, tc.arch)
+		got, err := query.ResolveSyscallNames(request, tc.arch)
 		if err != nil || !reflect.DeepEqual(got.Syscalls, tc.ids) || len(got.SyscallNames) != 0 {
 			t.Fatalf("%s: %+v, %v", tc.arch, got, err)
 		}
-		if !got.matches(Event{Syscall: tc.ids[1]}) || got.matches(Event{Syscall: 999}) {
+		if !got.Matches(Event{Syscall: tc.ids[1]}) || got.Matches(Event{Syscall: 999}) {
 			t.Fatalf("resolved selection failed: %+v", got)
 		}
 	}
@@ -64,13 +66,13 @@ func TestResolveSyscallNamesServerArchitecture(t *testing.T) {
 	for _, tc := range []struct{ arch, name string }{
 		{"amd64", "not_a_syscall"}, {"arm64", "open"}, {"riscv64", "fsync"},
 	} {
-		_, err := resolveSyscallNames(MonitorRequest{Source: "syscalls", SyscallNames: []string{tc.name}}, tc.arch)
+		_, err := query.ResolveSyscallNames(MonitorRequest{Source: "syscalls", SyscallNames: []string{tc.name}}, tc.arch)
 		if err == nil || !strings.Contains(err.Error(), tc.arch) {
 			t.Fatalf("unsupported name/arch not rejected: %+v, %v", tc, err)
 		}
 	}
 	// Numeric-only queries remain available even without a name table.
-	if _, err := resolveSyscallNames(MonitorRequest{Source: "syscalls", Syscalls: []int{1}}, "riscv64"); err != nil {
+	if _, err := query.ResolveSyscallNames(MonitorRequest{Source: "syscalls", Syscalls: []int{1}}, "riscv64"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -103,7 +105,7 @@ func TestRegisteredMonitorResolvesSyscallNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !m.request.matches(Event{Syscall: 74}) || m.request.matches(Event{Syscall: 75}) {
+	if !m.request.Matches(Event{Syscall: 74}) || m.request.Matches(Event{Syscall: 75}) {
 		t.Fatal("registered monitor retained unresolved userspace filter")
 	}
 	if _, err := store.create("owner", MonitorRequest{Source: "syscalls", SyscallNames: []string{"not_a_syscall"}}); err == nil {
