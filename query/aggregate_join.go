@@ -26,7 +26,7 @@ type AggregateReport struct {
 	Ascending   bool                      `json:"ascending,omitempty"`
 }
 
-func compileJoinedScript(script probeScript) (MonitorRequest, error) {
+func compileJoinedScript(script probeScript, sources map[string]CustomSource) (MonitorRequest, error) {
 	if len(script.probes) > maxScriptProbes {
 		return MonitorRequest{}, errors.New("scripts support at most 8 selectors")
 	}
@@ -95,7 +95,7 @@ func compileJoinedScript(script probeScript) (MonitorRequest, error) {
 		}
 		probe.reports = slices.Clone(timing)
 		probe.reports[0].table, probe.reports[0].clear = table, periodic
-		selection, err := compileProbe(probe)
+		selection, err := compileProbe(probe, sources)
 		if err != nil {
 			return MonitorRequest{}, fmt.Errorf("selector %s: %w", probe.selector, err)
 		}

@@ -17,25 +17,52 @@ type SnapshotSource func(context.Context, MonitorRequest) (Snapshot, error)
 type Engine struct {
 	Events    EventSource
 	Snapshots SnapshotSource
+	Sources   map[string]CustomSource // engine-local names; built-in names are reserved
 }
 
 func (e Engine) eventSource() EventSource {
-	if e.Events != nil {
-		return e.Events
+	return func(ctx context.Context, r MonitorRequest, emit func(Event) error) error {
+		if r.customSource != nil {
+			return r.customSource.Events(ctx, r, emit)
+		}
+		if e.Events != nil {
+			return e.Events(ctx, r, emit)
+		}
+		return CollectEvents(ctx, r, emit)
 	}
-	return CollectEvents
 }
 
 func (e Engine) snapshotSource() SnapshotSource {
-	if e.Snapshots != nil {
-		return e.Snapshots
+	return func(ctx context.Context, r MonitorRequest) (Snapshot, error) {
+		if r.customSource != nil {
+			return r.customSource.Snapshots(ctx, r)
+		}
+		if e.Snapshots != nil {
+			return e.Snapshots(ctx, r)
+		}
+		return querySnapshot(ctx, r)
 	}
-	return querySnapshot
+}
+
+// ParseMonitorQuery compiles the DSL with this engine's custom sources.
+func (e Engine) ParseMonitorQuery(text string) (MonitorRequest, error) {
+	return parseMonitorQuery(text, e.Sources)
+}
+
+// Validate validates a request against this engine's registered sources.
+func (e Engine) Validate(request MonitorRequest) error {
+	return e.bindSources(request).Validate()
+}
+
+// Metadata returns field metadata including this engine's custom sources.
+func (e Engine) Metadata(request MonitorRequest) (SourceMetadata, error) {
+	return Metadata(e.bindSources(request))
 }
 
 // Query normalizes query mode, resolves syscall names for the native ABI, and
 // dispatches snapshots, sampled aggregates, and event aggregates.
 func (e Engine) Query(ctx context.Context, request MonitorRequest) (Snapshot, error) {
+	request = e.bindSources(request)
 	if request.Mode != "aggregate" {
 		request.Mode = "snapshot"
 	}
@@ -63,6 +90,7 @@ func (e Engine) Query(ctx context.Context, request MonitorRequest) (Snapshot, er
 
 // Monitor validates and streams filtered, timestamped events.
 func (e Engine) Monitor(ctx context.Context, request MonitorRequest, onEvent func(Event) error) error {
+	request = e.bindSources(request)
 	if request.Mode != "" {
 		return errors.New("use Engine.Query for query modes")
 	}

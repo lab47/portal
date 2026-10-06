@@ -253,7 +253,7 @@ func newProbeGrammar() p.Rule {
 	})
 }
 
-func parseProbeQuery(text string) (MonitorRequest, error) {
+func parseProbeQuery(text string, sources map[string]CustomSource) (MonitorRequest, error) {
 	v, ok, err := p.New().Parse(probeGrammar, text, p.WithErrors())
 	if err != nil {
 		return MonitorRequest{}, querySyntaxError(err)
@@ -266,7 +266,7 @@ func parseProbeQuery(text string) (MonitorRequest, error) {
 		return MonitorRequest{}, errors.New("reporting requires one after block, optionally preceded by one every block")
 	}
 	if slices.ContainsFunc(script.reports, func(r probeReport) bool { return r.right != "" || len(r.leftRollup) != 0 || len(r.selects) != 0 }) {
-		return compileJoinedScript(script)
+		return compileJoinedScript(script, sources)
 	}
 	for _, report := range script.reports {
 		if len(report.clears) > 1 || len(report.clears) == 1 && (report.stop || report.clears[0] != report.table) {
@@ -275,7 +275,7 @@ func parseProbeQuery(text string) (MonitorRequest, error) {
 	}
 	if len(script.probes) == 1 {
 		script.probes[0].reports = script.reports
-		return compileProbe(script.probes[0])
+		return compileProbe(script.probes[0], sources)
 	}
 	if len(script.probes) > maxScriptProbes {
 		return MonitorRequest{}, fmt.Errorf("scripts support at most %d selectors", maxScriptProbes)
@@ -305,7 +305,7 @@ func parseProbeQuery(text string) (MonitorRequest, error) {
 				}
 			}
 		}
-		selection, err := compileProbe(probe)
+		selection, err := compileProbe(probe, sources)
 		if err != nil {
 			return MonitorRequest{}, fmt.Errorf("selector %s: %w", probe.selector, err)
 		}
@@ -317,7 +317,7 @@ func parseProbeQuery(text string) (MonitorRequest, error) {
 	return r, r.Validate()
 }
 
-func compileProbe(program probeProgram) (MonitorRequest, error) {
+func compileProbe(program probeProgram, sources map[string]CustomSource) (MonitorRequest, error) {
 	parts := strings.Split(program.selector, ":")
 	parsed := parsedMonitorQuery{source: parts[0], conditions: program.conditions, aggregation: &AggregationRequest{Compact: true}}
 	if len(parts) > 1 {
@@ -585,7 +585,7 @@ func compileProbe(program probeProgram) (MonitorRequest, error) {
 	} else if len(program.reports) != 1 || program.reports[0].stop {
 		return MonitorRequest{}, errors.New("one-shot report requires after { emit }")
 	}
-	r, err := compileMonitorQuery(parsed)
+	r, err := compileMonitorQuery(parsed, sources)
 	if err != nil {
 		return MonitorRequest{}, err
 	}

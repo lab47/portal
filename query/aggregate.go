@@ -223,6 +223,9 @@ func (a *AggregationResult) UnmarshalJSON(data []byte) error {
 }
 
 func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
+	if r.customSource != nil {
+		return slices.Clone(r.customSource.Fields), slices.Clone(r.customSource.NumericFields), nil
+	}
 	if sampledAggregation(r) {
 		fields, numeric = sampledFields(r.Source)
 		return
@@ -422,6 +425,9 @@ func (a AggregationRequest) validate(r MonitorRequest) error {
 }
 
 func eventGroupFields(event Event, stacks *StackCapture) map[string]any {
+	if event.Fields != nil {
+		return event.Fields
+	}
 	var fields map[string]any
 	switch {
 	case event.Process != nil:

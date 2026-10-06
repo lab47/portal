@@ -172,15 +172,19 @@ func newMonitorQueryGrammar() p.Rule {
 // "percentile(FIELD, PERCENT) over ..." for a one-shot aggregation query.
 // Comma-separated functions share one window, sampling interval and grouping.
 func ParseMonitorQuery(query string) (MonitorRequest, error) {
+	return parseMonitorQuery(query, nil)
+}
+
+func parseMonitorQuery(query string, sources map[string]CustomSource) (MonitorRequest, error) {
 	if len(query) > 4096 {
 		return MonitorRequest{}, errors.New("monitor query exceeds 4096 bytes")
 	}
 	if strings.Contains(query, "{") {
 		// Quoted braces remain ordinary values in the original DSL.
 		if value, matched, err := p.New().Parse(monitorQueryGrammar, query); err == nil && matched {
-			return compileMonitorQuery(value.(parsedMonitorQuery))
+			return compileMonitorQuery(value.(parsedMonitorQuery), sources)
 		}
-		return parseProbeQuery(query)
+		return parseProbeQuery(query, sources)
 	}
 	value, matched, err := p.New().Parse(monitorQueryGrammar, query, p.WithErrors())
 	if err != nil {
@@ -189,7 +193,7 @@ func ParseMonitorQuery(query string) (MonitorRequest, error) {
 	if !matched {
 		return MonitorRequest{}, errors.New("invalid monitor query")
 	}
-	return compileMonitorQuery(value.(parsedMonitorQuery))
+	return compileMonitorQuery(value.(parsedMonitorQuery), sources)
 }
 
 func querySyntaxError(err error) error {
@@ -221,13 +225,13 @@ func querySyntaxError(err error) error {
 	return fmt.Errorf("line %d, column %d: %s\n  %s\n  %s^", line, column, message, preview, padding)
 }
 
-func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
-	r := MonitorRequest{Source: parsed.source}
+func compileMonitorQuery(parsed parsedMonitorQuery, sources map[string]CustomSource) (MonitorRequest, error) {
+	r := (Engine{Sources: sources}).bindSources(MonitorRequest{Source: parsed.source})
 	if r.Source == "symbols" {
 		r.Mode = "snapshot"
 		r.Symbols = &SymbolRequest{}
 	}
-	if r.Source != "packets" && r.Source != "syscalls" && r.Source != "process" && r.Source != "disk" && r.Source != "tracepoint" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" && r.Source != "symbols" {
+	if !builtInSource(r.Source) && r.customSource == nil {
 		return MonitorRequest{}, fmt.Errorf("unknown monitor source %q", parsed.source)
 	}
 	if r.Source == "cpu" || r.Source == "memory" || r.Source == "network" || r.Source == "kernel" || r.Source == "sensors" || r.Source == "containers" || r.Source == "cgroups" || r.Source == "gpu" || r.Source == "capabilities" {
@@ -236,6 +240,8 @@ func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
 	if parsed.aggregation != nil {
 		r.Mode = "aggregate"
 		r.Aggregation = parsed.aggregation
+	} else if r.customSource != nil && r.customSource.Events == nil {
+		r.Mode = "snapshot"
 	}
 	seen := make(map[string]bool)
 	for _, condition := range parsed.conditions {
@@ -250,6 +256,16 @@ func compileMonitorQuery(parsed parsedMonitorQuery) (MonitorRequest, error) {
 			return MonitorRequest{}, fmt.Errorf("duplicate filter %q", condition.field)
 		}
 		seen[key] = true
+		if r.customSource != nil && strings.HasPrefix(condition.field, "result.") && condition.op == "=" {
+			if err := setQueryFilter(&r, condition.field, condition.values[0]); err != nil {
+				return MonitorRequest{}, err
+			}
+			continue
+		}
+		if r.customSource != nil && (condition.op == "=" || condition.op == "in") {
+			r.Filters = append(r.Filters, SourceFilter{Field: condition.field, Values: condition.values})
+			continue
+		}
 		if condition.op != "=" && condition.op != "in" {
 			if len(condition.values) != 1 {
 				return MonitorRequest{}, errors.New("comparison requires one numeric value")

@@ -40,6 +40,8 @@ type MonitorRequest struct {
 	EventFilters map[string]string   `json:"event_filters,omitempty"` // task-context event strings; AND, exact or one edge glob
 	Comparisons  []NumericComparison `json:"comparisons,omitempty"`   // event numeric predicates; AND, applied before delivery/reduction
 	FileDepth    int                 `json:"file_depth,omitempty"`    // aggregate file.dir prefix depth; zero retains full directory
+	Filters      []SourceFilter      `json:"filters,omitempty"`       // custom-source predicates
+	customSource *CustomSource
 }
 
 // NumericComparison compares an event field to an exact numeric threshold.
@@ -196,6 +198,7 @@ type Snapshot struct {
 	Tables       []Snapshot           `json:"tables,omitempty"`  // multi-selector results in selector order
 	Capabilities *Capabilities        `json:"capabilities,omitempty"`
 	Symbols      *SymbolResult        `json:"symbols,omitempty"`
+	Data         any                  `json:"data,omitempty"` // integration-specific snapshot payload
 }
 
 // MarshalJSON keeps empty collections visible for the selected source while
@@ -302,6 +305,8 @@ type Event struct {
 	Tracepoint  *TracepointEvent `json:"tracepoint,omitempty"`
 	UserStack   *CapturedStack   `json:"user_stack,omitempty"`
 	KernelStack *CapturedStack   `json:"kernel_stack,omitempty"`
+	Data        any              `json:"data,omitempty"`   // integration-specific typed payload
+	Fields      map[string]any   `json:"fields,omitempty"` // flat custom-source query fields
 }
 
 // MarshalJSON keeps syscall number zero visible without putting a spurious
@@ -316,7 +321,7 @@ func (e Event) MarshalJSON() ([]byte, error) {
 			Name string `json:"name"`
 		}{fields(e), e.PID, e.TID, e.Name})
 	}
-	if e.Packet != nil || e.Process != nil || e.Kind == "collection_stats" {
+	if e.Packet != nil || e.Process != nil || e.Kind == "collection_stats" || e.Data != nil || e.Fields != nil {
 		return json.Marshal(fields(e))
 	}
 	return json.Marshal(struct {
@@ -361,6 +366,9 @@ func validateScript(r MonitorRequest) error {
 // Validate checks that the request selects a supported source and that all
 // source-specific filters and controls are internally consistent.
 func (r MonitorRequest) Validate() error {
+	if r.customSource == nil && len(r.Filters) != 0 {
+		return errors.New("custom filters require a registered custom source")
+	}
 	if r.Source == "script" {
 		return validateScript(r)
 	}
@@ -453,6 +461,9 @@ func (r MonitorRequest) Validate() error {
 		}
 	} else if r.Aggregation != nil {
 		return errors.New("aggregation requires aggregate mode")
+	}
+	if r.customSource != nil {
+		return r.validateCustomSource()
 	}
 	if r.Mode == "snapshot" && r.Source != "process" && r.Source != "cpu" && r.Source != "memory" && r.Source != "network" && r.Source != "kernel" && r.Source != "sensors" && r.Source != "containers" && r.Source != "cgroups" && r.Source != "gpu" && r.Source != "capabilities" && r.Source != "symbols" {
 		return errors.New("unsupported snapshot source")
@@ -614,6 +625,15 @@ func (r MonitorRequest) Matches(event Event) bool {
 			}
 		}
 	}
+	if r.customSource != nil {
+		for _, filter := range r.Filters {
+			value, ok := event.Fields[filter.Field]
+			if !ok || !slices.Contains(filter.Values, fmt.Sprint(value)) {
+				return false
+			}
+		}
+		return true
+	}
 	if r.Source == "tracepoint" {
 		if event.Tracepoint == nil || r.Tracepoint == nil || event.Tracepoint.Event != r.Tracepoint.Event {
 			return false
@@ -661,7 +681,7 @@ func (r MonitorRequest) Matches(event Event) bool {
 			(f.SourcePort == 0 || f.SourcePort == p.SourcePort) &&
 			(f.DestinationPort == 0 || f.DestinationPort == p.DestinationPort)
 	}
-	if event.Packet != nil || event.Process != nil || event.Disk != nil || event.Tracepoint != nil {
+	if event.Packet != nil || event.Process != nil || event.Disk != nil || event.Tracepoint != nil || event.Data != nil || event.Fields != nil {
 		return false
 	}
 	if r.PID != 0 && r.PID != event.PID {

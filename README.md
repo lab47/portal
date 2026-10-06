@@ -28,6 +28,76 @@ to callbacks using the shared request/event/snapshot models. Collectors must
 honor context cancellation and propagate callback errors. Event predicates
 are applied by the engine; snapshot collectors apply their source selections.
 
+### Integration-specific sources
+
+Register custom sources in `Engine.Sources` and use `engine.ParseMonitorQuery`
+instead of the package-level parser. Source names and field keys should be
+lowercase DSL identifiers (field keys may contain dots); built-in source names
+and the `result.*` options are reserved. Registries are engine-local, so one
+integration's sources do not affect another engine or Portal's remote API.
+
+```go
+type Job struct {
+    Queue string `json:"queue"`
+    Bytes uint64 `json:"bytes"`
+}
+
+engine := query.Engine{Sources: map[string]query.CustomSource{
+    "jobs": {
+        Fields:        []string{"queue", "bytes"},
+        NumericFields: []string{"bytes"},
+        Events: func(ctx context.Context, r query.MonitorRequest, emit func(query.Event) error) error {
+            for {
+                select {
+                case <-ctx.Done():
+                    return ctx.Err()
+                case job, ok := <-jobs: // integration's channel of Job records
+                    if !ok {
+                        return nil
+                    }
+                    if err := emit(query.Event{
+                        Time: time.Now(),
+                        Data: job,
+                        Fields: map[string]any{"queue": job.Queue, "bytes": job.Bytes},
+                    }); err != nil {
+                        return err
+                    }
+                }
+            }
+        },
+    },
+}}
+
+request, err := engine.ParseMonitorQuery("jobs where queue = fast sum(bytes) over 5s by queue")
+if err != nil {
+    return err
+}
+result, err := engine.Query(ctx, request)
+```
+
+`Event.Data` and `Snapshot.Data` retain your Go types for local callers and
+serialize under `data` in JSON. `Event.Fields` supplies flat field values for
+filtering and aggregation, independently of the payload's structure. Declare
+all queryable fields in `Fields`, and their numeric subset in `NumericFields`.
+Custom events support `=`, `==`, `in`, numeric comparisons, event aggregations,
+and selector/action scripts, including joins and periodic reports. Collectors
+must remain active until cancellation to complete an aggregation window;
+premature termination is an error, as with built-in event sources.
+
+For one-shot custom snapshots, provide `CustomSource.Snapshots` returning a
+`Snapshot` with `Source`, `Time`, and `Data`. Snapshot collectors apply
+`MonitorRequest.Filters` themselves; sampled snapshot aggregation is not
+supported for custom sources. A source can provide both callbacks: the plain
+selector defaults to events when `Events` is present; `Engine.Query` selects
+snapshots unless the request contains an aggregation.
+
+Use `engine.Validate` and `engine.Metadata` for integration-aware validation
+and field discovery. Requests can be constructed directly or serialized to
+JSON; execution binds them to the receiving engine's source registry. Configure
+the registry and field slices before concurrent use, and do not mutate them
+while queries are running. Ordinary `query.ParseMonitorQuery` and the zero-value
+engine continue to support only built-in sources.
+
 Local queries run with the calling process's OS privileges. Linux/eBPF and
 other collector requirements still apply; the engine does not authenticate or
 authorize callers, so an embedding product must enforce its own access policy.
