@@ -53,6 +53,11 @@ func cgroupSnapshot(ctx context.Context, mount, pattern string) ([]CgroupInfo, e
 		if rel != "." {
 			path += filepath.ToSlash(rel)
 		}
+		// Exact selections (including inventory-driven paths) need only their
+		// ancestors, not a walk through every app and descendant in the mount.
+		if pattern != "" && !strings.Contains(pattern, "*") && path != "/" && path != pattern && !strings.HasPrefix(pattern, path+"/") {
+			return filepath.SkipDir
+		}
 		if !processNameMatches(pattern, path) {
 			return nil
 		}
@@ -85,6 +90,9 @@ func cgroupSnapshot(ctx context.Context, mount, pattern string) ([]CgroupInfo, e
 			return errors.New("cgroup snapshot exceeds 4096 groups; narrow the path filter")
 		}
 		result = append(result, info)
+		if pattern == path {
+			return filepath.SkipDir
+		}
 		return nil
 	})
 	if err != nil {

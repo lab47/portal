@@ -19,28 +19,29 @@ import (
 // unrelated filters must be omitted. "script" selects concurrent named aggregates
 // in Probes, with shared timing in Aggregation and no root-level filters.
 type MonitorRequest struct {
-	Source       string              `json:"source"`
-	Mode         string              `json:"mode,omitempty"` // empty for events, "snapshot" or "aggregate" for queries
-	Aggregation  *AggregationRequest `json:"aggregation,omitempty"`
-	Probes       []MonitorRequest    `json:"probes,omitempty"`  // script: independent selections sharing aggregation timing
-	Reports      []AggregateReport   `json:"reports,omitempty"` // script: post-aggregation emits, including joins
-	PID          uint32              `json:"pid,omitempty"`
-	Syscalls     []int               `json:"syscalls,omitempty"`
-	SyscallNames []string            `json:"syscall_names,omitempty"` // resolved against the server's native Linux ABI
-	Phase        string              `json:"phase,omitempty"`         // syscalls/disk: entry (default) or completion
-	Paths        bool                `json:"paths,omitempty"`         // best-effort syscall FD path resolution
-	Packet       *PacketFilter       `json:"packet,omitempty"`
-	Process      *ProcessFilter      `json:"process,omitempty"`
-	Disk         *DiskFilter         `json:"disk,omitempty"`
-	Tracepoint   *TracepointFilter   `json:"tracepoint,omitempty"`
-	Symbols      *SymbolRequest      `json:"symbols,omitempty"`
-	Stacks       *StackCapture       `json:"stacks,omitempty"`
-	Name         string              `json:"name,omitempty"`          // network interface or sensor key (exact or edge glob)
-	Path         string              `json:"path,omitempty"`          // cgroup path relative to the visible v2 mount (exact or edge glob)
-	EventFilters map[string]string   `json:"event_filters,omitempty"` // task-context event strings; AND, exact or one edge glob
-	Comparisons  []NumericComparison `json:"comparisons,omitempty"`   // event numeric predicates; AND, applied before delivery/reduction
-	FileDepth    int                 `json:"file_depth,omitempty"`    // aggregate file.dir prefix depth; zero retains full directory
-	Filters      []SourceFilter      `json:"filters,omitempty"`       // custom-source predicates
+	Source       string               `json:"source"`
+	Mode         string               `json:"mode,omitempty"` // empty for events, "snapshot" or "aggregate" for queries
+	Aggregation  *AggregationRequest  `json:"aggregation,omitempty"`
+	Probes       []MonitorRequest     `json:"probes,omitempty"`  // script: independent selections sharing aggregation timing
+	Reports      []AggregateReport    `json:"reports,omitempty"` // script: post-aggregation emits, including joins
+	PID          uint32               `json:"pid,omitempty"`
+	Syscalls     []int                `json:"syscalls,omitempty"`
+	SyscallNames []string             `json:"syscall_names,omitempty"` // resolved against the server's native Linux ABI
+	Phase        string               `json:"phase,omitempty"`         // syscalls/disk: entry (default) or completion
+	Paths        bool                 `json:"paths,omitempty"`         // best-effort syscall FD path resolution
+	Packet       *PacketFilter        `json:"packet,omitempty"`
+	Process      *ProcessFilter       `json:"process,omitempty"`
+	Disk         *DiskFilter          `json:"disk,omitempty"`
+	Tracepoint   *TracepointFilter    `json:"tracepoint,omitempty"`
+	Symbols      *SymbolRequest       `json:"symbols,omitempty"`
+	Stacks       *StackCapture        `json:"stacks,omitempty"`
+	Name         string               `json:"name,omitempty"`          // network interface or sensor key (exact or edge glob)
+	Path         string               `json:"path,omitempty"`          // cgroup path relative to the visible v2 mount (exact or edge glob)
+	EventFilters map[string]string    `json:"event_filters,omitempty"` // task-context event strings; AND, exact or one edge glob
+	Comparisons  []NumericComparison  `json:"comparisons,omitempty"`   // event numeric predicates; AND, applied before delivery/reduction
+	FileDepth    int                  `json:"file_depth,omitempty"`    // aggregate file.dir prefix depth; zero retains full directory
+	Filters      []SourceFilter       `json:"filters,omitempty"`       // custom-source predicates
+	Using        *SnapshotCorrelation `json:"using,omitempty"`         // frozen inventory selection before snapshot collection
 	customSource *CustomSource
 }
 
@@ -199,6 +200,7 @@ type Snapshot struct {
 	Capabilities *Capabilities        `json:"capabilities,omitempty"`
 	Symbols      *SymbolResult        `json:"symbols,omitempty"`
 	Data         any                  `json:"data,omitempty"` // integration-specific snapshot payload
+	sampleRows   []map[string]any     // engine-owned enriched sampling records
 }
 
 // MarshalJSON keeps empty collections visible for the selected source while
@@ -209,7 +211,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.Aggregation != nil || s.Windows != nil {
+	if s.Aggregation != nil || s.Windows != nil || s.Data != nil {
 		return encoded, nil
 	}
 	var collection string
@@ -366,6 +368,11 @@ func validateScript(r MonitorRequest) error {
 // Validate checks that the request selects a supported source and that all
 // source-specific filters and controls are internally consistent.
 func (r MonitorRequest) Validate() error {
+	if r.Using != nil {
+		if err := r.Using.validate(r); err != nil {
+			return err
+		}
+	}
 	if r.customSource == nil && len(r.Filters) != 0 {
 		return errors.New("custom filters require a registered custom source")
 	}

@@ -732,6 +732,31 @@ Every table must be emitted once per report, and periodic reports must clear eac
 
 Multi-selector results are in `Snapshot.Tables` / JSON `tables`, in selector order. Each entry has its source and either `aggregation` or `windows`, with the table name and named metric objects. Use `.tables[].aggregation` for one-shot results or `.tables[].windows[]` for periodic results; a trailing jq filter such as `.tables[] | {source, result: .aggregation}` works normally. Single-selector and original-DSL results retain their existing shapes. API callers use `MonitorRequest{Source: "script", Mode: "aggregate", Aggregation: sharedTiming, Probes: selections}`: root aggregation contains only `Window`/`ReportEvery`, and each selection is a non-nested named aggregate with matching timing. The entire script is signed; syscall names resolve independently against the server architecture. Update both client and server for multi-selector support.
 
+#### Inventory-driven snapshot selection
+
+An embedded `query.Engine` can use a registered custom snapshot to select and
+attribute built-in metrics in one expression, without an event source for the
+inventory:
+
+```text
+cgroups using (sandboxes where app = "my-app") on path = cgroup
+  where result.format = rows
+  rate(io.write_bytes), rate(io.write_ios) over 10s every 1s by inventory.app
+```
+
+`sandboxes`, `app`, and `cgroup` are example integration-defined names, not Portal
+built-ins. Inventory is frozen once within the finite window; exact matching
+precedes sampling, and inventory fields become `inventory.FIELD` dimensions.
+Multiple disjoint containers contribute to the app's total rate. Duplicate
+identical inventory rows are deduplicated; ambiguous ownership and parent/child
+cgroup selections fail rather than double-count. Without the aggregate suffix,
+the result is attributed lifetime counters in a flat `data` array.
+
+See the [self-contained query engine reference](query/README.md) for compact and
+selector/block examples, API integration, finite-window/rate semantics, missing
+cgroups, cancellation, and collection limits. Completed aggregate joins below
+cannot replace this pre-collection lookup.
+
 #### Joining completed aggregate tables
 
 Join two tables by explicitly named output grouping columns:

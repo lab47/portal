@@ -38,6 +38,7 @@ type probeReport struct {
 type probeProgram struct {
 	selector   string
 	conditions []queryCondition
+	using      *parsedCorrelation
 	statements []probeStatement
 	reports    []probeReport
 }
@@ -228,7 +229,7 @@ func newProbeGrammar() p.Rule {
 		return out
 	})
 	statement := p.Action(p.Seq(p.Named("statement", p.Or(local, table)), p.Maybe(sym(";"))), func(v p.Values) any { return v.Get("statement") })
-	probe := p.Action(p.Seq(p.Named("selector", word), p.Named("where", p.Maybe(conditions)), sym("{"), p.Named("statements", p.Many(statement, 1, -1, func(v []any) any {
+	probe := p.Action(p.Seq(p.Named("selector", word), p.Named("using", p.Maybe(correlationGrammar(token, word, conditions))), p.Named("where", p.Maybe(conditions)), sym("{"), p.Named("statements", p.Many(statement, 1, -1, func(v []any) any {
 		out := []probeStatement{}
 		for _, x := range v {
 			out = append(out, x.(probeStatement))
@@ -236,6 +237,9 @@ func newProbeGrammar() p.Rule {
 		return out
 	})), sym("}")), func(v p.Values) any {
 		out := probeProgram{selector: v.Get("selector").(string), statements: v.Get("statements").([]probeStatement)}
+		if x := v.Get("using"); x != nil {
+			out.using = x.(*parsedCorrelation)
+		}
 		if x := v.Get("where"); x != nil {
 			out.conditions = x.([]queryCondition)
 		}
@@ -319,7 +323,7 @@ func parseProbeQuery(text string, sources map[string]CustomSource) (MonitorReque
 
 func compileProbe(program probeProgram, sources map[string]CustomSource) (MonitorRequest, error) {
 	parts := strings.Split(program.selector, ":")
-	parsed := parsedMonitorQuery{source: parts[0], conditions: program.conditions, aggregation: &AggregationRequest{Compact: true}}
+	parsed := parsedMonitorQuery{source: parts[0], conditions: program.conditions, aggregation: &AggregationRequest{Compact: true}, using: program.using}
 	if len(parts) > 1 {
 		switch {
 		case (parts[0] == "syscalls" || parts[0] == "disk") && len(parts) == 2:

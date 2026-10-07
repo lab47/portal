@@ -140,6 +140,9 @@ func sampledFields(source string) (fields, numeric []string) {
 }
 
 func sampleRecords(snapshot Snapshot) ([]map[string]any, error) {
+	if snapshot.sampleRows != nil {
+		return snapshot.sampleRows, nil
+	}
 	def := sampledSources[snapshot.Source]
 	value := reflect.ValueOf(snapshot).FieldByName(def.field)
 	var records []map[string]any
@@ -300,10 +303,20 @@ func aggregateSnapshotsAt(ctx context.Context, request MonitorRequest, collect f
 	end := start.Add(a.Window)
 	windowCtx, cancel := context.WithDeadline(ctx, end)
 	defer cancel()
-	selection := request
-	selection.Mode, selection.Aggregation = "snapshot", nil
 	reduction := newAggregateReduction(a)
 	reduction.configureRollups(rollups)
+	collect, err := correlatedCollector(windowCtx, request, collect)
+	if err != nil {
+		if ctx.Err() != nil {
+			return Snapshot{}, ctx.Err()
+		}
+		if windowCtx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded) {
+			return Snapshot{}, err
+		}
+		return reduction.result(request.Source, start, end), nil
+	}
+	selection := request
+	selection.Mode, selection.Aggregation = "snapshot", nil
 	previous := make(map[string]sampleObservation)
 	metadata := snapshotSampleFields(request.Source)
 	next := start

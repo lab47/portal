@@ -22,6 +22,23 @@ type parsedMonitorQuery struct {
 	source      string
 	conditions  []queryCondition
 	aggregation *AggregationRequest
+	using       *parsedCorrelation
+}
+
+type parsedCorrelation struct {
+	inventory  parsedMonitorQuery
+	field, key string
+}
+
+func correlationGrammar(token func(p.Rule) p.Rule, word, where p.Rule) p.Rule {
+	keyword := func(s string) p.Rule { return token(p.Seq(p.Re("(?i:"+s+")"), p.Not(p.Re(`[A-Za-z_0-9.]`)))) }
+	return p.Action(p.Seq(keyword("using"), token(p.S("(")), p.Named("source", word), p.Named("where", p.Maybe(where)), token(p.S(")")), keyword("on"), p.Named("field", word), token(p.S("=")), p.Named("key", word)), func(v p.Values) any {
+		c := &parsedCorrelation{inventory: parsedMonitorQuery{source: strings.ToLower(v.Get("source").(string))}, field: queryField(v.Get("field").(string)), key: queryField(v.Get("key").(string))}
+		if conditions := v.Get("where"); conditions != nil {
+			c.inventory.conditions = conditions.([]queryCondition)
+		}
+		return c
+	})
 }
 
 func queryField(field string) string {
@@ -152,8 +169,11 @@ func newMonitorQueryGrammar() p.Rule {
 		}
 		return a
 	})
-	return p.Action(p.Seq(toolkit.WS, p.Named("source", word), p.Named("where", p.Maybe(where)), p.Named("aggregate", p.Maybe(aggregate)), toolkit.WS, p.EOS()), func(v p.Values) any {
+	return p.Action(p.Seq(toolkit.WS, p.Named("source", word), p.Named("using", p.Maybe(correlationGrammar(token, word, where))), p.Named("where", p.Maybe(where)), p.Named("aggregate", p.Maybe(aggregate)), toolkit.WS, p.EOS()), func(v p.Values) any {
 		result := parsedMonitorQuery{source: strings.ToLower(v.Get("source").(string))}
+		if using := v.Get("using"); using != nil {
+			result.using = using.(*parsedCorrelation)
+		}
 		if conditions := v.Get("where"); conditions != nil {
 			result.conditions = conditions.([]queryCondition)
 		}
@@ -227,6 +247,14 @@ func querySyntaxError(err error) error {
 
 func compileMonitorQuery(parsed parsedMonitorQuery, sources map[string]CustomSource) (MonitorRequest, error) {
 	r := (Engine{Sources: sources}).bindSources(MonitorRequest{Source: parsed.source})
+	if parsed.using != nil {
+		inventory, err := compileMonitorQuery(parsed.using.inventory, sources)
+		if err != nil {
+			return MonitorRequest{}, err
+		}
+		inventory.Mode = "snapshot"
+		r.Using = &SnapshotCorrelation{Inventory: inventory, Field: parsed.using.field, Key: parsed.using.key}
+	}
 	if r.Source == "symbols" {
 		r.Mode = "snapshot"
 		r.Symbols = &SymbolRequest{}

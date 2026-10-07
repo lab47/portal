@@ -80,7 +80,11 @@ func (e Engine) Query(ctx context.Context, request MonitorRequest) (Snapshot, er
 		return aggregateScript(ctx, request, e.eventSource(), e.snapshotSource())
 	}
 	if request.Mode == "snapshot" {
-		return e.snapshotSource()(ctx, request)
+		collect, err := correlatedCollector(ctx, request, e.snapshotSource())
+		if err != nil {
+			return Snapshot{}, err
+		}
+		return collect(ctx, request)
 	}
 	if sampledAggregation(request) {
 		return aggregateSnapshots(ctx, request, e.snapshotSource())

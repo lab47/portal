@@ -25,6 +25,9 @@ func Metadata(request MonitorRequest) (SourceMetadata, error) {
 	fields, numericFields, err := aggregateFields(request)
 	if _, ok := sampledSources[request.Source]; ok {
 		groups, numeric := sampledFields(request.Source)
+		if request.Using != nil {
+			groups = fields
+		}
 		return SourceMetadata{
 			Sampled:             true,
 			SampleFields:        snapshotSampleFields(request.Source),

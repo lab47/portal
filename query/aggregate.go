@@ -228,6 +228,11 @@ func aggregateFields(r MonitorRequest) (fields, numeric []string, err error) {
 	}
 	if sampledAggregation(r) {
 		fields, numeric = sampledFields(r.Source)
+		if r.Using != nil && r.Using.Inventory.customSource != nil {
+			for _, field := range r.Using.Inventory.customSource.Fields {
+				fields = append(fields, "inventory."+field)
+			}
+		}
 		return
 	}
 	switch r.Source {

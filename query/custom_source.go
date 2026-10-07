@@ -35,6 +35,11 @@ func (e Engine) bindSources(r MonitorRequest) MonitorRequest {
 	for i := range r.Probes {
 		r.Probes[i] = e.bindSources(r.Probes[i])
 	}
+	if r.Using != nil {
+		using := *r.Using
+		using.Inventory = e.bindSources(using.Inventory)
+		r.Using = &using
+	}
 	return r
 }
 
